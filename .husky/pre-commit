@@ -1,0 +1,10 @@
+#!/usr/bin/env sh
+
+echo "⚙️ Running Frontend Lint & TS Check..."
+npx lint-staged
+npm run build-check
+
+echo "⚙️ Running Rust Formatting & Clippy (Backend)..."
+cd src-tauri
+cargo fmt --check
+cargo clippy -- -D warnings
