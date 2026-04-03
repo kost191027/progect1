@@ -8,7 +8,10 @@
     "opener:default",
     {
       "identifier": "shell:allow-execute",
-      "allow": [{ "name": "sing-box", "sidecar": true }]
+      "allow": [
+        { "name": "sing-box", "sidecar": true },
+        { "name": "osascript", "cmd": "osascript", "args": true }
+      ]
     }
   ]
 }
