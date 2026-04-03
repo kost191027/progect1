@@ -8,15 +8,35 @@ pub struct RealityKeys {
     pub public_key: String,
 }
 
-pub async fn generate_reality_keypair(app: &AppHandle) -> Result<RealityKeys, String> {
+async fn run_singbox_generate(app: &AppHandle, args: &[&str]) -> Result<String, String> {
     let sidecar = app
         .shell()
         .sidecar("sing-box")
         .map_err(|e| e.to_string())?
-        .args(["generate", "reality-keypair"]);
+        .args(args);
 
     let output = sidecar.output().await.map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let message = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!(
+            "sing-box generate {} failed: {}",
+            args.join(" "),
+            message
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn is_hex_string(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+pub async fn generate_reality_keypair(app: &AppHandle) -> Result<RealityKeys, String> {
+    let stdout = run_singbox_generate(app, &["generate", "reality-keypair"]).await?;
 
     let mut private_key = String::new();
     let mut public_key = String::new();
@@ -40,25 +60,17 @@ pub async fn generate_reality_keypair(app: &AppHandle) -> Result<RealityKeys, St
 }
 
 pub async fn generate_short_id(app: &AppHandle) -> Result<String, String> {
-    let sidecar = app
-        .shell()
-        .sidecar("sing-box")
-        .map_err(|e| e.to_string())?
-        .args(["generate", "short-id"]);
+    let short_id = run_singbox_generate(app, &["generate", "rand", "8", "--hex"]).await?;
 
-    let output = sidecar.output().await.map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    if !is_hex_string(&short_id) {
+        return Err(format!("Generated short_id is not valid hex: {}", short_id));
+    }
+
+    Ok(short_id.to_ascii_lowercase())
 }
 
 pub async fn generate_uuid(app: &AppHandle) -> Result<String, String> {
-    let sidecar = app
-        .shell()
-        .sidecar("sing-box")
-        .map_err(|e| e.to_string())?
-        .args(["generate", "uuid"]);
-
-    let output = sidecar.output().await.map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    run_singbox_generate(app, &["generate", "uuid"]).await
 }
 
 pub fn build_server_config(
@@ -67,6 +79,8 @@ pub fn build_server_config(
     uuid: &str,
     shadow_pass: &str,
 ) -> String {
+    let cover_domain = "www.microsoft.com";
+
     let config = json!({
       "log": {
         "disabled": false,
@@ -86,7 +100,7 @@ pub fn build_server_config(
             }
           ],
           "handshake": {
-            "server": "104.21.35.210",
+            "server": cover_domain,
             "server_port": 443
           },
           "detour": "in-reality"
@@ -105,11 +119,11 @@ pub fn build_server_config(
           ],
           "tls": {
             "enabled": true,
-            "server_name": "www.microsoft.com",
+            "server_name": cover_domain,
             "reality": {
               "enabled": true,
               "handshake": {
-                "server": "104.21.35.210",
+                "server": cover_domain,
                 "server_port": 443
               },
               "private_key": keys.private_key,
@@ -136,6 +150,25 @@ pub fn build_client_config(
     uuid: &str,
     shadow_pass: &str,
 ) -> String {
+    let cover_domain = "www.microsoft.com";
+
+    let mut tun_inbound = json!({
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.19.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system",
+      "mtu": 1280
+    });
+
+    if !cfg!(target_os = "macos") {
+        tun_inbound["interface_name"] = json!("tun0");
+    }
+
     let config = json!({
       "log": {
         "level": "info",
@@ -165,13 +198,18 @@ pub fn build_client_config(
             "server": "8.8.8.8"
           }
         ],
+        "strategy": "prefer_ipv4",
         "rules": [
           {
             "rule_set": "geosite-category-ads-all",
             "action": "reject"
           },
           {
-            "rule_set": "geosite-ru",
+            "rule_set": [
+              "geosite-category-gov-ru",
+              "geosite-yandex",
+              "geosite-vk"
+            ],
             "server": "dns-direct"
           }
         ],
@@ -181,19 +219,7 @@ pub fn build_client_config(
 
       // --- TUN Inbound: перехват всего системного трафика ---
       "inbounds": [
-        {
-          "type": "tun",
-          "tag": "tun-in",
-          "interface_name": "utun-rkn",
-          "address": [
-            "172.19.0.1/30",
-            "fdfe:dcba:9876::1/126"
-          ],
-          "auto_route": true,
-          "strict_route": true,
-          "stack": "system",
-          "mtu": 1280
-        }
+        tun_inbound
       ],
 
       // --- Outbounds ---
@@ -202,12 +228,12 @@ pub fn build_client_config(
           "type": "vless",
           "tag": "proxy",
           "server": server_ip,
-          "server_port": 443,
+          "server_port": 8443,
           "uuid": uuid,
           "flow": "xtls-rprx-vision",
           "tls": {
             "enabled": true,
-            "server_name": "www.microsoft.com",
+            "server_name": cover_domain,
             "utls": {
               "enabled": true,
               "fingerprint": "chrome"
@@ -229,7 +255,7 @@ pub fn build_client_config(
           "password": shadow_pass,
           "tls": {
             "enabled": true,
-            "server_name": "104.21.35.210",
+            "server_name": cover_domain,
             "utls": {
               "enabled": true,
               "fingerprint": "chrome"
@@ -256,7 +282,12 @@ pub fn build_client_config(
           },
           // Российские сайты и IP — напрямую (Split-Tunneling)
           {
-            "rule_set": ["geoip-ru", "geosite-ru"],
+            "rule_set": [
+              "geoip-ru",
+              "geosite-category-gov-ru",
+              "geosite-yandex",
+              "geosite-vk"
+            ],
             "action": "route",
             "outbound": "direct"
           },
@@ -275,6 +306,10 @@ pub fn build_client_config(
         // Всё остальное — через зашифрованный туннель
         "final": "proxy",
         "auto_detect_interface": true,
+        "default_domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4"
+        },
 
         // GeoIP / GeoSite базы — sing-box скачает сам (remote rule-set)
         "rule_set": [
@@ -286,10 +321,24 @@ pub fn build_client_config(
             "download_detour": "direct"
           },
           {
-            "tag": "geosite-ru",
+            "tag": "geosite-category-gov-ru",
             "type": "remote",
             "format": "binary",
-            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-companies@ru.srs",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-gov-ru.srs",
+            "download_detour": "direct"
+          },
+          {
+            "tag": "geosite-yandex",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-yandex.srs",
+            "download_detour": "direct"
+          },
+          {
+            "tag": "geosite-vk",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-vk.srs",
             "download_detour": "direct"
           },
           {
