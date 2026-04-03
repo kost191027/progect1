@@ -135,26 +135,66 @@ pub fn build_client_config(
     short_id: &str,
     uuid: &str,
     shadow_pass: &str,
+    geodata_dir: &str,
 ) -> String {
     let config = json!({
       "log": {
         "level": "info",
         "timestamp": true
       },
+
+      // --- DNS: Локальный перехват, DoH для безопасности, FakeIP ---
+      "dns": {
+        "servers": [
+          {
+            "tag": "dns-remote",
+            "address": "https://1.1.1.1/dns-query",
+            "address_resolver": "dns-direct",
+            "detour": "proxy"
+          },
+          {
+            "tag": "dns-direct",
+            "address": "https://dns.google/dns-query",
+            "detour": "direct"
+          },
+          {
+            "tag": "dns-block",
+            "address": "rcode://success"
+          }
+        ],
+        "rules": [
+          {
+            "rule_set": "geosite-category-ads-all",
+            "server": "dns-block"
+          },
+          {
+            "rule_set": "geosite-ru",
+            "server": "dns-direct"
+          }
+        ],
+        "final": "dns-remote",
+        "independent_cache": true
+      },
+
+      // --- TUN Inbound: перехват всего системного трафика ---
       "inbounds": [
         {
           "type": "tun",
           "tag": "tun-in",
           "interface_name": "utun-rkn",
           "inet4_address": "172.19.0.1/30",
+          // IPv6 через TUN — перехватываем, чтобы не было утечек
           "inet6_address": "fdfe:dcba:9876::1/126",
           "auto_route": true,
           "strict_route": true,
           "stack": "system",
           "mtu": 1280,
-          "sniff": true
+          "sniff": true,
+          "sniff_override_destination": true
         }
       ],
+
+      // --- Outbounds ---
       "outbounds": [
         {
           "type": "vless",
@@ -197,17 +237,69 @@ pub fn build_client_config(
         {
           "type": "direct",
           "tag": "direct"
+        },
+        {
+          "type": "block",
+          "tag": "block"
+        },
+        {
+          "type": "dns",
+          "tag": "dns-out"
         }
       ],
+
+      // --- Route: Умная маршрутизация ---
       "route": {
         "rules": [
+          // DNS-запросы → перехватываем локально
           {
-            "inbound": "tun-in",
-            "action": "route",
-            "outbound": "proxy"
+            "protocol": "dns",
+            "outbound": "dns-out"
+          },
+          // Российские сайты и IP — напрямую (Split-Tunneling)
+          {
+            "rule_set": ["geoip-ru", "geosite-ru"],
+            "outbound": "direct"
+          },
+          // Реклама — блочим
+          {
+            "rule_set": "geosite-category-ads-all",
+            "outbound": "block"
+          },
+          // Приватные сети (192.168.x.x, 10.x.x.x) — напрямую
+          {
+            "ip_is_private": true,
+            "outbound": "direct"
           }
         ],
-        "auto_detect_interface": true
+        // Всё остальное — через зашифрованный туннель
+        "final": "proxy",
+        "auto_detect_interface": true,
+
+        // GeoIP / GeoSite базы (скачиваются автоматически geodata.rs)
+        "rule_set": [
+          {
+            "tag": "geoip-ru",
+            "type": "local",
+            "format": "binary",
+            "path": format!("{}/geoip.db", geodata_dir),
+            "download_detour": "direct"
+          },
+          {
+            "tag": "geosite-ru",
+            "type": "local",
+            "format": "binary",
+            "path": format!("{}/geosite.db", geodata_dir),
+            "download_detour": "direct"
+          },
+          {
+            "tag": "geosite-category-ads-all",
+            "type": "local",
+            "format": "binary",
+            "path": format!("{}/geosite.db", geodata_dir),
+            "download_detour": "direct"
+          }
+        ]
       }
     });
 
