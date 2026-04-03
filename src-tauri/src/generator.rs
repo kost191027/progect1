@@ -135,7 +135,6 @@ pub fn build_client_config(
     short_id: &str,
     uuid: &str,
     shadow_pass: &str,
-    geodata_dir: &str,
 ) -> String {
     let config = json!({
       "log": {
@@ -143,29 +142,33 @@ pub fn build_client_config(
         "timestamp": true
       },
 
-      // --- DNS: Локальный перехват, DoH для безопасности, FakeIP ---
+      // --- DNS: sing-box 1.12+ новый формат серверов ---
       "dns": {
         "servers": [
           {
+            "type": "https",
             "tag": "dns-remote",
-            "address": "https://1.1.1.1/dns-query",
-            "address_resolver": "dns-direct",
-            "detour": "proxy"
+            "server": "1.1.1.1",
+            "server_port": 443,
+            "domain_resolver": "dns-bootstrap"
           },
           {
+            "type": "https",
             "tag": "dns-direct",
-            "address": "https://dns.google/dns-query",
-            "detour": "direct"
+            "server": "dns.google",
+            "server_port": 443,
+            "domain_resolver": "dns-bootstrap"
           },
           {
-            "tag": "dns-block",
-            "address": "rcode://success"
+            "type": "udp",
+            "tag": "dns-bootstrap",
+            "server": "8.8.8.8"
           }
         ],
         "rules": [
           {
             "rule_set": "geosite-category-ads-all",
-            "server": "dns-block"
+            "action": "reject"
           },
           {
             "rule_set": "geosite-ru",
@@ -182,15 +185,14 @@ pub fn build_client_config(
           "type": "tun",
           "tag": "tun-in",
           "interface_name": "utun-rkn",
-          "inet4_address": "172.19.0.1/30",
-          // IPv6 через TUN — перехватываем, чтобы не было утечек
-          "inet6_address": "fdfe:dcba:9876::1/126",
+          "address": [
+            "172.19.0.1/30",
+            "fdfe:dcba:9876::1/126"
+          ],
           "auto_route": true,
           "strict_route": true,
           "stack": "system",
-          "mtu": 1280,
-          "sniff": true,
-          "sniff_override_destination": true
+          "mtu": 1280
         }
       ],
 
@@ -237,38 +239,36 @@ pub fn build_client_config(
         {
           "type": "direct",
           "tag": "direct"
-        },
-        {
-          "type": "block",
-          "tag": "block"
-        },
-        {
-          "type": "dns",
-          "tag": "dns-out"
         }
       ],
 
-      // --- Route: Умная маршрутизация ---
+      // --- Route: Умная маршрутизация (sing-box 1.11+ actions) ---
       "route": {
         "rules": [
-          // DNS-запросы → перехватываем локально
+          // Sniff: определяет протокол трафика
+          {
+            "action": "sniff"
+          },
+          // DNS-запросы → перехватываем и отправляем в DNS-модуль
           {
             "protocol": "dns",
-            "outbound": "dns-out"
+            "action": "hijack-dns"
           },
           // Российские сайты и IP — напрямую (Split-Tunneling)
           {
             "rule_set": ["geoip-ru", "geosite-ru"],
+            "action": "route",
             "outbound": "direct"
           },
           // Реклама — блочим
           {
             "rule_set": "geosite-category-ads-all",
-            "outbound": "block"
+            "action": "reject"
           },
           // Приватные сети (192.168.x.x, 10.x.x.x) — напрямую
           {
             "ip_is_private": true,
+            "action": "route",
             "outbound": "direct"
           }
         ],
@@ -276,27 +276,27 @@ pub fn build_client_config(
         "final": "proxy",
         "auto_detect_interface": true,
 
-        // GeoIP / GeoSite базы (скачиваются автоматически geodata.rs)
+        // GeoIP / GeoSite базы — sing-box скачает сам (remote rule-set)
         "rule_set": [
           {
             "tag": "geoip-ru",
-            "type": "local",
+            "type": "remote",
             "format": "binary",
-            "path": format!("{}/geoip.db", geodata_dir),
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
             "download_detour": "direct"
           },
           {
             "tag": "geosite-ru",
-            "type": "local",
+            "type": "remote",
             "format": "binary",
-            "path": format!("{}/geosite.db", geodata_dir),
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-companies@ru.srs",
             "download_detour": "direct"
           },
           {
             "tag": "geosite-category-ads-all",
-            "type": "local",
+            "type": "remote",
             "format": "binary",
-            "path": format!("{}/geosite.db", geodata_dir),
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
             "download_detour": "direct"
           }
         ]

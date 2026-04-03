@@ -6,6 +6,7 @@ use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 mod generator;
+#[allow(dead_code)]
 mod geodata;
 mod ssh;
 
@@ -48,10 +49,6 @@ async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
     }
 
     let _ = app.emit("tunnel-log", "[SYSTEM] Resolving core binary path...");
-
-    geodata::ensure_geodata(&app)
-        .await
-        .map_err(|e| format!("Geodata error: {}", e))?;
 
     let singbox_path = resolve_singbox_path()?;
 

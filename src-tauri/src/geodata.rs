@@ -1,12 +1,24 @@
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager};
 
-const GEOIP_URL: &str = "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db";
-const GEOSITE_URL: &str =
-    "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db";
+/// Каждый rule-set — отдельный .srs файл из GitHub
+const RULE_SETS: &[(&str, &str)] = &[
+    (
+        "geoip-ru.srs",
+        "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
+    ),
+    (
+        "geosite-ru.srs",
+        "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-ru.srs",
+    ),
+    (
+        "geosite-category-ads-all.srs",
+        "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
+    ),
+];
 
 /// Возвращает путь к папке геоданных внутри AppLocalData
-fn geodata_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub fn geodata_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     let dir = base.join("geodata");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -14,7 +26,6 @@ fn geodata_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Скачивает один файл по URL и сохраняет в указанный путь.
-/// Возвращает размер файла в байтах.
 async fn download_file(url: &str, dest: &PathBuf) -> Result<u64, String> {
     let response = reqwest::get(url)
         .await
@@ -38,53 +49,45 @@ async fn download_file(url: &str, dest: &PathBuf) -> Result<u64, String> {
     Ok(size)
 }
 
-/// Проверяет наличие geoip.db и geosite.db.
+/// Проверяет наличие всех rule-set файлов.
 /// Если файлов нет — скачивает их.
-/// Вызывается перед стартом тоннеля.
 pub async fn ensure_geodata(app: &AppHandle) -> Result<(), String> {
     let dir = geodata_dir(app)?;
 
-    let geoip_path = dir.join("geoip.db");
-    let geosite_path = dir.join("geosite.db");
+    // Проверяем, все ли файлы на месте
+    let all_exist = RULE_SETS.iter().all(|(name, _)| dir.join(name).exists());
 
-    if geoip_path.exists() && geosite_path.exists() {
+    if all_exist {
         let _ = app.emit(
             "tunnel-log",
-            "[GEODATA] Routing databases found locally.".to_string(),
+            "[GEODATA] All rule-set files found locally.".to_string(),
         );
         return Ok(());
     }
 
     let _ = app.emit(
         "tunnel-log",
-        "[GEODATA] Downloading fresh GeoIP & GeoSite databases...".to_string(),
+        "[GEODATA] Downloading rule-set databases...".to_string(),
     );
 
-    if !geoip_path.exists() {
-        let size = download_file(GEOIP_URL, &geoip_path).await?;
-        let _ = app.emit(
-            "tunnel-log",
-            format!(
-                "[GEODATA] geoip.db downloaded ({:.1} MB)",
-                size as f64 / 1_048_576.0
-            ),
-        );
-    }
-
-    if !geosite_path.exists() {
-        let size = download_file(GEOSITE_URL, &geosite_path).await?;
-        let _ = app.emit(
-            "tunnel-log",
-            format!(
-                "[GEODATA] geosite.db downloaded ({:.1} MB)",
-                size as f64 / 1_048_576.0
-            ),
-        );
+    for (name, url) in RULE_SETS {
+        let path = dir.join(name);
+        if !path.exists() {
+            let size = download_file(url, &path).await?;
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[GEODATA] {} downloaded ({:.1} KB)",
+                    name,
+                    size as f64 / 1024.0
+                ),
+            );
+        }
     }
 
     let _ = app.emit(
         "tunnel-log",
-        "[GEODATA] Routing databases ready.".to_string(),
+        "[GEODATA] All rule-set databases ready.".to_string(),
     );
 
     Ok(())

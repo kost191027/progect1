@@ -34,22 +34,14 @@ pub async fn deploy_server(
     let server_cfg =
         crate::generator::build_server_config(&reality_keys, &short_id, &uuid, &shadow_pass);
 
-    // Получаем путь к геоданным для маршрутизации
+    // Получаем путь к AppData
     let local_data = app
         .path()
         .app_local_data_dir()
         .unwrap_or_else(|_| std::env::temp_dir());
-    let geodata_path = local_data.join("geodata");
-    let geodata_dir_str = geodata_path.to_string_lossy().to_string();
 
-    let client_cfg = crate::generator::build_client_config(
-        &host,
-        &reality_keys,
-        &short_id,
-        &uuid,
-        &shadow_pass,
-        &geodata_dir_str,
-    );
+    let client_cfg =
+        crate::generator::build_client_config(&host, &reality_keys, &short_id, &uuid, &shadow_pass);
 
     // 3. Save Client Config locally in AppData
     std::fs::create_dir_all(&local_data).unwrap();
