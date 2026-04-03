@@ -28,21 +28,21 @@ function App() {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
-  async function startVpn() {
+  async function startTunnel() {
     try {
-      await invoke("start_vpn", { configPath: "dummy_config.json" });
+      await invoke("start_tunnel");
       setIsRunning(true);
-      setLogs((prev) => [...prev, "--- LOCAL TUNNEL PROCESS STARTED ---"]);
+      setLogs((prev) => [...prev, "--- TUNNEL ROUTING ACTIVE ---"]);
     } catch (err) {
       setLogs((prev) => [...prev, `[ERROR] starting tunnel: ${err}`]);
     }
   }
 
-  async function stopVpn() {
+  async function stopTunnel() {
     try {
-      await invoke("stop_vpn");
+      await invoke("stop_tunnel");
       setIsRunning(false);
-      setLogs((prev) => [...prev, "--- LOCAL TUNNEL PROCESS STOPPED ---"]);
+      setLogs((prev) => [...prev, "--- TUNNEL ROUTING STOPPED ---"]);
     } catch (err) {
       setLogs((prev) => [...prev, `[ERROR] stopping tunnel: ${err}`]);
     }
@@ -127,13 +127,13 @@ function App() {
           {/* Правая панель: Локальный туннель */}
           <div className="flex-1 p-6 flex flex-col items-center justify-center gap-6 bg-[#222222] relative">
             <div className="absolute top-4 right-4 flex items-center gap-2">
-			        <span className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Local VPN:</span>
+			        <span className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Status:</span>
               <div className={`w-3 h-3 rounded-full ${isRunning ? 'bg-green-500 shadow-[0_0_12px_#22c55e]' : 'bg-red-500 shadow-[0_0_12px_#ef4444]'}`}></div>
             </div>
 
             <div className="flex flex-col items-center gap-4 w-full px-4">
               <button 
-                onClick={startVpn}
+                onClick={startTunnel}
                 disabled={isRunning || isDeploying}
                 className={`w-full py-4 rounded-xl font-bold uppercase tracking-wider transition-all duration-300 ${
                   isRunning || isDeploying
@@ -144,7 +144,7 @@ function App() {
                 Start Tunnel
               </button>
               <button 
-                onClick={stopVpn}
+                onClick={stopTunnel}
                 disabled={!isRunning || isDeploying}
                 className={`w-full py-4 rounded-xl font-bold uppercase tracking-wider transition-all duration-300 ${
                   !isRunning || isDeploying
