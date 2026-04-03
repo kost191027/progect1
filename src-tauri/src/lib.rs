@@ -62,6 +62,7 @@ fn stop_vpn(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+mod generator;
 mod ssh;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -73,7 +74,7 @@ pub fn run() {
             singbox_child: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
-            start_vpn, 
+            start_vpn,
             stop_vpn,
             ssh::deploy_server
         ])
