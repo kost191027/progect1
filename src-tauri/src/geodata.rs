@@ -16,6 +16,27 @@ pub const DIRECT_ROUTE_RULE_SET_TAGS: &[&str] = &[
     "geosite-vk",
 ];
 
+pub const CURATED_RU_DOMAIN_SUFFIXES: &[&str] = &[
+    "2gis.ru",
+    "alfabank.ru",
+    "avito.ru",
+    "cdek.ru",
+    "gosuslugi.ru",
+    "kinopoisk.ru",
+    "mail.ru",
+    "mos.ru",
+    "nalog.gov.ru",
+    "ok.ru",
+    "ozon.ru",
+    "pochta.ru",
+    "rambler.ru",
+    "sberbank.ru",
+    "tbank.ru",
+    "tinkoff.ru",
+    "vtb.ru",
+    "wildberries.ru",
+];
+
 pub const REMOTE_RULE_SETS: &[RemoteRuleSet] = &[
     RemoteRuleSet {
         tag: "geoip-ru",

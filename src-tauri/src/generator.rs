@@ -3,7 +3,8 @@ use tauri::AppHandle;
 use tauri_plugin_shell::ShellExt;
 
 use crate::geodata::{
-    ADS_RULE_SET_TAG, DIRECT_ROUTE_RULE_SET_TAGS, DNS_DIRECT_RULE_SET_TAGS, REMOTE_RULE_SETS,
+    ADS_RULE_SET_TAG, CURATED_RU_DOMAIN_SUFFIXES, DIRECT_ROUTE_RULE_SET_TAGS,
+    DNS_DIRECT_RULE_SET_TAGS, REMOTE_RULE_SETS,
 };
 
 #[derive(Debug)]
@@ -211,6 +212,10 @@ pub fn build_client_config(
             "action": "reject"
           },
           {
+            "domain_suffix": CURATED_RU_DOMAIN_SUFFIXES,
+            "server": "dns-direct"
+          },
+          {
             "rule_set": DNS_DIRECT_RULE_SET_TAGS,
             "server": "dns-direct"
           }
@@ -281,6 +286,12 @@ pub fn build_client_config(
           {
             "protocol": "dns",
             "action": "hijack-dns"
+          },
+          // Критичные российские домены — напрямую, даже если их нет в rule-set
+          {
+            "domain_suffix": CURATED_RU_DOMAIN_SUFFIXES,
+            "action": "route",
+            "outbound": "direct"
           },
           // Российские сайты и IP — напрямую (Split-Tunneling)
           {
