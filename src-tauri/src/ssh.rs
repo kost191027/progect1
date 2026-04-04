@@ -33,14 +33,17 @@ pub async fn deploy_server(
     // 2. Build Server and Client JSON configs
     let server_cfg =
         crate::generator::build_server_config(&reality_keys, &short_id, &uuid, &shadow_pass);
-    let client_cfg =
-        crate::generator::build_client_config(&host, &reality_keys, &short_id, &uuid, &shadow_pass);
 
-    // 3. Save Client Config locally in AppData
+    // Получаем путь к AppData
     let local_data = app
         .path()
         .app_local_data_dir()
         .unwrap_or_else(|_| std::env::temp_dir());
+
+    let client_cfg =
+        crate::generator::build_client_config(&host, &reality_keys, &short_id, &uuid, &shadow_pass);
+
+    // 3. Save Client Config locally in AppData
     std::fs::create_dir_all(&local_data).unwrap();
     let client_cfg_path = local_data.join("client_config.json");
     std::fs::write(&client_cfg_path, &client_cfg).unwrap();

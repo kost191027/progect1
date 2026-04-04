@@ -1,9 +1,13 @@
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::time::{sleep, Duration};
 
 mod generator;
+#[allow(dead_code)]
 mod geodata;
 mod ssh;
 
@@ -12,16 +16,72 @@ struct AppState {
     singbox_pid: Mutex<Option<u32>>,
 }
 
+fn emit_tunnel_state(app: &AppHandle, is_running: bool) {
+    let _ = app.emit("tunnel-state", is_running);
+}
+
+fn process_exists(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .output()
+        .map(|output| {
+            output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        })
+        .unwrap_or(false)
+}
+
+fn escape_applescript(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn run_admin_command(script: &str) -> Result<std::process::Output, String> {
+    let osascript_arg = format!(
+        "do shell script \"{}\" with administrator privileges",
+        escape_applescript(script)
+    );
+
+    std::process::Command::new("osascript")
+        .args(["-e", &osascript_arg])
+        .output()
+        .map_err(|e| format!("Failed to execute osascript: {}", e))
+}
+
+fn terminate_root_process(pid: u32) -> Result<(), String> {
+    let kill_cmd = format!(
+        "kill {} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {} >/dev/null 2>&1 || true",
+        pid, pid
+    );
+
+    let output = run_admin_command(&kill_cmd)?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn recent_log_tail(log_path: &str, max_lines: usize) -> String {
+    let Ok(contents) = std::fs::read_to_string(log_path) else {
+        return String::new();
+    };
+
+    let mut lines = contents
+        .lines()
+        .rev()
+        .take(max_lines)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
+}
+
 /// Находит абсолютный путь до sidecar-бинарника `sing-box`
 fn resolve_singbox_path() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
 
-    // В dev-режиме: target/debug/progect-1 -> ищем рядом
-    // В production: MacOS/progect-1 -> ищем рядом
     let dir = exe.parent().ok_or("Cannot resolve binary directory")?;
 
-    // Tauri sidecar лежит рядом с бинарником как sing-box-{arch}
-    // Определяем суффикс архитектуры
     let arch_suffix = if cfg!(target_arch = "x86_64") {
         "x86_64-apple-darwin"
     } else if cfg!(target_arch = "aarch64") {
@@ -36,14 +96,12 @@ fn resolve_singbox_path() -> Result<String, String> {
     if sidecar_path.exists() {
         Ok(sidecar_path.to_string_lossy().to_string())
     } else {
-        // Fallback: просто попробуем sing-box в PATH
         Ok("sing-box".to_string())
     }
 }
 
 #[tauri::command]
 async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    // Проверяем, не запущен ли уже
     {
         let guard = state.singbox_pid.lock().unwrap();
         if guard.is_some() {
@@ -53,14 +111,8 @@ async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
 
     let _ = app.emit("tunnel-log", "[SYSTEM] Resolving core binary path...");
 
-    // Скачиваем/проверяем геоданные перед запуском
-    geodata::ensure_geodata(&app)
-        .await
-        .map_err(|e| format!("Geodata error: {}", e))?;
-
     let singbox_path = resolve_singbox_path()?;
 
-    // Получаем путь к конфигу из AppLocalData
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     let config_path = local_data.join("client_config.json");
 
@@ -75,23 +127,17 @@ async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
         "[SYSTEM] Requesting administrator privileges...".to_string(),
     );
 
-    // Формируем shell-команду для запуска sing-box от рута
-    // sing-box пишет логи в файл, а мы будем их читать асинхронно
     let log_path = "/tmp/rkn-tun.log";
     let shell_cmd = format!(
         "{} run -c '{}' > {} 2>&1 & echo $!",
         singbox_path, config_str, log_path
     );
 
-    // Экранируем одинарные кавычки для AppleScript
-    let escaped_cmd = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
-
     let osascript_arg = format!(
         "do shell script \"{}\" with administrator privileges",
-        escaped_cmd
+        escape_applescript(&shell_cmd)
     );
 
-    // Запускаем osascript через Tauri shell (вызовет нативное окно macOS «Введите пароль»)
     let sidecar = app
         .shell()
         .command("osascript")
@@ -104,7 +150,6 @@ async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Если юзер нажал "Cancel" — это не ошибка, а отмена
         if stderr.contains("User canceled") || stderr.contains("-128") {
             let _ = app.emit(
                 "tunnel-log",
@@ -115,7 +160,6 @@ async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
         return Err(format!("osascript error: {}", stderr));
     }
 
-    // Ответ osascript — PID root-процесса sing-box
     let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let pid: u32 = pid_str
         .parse()
@@ -126,17 +170,39 @@ async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
         format!("[SYSTEM] Core process started with PID {} (root)", pid),
     );
 
-    // Сохраняем PID
     {
         let mut guard = state.singbox_pid.lock().unwrap();
         *guard = Some(pid);
     }
 
-    // Запускаем асинхронное чтение логов (аналог tail -f)
+    sleep(Duration::from_millis(1200)).await;
+
+    if !process_exists(pid) {
+        {
+            let mut guard = state.singbox_pid.lock().unwrap();
+            if guard.as_ref() == Some(&pid) {
+                *guard = None;
+            }
+        }
+
+        emit_tunnel_state(&app, false);
+
+        let log_tail = recent_log_tail(log_path, 20);
+        let details = if log_tail.is_empty() {
+            "No startup logs captured.".to_string()
+        } else {
+            format!("Recent logs:\n{}", log_tail)
+        };
+
+        return Err(format!("Core process exited during startup. {}", details));
+    }
+
+    emit_tunnel_state(&app, true);
+
+    // Асинхронное чтение логов (tail -f)
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
-        // Даём sing-box секунду на создание файла
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(500)).await;
 
         let file = match tokio::fs::File::open(log_path).await {
             Ok(f) => f,
@@ -160,10 +226,43 @@ async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
                     }
                 }
                 Ok(None) => {
-                    // EOF — файл не вырос, ждём немного и перечитаем
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    sleep(Duration::from_millis(300)).await;
                 }
                 Err(_) => break,
+            }
+        }
+    });
+
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(2)).await;
+
+            let current_pid = {
+                let state = app_clone.state::<AppState>();
+                let current_pid = *state.singbox_pid.lock().unwrap();
+                current_pid
+            };
+
+            if current_pid != Some(pid) {
+                break;
+            }
+
+            if !process_exists(pid) {
+                {
+                    let state = app_clone.state::<AppState>();
+                    let mut guard = state.singbox_pid.lock().unwrap();
+                    if guard.as_ref() == Some(&pid) {
+                        *guard = None;
+                    }
+                }
+
+                let _ = app_clone.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Core process exited. Tunnel is no longer active.".to_string(),
+                );
+                emit_tunnel_state(&app_clone, false);
+                break;
             }
         }
     });
@@ -190,36 +289,20 @@ async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
                 format!("[SYSTEM] Stopping core process (PID {})...", pid),
             );
 
-            // Убиваем root-процесс через osascript
-            let kill_cmd = format!("kill -9 {}", pid);
-            let osascript_arg = format!(
-                "do shell script \"{}\" with administrator privileges",
-                kill_cmd
-            );
-
-            let output = app
-                .shell()
-                .command("osascript")
-                .args(["-e", &osascript_arg])
-                .output()
-                .await
-                .map_err(|e| e.to_string())?;
-
-            if output.status.success() {
+            if terminate_root_process(pid).is_ok() {
                 let _ = app.emit(
                     "tunnel-log",
                     "[SYSTEM] Core process terminated. Routing disabled.".to_string(),
                 );
             } else {
-                // Если не требуются права (процесс уже умер), просто логируем
                 let _ = app.emit(
                     "tunnel-log",
                     "[WARN] Process may have already exited.".to_string(),
                 );
             }
 
-            // Чистим лог-файл
             let _ = std::fs::remove_file("/tmp/rkn-tun.log");
+            emit_tunnel_state(&app, false);
 
             Ok(())
         }
@@ -228,6 +311,7 @@ async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
                 "tunnel-log",
                 "[SYSTEM] No active tunnel to stop.".to_string(),
             );
+            emit_tunnel_state(&app, false);
             Ok(())
         }
     }
@@ -240,6 +324,51 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             singbox_pid: Mutex::new(None),
+        })
+        .setup(|app| {
+            // --- System Tray (живёт в менюбаре macOS) ---
+            let show_item = MenuItemBuilder::with_id("show", "Show RKN").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+
+            let menu = MenuBuilder::new(app)
+                .item(&show_item)
+                .separator()
+                .item(&quit_item)
+                .build()?;
+
+            let _tray = TrayIconBuilder::new()
+                .tooltip("RKN — Recursive Kinetic Network")
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        // Убиваем sing-box процесс перед выходом
+                        let state = app.state::<AppState>();
+                        if let Some(pid) = state.singbox_pid.lock().unwrap().take() {
+                            let _ = terminate_root_process(pid);
+                            let _ = std::fs::remove_file("/tmp/rkn-tun.log");
+                        }
+                        emit_tunnel_state(app, false);
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
+            Ok(())
+        })
+        // --- Закрытие окна → скрытие (туннель продолжает работать) ---
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // Не закрываем, а прячем окно
+                let _ = window.hide();
+                api.prevent_close();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             start_tunnel,

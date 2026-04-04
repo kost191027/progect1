@@ -25,13 +25,21 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const unlisten = listen<boolean>("tunnel-state", (event) => {
+      setIsRunning(event.payload);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
   async function startTunnel() {
     try {
       await invoke("start_tunnel");
-      setIsRunning(true);
       setLogs((prev) => [...prev, "--- TUNNEL ROUTING ACTIVE ---"]);
     } catch (err) {
       setLogs((prev) => [...prev, `[ERROR] starting tunnel: ${err}`]);
@@ -41,7 +49,6 @@ function App() {
   async function stopTunnel() {
     try {
       await invoke("stop_tunnel");
-      setIsRunning(false);
       setLogs((prev) => [...prev, "--- TUNNEL ROUTING STOPPED ---"]);
     } catch (err) {
       setLogs((prev) => [...prev, `[ERROR] stopping tunnel: ${err}`]);
