@@ -287,6 +287,12 @@ pub fn build_client_config(
             "protocol": "dns",
             "action": "hijack-dns"
           },
+          // IPv6 для MVP блокируем внутри туннеля, чтобы не допускать утечек
+          {
+            "ip_version": 6,
+            "action": "reject",
+            "method": "drop"
+          },
           // Критичные российские домены — напрямую, даже если их нет в rule-set
           {
             "domain_suffix": CURATED_RU_DOMAIN_SUFFIXES,
