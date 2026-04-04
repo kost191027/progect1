@@ -7,7 +7,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{sleep, Duration};
 
 mod generator;
-#[allow(dead_code)]
 mod geodata;
 mod ssh;
 

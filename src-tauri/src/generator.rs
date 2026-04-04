@@ -2,6 +2,10 @@ use serde_json::json;
 use tauri::AppHandle;
 use tauri_plugin_shell::ShellExt;
 
+use crate::geodata::{
+    ADS_RULE_SET_TAG, DIRECT_ROUTE_RULE_SET_TAGS, DNS_DIRECT_RULE_SET_TAGS, REMOTE_RULE_SETS,
+};
+
 #[derive(Debug)]
 pub struct RealityKeys {
     pub private_key: String,
@@ -203,15 +207,11 @@ pub fn build_client_config(
         "strategy": "prefer_ipv4",
         "rules": [
           {
-            "rule_set": "geosite-category-ads-all",
+            "rule_set": ADS_RULE_SET_TAG,
             "action": "reject"
           },
           {
-            "rule_set": [
-              "geosite-category-gov-ru",
-              "geosite-yandex",
-              "geosite-vk"
-            ],
+            "rule_set": DNS_DIRECT_RULE_SET_TAGS,
             "server": "dns-direct"
           }
         ],
@@ -284,18 +284,13 @@ pub fn build_client_config(
           },
           // Российские сайты и IP — напрямую (Split-Tunneling)
           {
-            "rule_set": [
-              "geoip-ru",
-              "geosite-category-gov-ru",
-              "geosite-yandex",
-              "geosite-vk"
-            ],
+            "rule_set": DIRECT_ROUTE_RULE_SET_TAGS,
             "action": "route",
             "outbound": "direct"
           },
           // Реклама — блочим
           {
-            "rule_set": "geosite-category-ads-all",
+            "rule_set": ADS_RULE_SET_TAG,
             "action": "reject"
           },
           // Приватные сети (192.168.x.x, 10.x.x.x) — напрямую
@@ -314,43 +309,15 @@ pub fn build_client_config(
         },
 
         // GeoIP / GeoSite базы — sing-box скачает сам (remote rule-set)
-        "rule_set": [
-          {
-            "tag": "geoip-ru",
+        "rule_set": REMOTE_RULE_SETS.iter().map(|rule_set| {
+          json!({
+            "tag": rule_set.tag,
             "type": "remote",
             "format": "binary",
-            "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
+            "url": rule_set.url,
             "download_detour": "direct"
-          },
-          {
-            "tag": "geosite-category-gov-ru",
-            "type": "remote",
-            "format": "binary",
-            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-gov-ru.srs",
-            "download_detour": "direct"
-          },
-          {
-            "tag": "geosite-yandex",
-            "type": "remote",
-            "format": "binary",
-            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-yandex.srs",
-            "download_detour": "direct"
-          },
-          {
-            "tag": "geosite-vk",
-            "type": "remote",
-            "format": "binary",
-            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-vk.srs",
-            "download_detour": "direct"
-          },
-          {
-            "tag": "geosite-category-ads-all",
-            "type": "remote",
-            "format": "binary",
-            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
-            "download_detour": "direct"
-          }
-        ]
+          })
+        }).collect::<Vec<_>>()
       }
     });
 
