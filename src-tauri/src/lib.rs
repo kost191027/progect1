@@ -15,10 +15,16 @@ struct AppState {
     singbox_pid: Mutex<Option<u32>>,
     network_fingerprint: Mutex<Option<String>>,
     recovery_in_progress: Mutex<bool>,
+    proxy_failure_count: Mutex<u8>,
+    kill_switch_engaged: Mutex<bool>,
 }
 
 fn emit_tunnel_state(app: &AppHandle, is_running: bool) {
     let _ = app.emit("tunnel-state", is_running);
+}
+
+fn emit_guard_state(app: &AppHandle, state: &str) {
+    let _ = app.emit("tunnel-guard-state", state.to_string());
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -175,6 +181,48 @@ fn finish_recovery(state: &AppState) {
     *guard = false;
 }
 
+fn reset_guard_state(state: &AppState) {
+    *state.proxy_failure_count.lock().unwrap() = 0;
+    *state.kill_switch_engaged.lock().unwrap() = false;
+}
+
+fn register_proxy_failure(app: &AppHandle, state: &AppState) {
+    let mut failure_count = state.proxy_failure_count.lock().unwrap();
+    *failure_count = failure_count.saturating_add(1);
+
+    if *failure_count < 3 {
+        return;
+    }
+
+    drop(failure_count);
+
+    let mut engaged = state.kill_switch_engaged.lock().unwrap();
+    if *engaged {
+        return;
+    }
+
+    *engaged = true;
+    let _ = app.emit(
+        "tunnel-log",
+        "[GUARD] Proxy path is degraded. Kill-switch remains engaged for non-direct traffic."
+            .to_string(),
+    );
+    emit_guard_state(app, "engaged");
+}
+
+fn classify_proxy_failure(line: &str) -> bool {
+    let lower = line.to_lowercase();
+
+    lower.contains("outbound/vless[proxy]")
+        && (lower.contains("handshake failure")
+            || lower.contains("connection refused")
+            || lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("network is unreachable")
+            || lower.contains("no route to host")
+            || lower.contains("eof"))
+}
+
 /// Находит абсолютный путь до sidecar-бинарника `sing-box`
 fn resolve_singbox_path() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -290,7 +338,9 @@ async fn verify_tunnel_start(
     }
 
     set_network_fingerprint(state, current_network_fingerprint());
+    reset_guard_state(state);
     emit_tunnel_state(app, true);
+    emit_guard_state(app, "active");
 
     Ok(())
 }
@@ -328,6 +378,10 @@ fn spawn_log_reader(app: AppHandle, pid: u32, log_path: &'static str) {
                 Ok(Some(line)) => {
                     if !line.trim().is_empty() {
                         let _ = app.emit("tunnel-log", format!("[CORE] {}", line));
+                        if classify_proxy_failure(&line) {
+                            let state = app.state::<AppState>();
+                            register_proxy_failure(&app, &state);
+                        }
                     }
                 }
                 Ok(None) => {
@@ -363,6 +417,7 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
                     }
                     set_network_fingerprint(&state, None);
                     finish_recovery(&state);
+                    reset_guard_state(&state);
                 }
 
                 let _ = app.emit(
@@ -370,6 +425,7 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
                     "[SYSTEM] Core process exited. Tunnel is no longer active.".to_string(),
                 );
                 emit_tunnel_state(&app, false);
+                emit_guard_state(&app, "inactive");
                 break;
             }
         }
@@ -445,6 +501,7 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                                 .to_string(),
                         );
                         emit_tunnel_state(&app, false);
+                        emit_guard_state(&app, "inactive");
                     }
                 }
                 Err(err) => {
@@ -453,6 +510,7 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                         format!("[WARN] Tunnel recovery failed: {}", err),
                     );
                     emit_tunnel_state(&app, false);
+                    emit_guard_state(&app, "inactive");
                 }
             }
 
@@ -522,7 +580,9 @@ async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
             let _ = std::fs::remove_file("/tmp/rkn-tun.log");
             set_network_fingerprint(&state, None);
             finish_recovery(&state);
+            reset_guard_state(&state);
             emit_tunnel_state(&app, false);
+            emit_guard_state(&app, "inactive");
 
             Ok(())
         }
@@ -533,7 +593,9 @@ async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
             );
             set_network_fingerprint(&state, None);
             finish_recovery(&state);
+            reset_guard_state(&state);
             emit_tunnel_state(&app, false);
+            emit_guard_state(&app, "inactive");
             Ok(())
         }
     }
@@ -548,6 +610,8 @@ pub fn run() {
             singbox_pid: Mutex::new(None),
             network_fingerprint: Mutex::new(None),
             recovery_in_progress: Mutex::new(false),
+            proxy_failure_count: Mutex::new(0),
+            kill_switch_engaged: Mutex::new(false),
         })
         .setup(|app| {
             // --- System Tray (живёт в менюбаре macOS) ---
@@ -577,7 +641,9 @@ pub fn run() {
                             let _ = terminate_root_process(pid);
                             let _ = std::fs::remove_file("/tmp/rkn-tun.log");
                         }
+                        reset_guard_state(&state);
                         emit_tunnel_state(app, false);
+                        emit_guard_state(app, "inactive");
                         app.exit(0);
                     }
                     _ => {}

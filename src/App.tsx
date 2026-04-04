@@ -6,6 +6,7 @@ import "./App.css";
 function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
+  const [guardState, setGuardState] = useState<"inactive" | "active" | "engaged">("inactive");
   
   // SSH Credentials state
   const [host, setHost] = useState("");
@@ -27,6 +28,17 @@ function App() {
   useEffect(() => {
     const unlisten = listen<boolean>("tunnel-state", (event) => {
       setIsRunning(event.payload);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<string>("tunnel-guard-state", (event) => {
+      if (event.payload === "active" || event.payload === "engaged" || event.payload === "inactive") {
+        setGuardState(event.payload);
+      }
     });
     return () => {
       unlisten.then((f) => f());
@@ -136,6 +148,23 @@ function App() {
             <div className="absolute top-4 right-4 flex items-center gap-2">
 			        <span className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Status:</span>
               <div className={`w-3 h-3 rounded-full ${isRunning ? 'bg-green-500 shadow-[0_0_12px_#22c55e]' : 'bg-red-500 shadow-[0_0_12px_#ef4444]'}`}></div>
+            </div>
+
+            <div className="w-full rounded-xl border border-zinc-800 bg-[#181818] px-4 py-3 text-sm">
+              <span className="text-zinc-500 uppercase tracking-wider">Guard:</span>{" "}
+              <span className={`font-bold ${
+                guardState === "engaged"
+                  ? "text-amber-400"
+                  : guardState === "active"
+                    ? "text-emerald-400"
+                    : "text-zinc-500"
+              }`}>
+                {guardState === "engaged"
+                  ? "Kill-switch engaged"
+                  : guardState === "active"
+                    ? "Protected"
+                    : "Inactive"}
+              </span>
             </div>
 
             <div className="flex flex-col items-center gap-4 w-full px-4">
