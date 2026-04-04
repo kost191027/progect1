@@ -78,6 +78,7 @@ pub fn build_server_config(
     short_id: &str,
     uuid: &str,
     shadow_pass: &str,
+    external_port: u16,
 ) -> String {
     let cover_domain = "www.microsoft.com";
 
@@ -92,7 +93,7 @@ pub fn build_server_config(
           "type": "shadowtls",
           "tag": "in-stls",
           "listen": "::",
-          "listen_port": 443,
+          "listen_port": external_port,
           "version": 3,
           "users": [
             {
@@ -149,6 +150,7 @@ pub fn build_client_config(
     short_id: &str,
     uuid: &str,
     shadow_pass: &str,
+    external_port: u16,
 ) -> String {
     let cover_domain = "www.microsoft.com";
 
@@ -250,7 +252,7 @@ pub fn build_client_config(
           "type": "shadowtls",
           "tag": "shadowtls-out",
           "server": server_ip,
-          "server_port": 443,
+          "server_port": external_port,
           "version": 3,
           "password": shadow_pass,
           "tls": {

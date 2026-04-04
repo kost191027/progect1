@@ -4,6 +4,57 @@ use std::io::Write;
 use std::net::TcpStream;
 use tauri::{AppHandle, Emitter, Manager};
 
+const EXTERNAL_PORT_CANDIDATES: [u16; 4] = [443, 5443, 7443, 9443];
+
+fn run_remote_command(sess: &Session, command: &str) -> Result<(String, i32), String> {
+    let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
+    channel.exec(command).map_err(|e| e.to_string())?;
+
+    let mut stdout = String::new();
+    channel
+        .read_to_string(&mut stdout)
+        .map_err(|e| e.to_string())?;
+
+    channel.wait_close().map_err(|e| e.to_string())?;
+    let exit_status = channel.exit_status().map_err(|e| e.to_string())?;
+
+    Ok((stdout, exit_status))
+}
+
+fn select_remote_external_port(sess: &Session) -> Result<u16, String> {
+    let candidates = EXTERNAL_PORT_CANDIDATES
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let command = format!(
+        "bash -lc 'for port in {}; do if ! ss -Htanl \"( sport = :$port )\" | grep -q .; then echo \"$port\"; exit 0; fi; done; exit 1'",
+        candidates
+    );
+
+    let (stdout, exit_status) = run_remote_command(sess, &command)?;
+
+    if exit_status != 0 {
+        return Err(format!(
+            "No free external ports found in candidate list: {}",
+            candidates
+        ));
+    }
+
+    let selected_port = stdout
+        .lines()
+        .find_map(|line| line.trim().parse::<u16>().ok())
+        .ok_or_else(|| {
+            format!(
+                "Failed to parse remote selected port from output: {}",
+                stdout
+            )
+        })?;
+
+    Ok(selected_port)
+}
+
 #[tauri::command]
 pub async fn deploy_server(
     app: AppHandle,
@@ -30,30 +81,11 @@ pub async fn deploy_server(
         .await
         .unwrap_or_else(|_| "shadow_secure_pass".to_string());
 
-    // 2. Build Server and Client JSON configs
-    let server_cfg =
-        crate::generator::build_server_config(&reality_keys, &short_id, &uuid, &shadow_pass);
-
     // Получаем путь к AppData
     let local_data = app
         .path()
         .app_local_data_dir()
         .unwrap_or_else(|_| std::env::temp_dir());
-
-    let client_cfg =
-        crate::generator::build_client_config(&host, &reality_keys, &short_id, &uuid, &shadow_pass);
-
-    // 3. Save Client Config locally in AppData
-    std::fs::create_dir_all(&local_data).unwrap();
-    let client_cfg_path = local_data.join("client_config.json");
-    std::fs::write(&client_cfg_path, &client_cfg).unwrap();
-    let _ = app.emit(
-        "tunnel-log",
-        format!(
-            "[SYSTEM] Client config safely generated at: {:?}",
-            client_cfg_path
-        ),
-    );
 
     // 4. Perform SSH upload and deployment (Blocking)
     tauri::async_runtime::spawn_blocking(move || {
@@ -79,6 +111,43 @@ pub async fn deploy_server(
         let _ = app.emit(
             "tunnel-log",
             "[SSH] Authenticated successfully.".to_string(),
+        );
+
+        let _ = app.emit(
+            "tunnel-log",
+            "[SSH] Running remote pre-flight checks for external port...".to_string(),
+        );
+
+        let external_port = select_remote_external_port(&sess)?;
+        if external_port == 443 {
+            let _ = app.emit(
+                "tunnel-log",
+                "[SSH] Port 443 is available on remote host.".to_string(),
+            );
+        } else {
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SSH WARN] Port 443 is busy. Falling back to external port {}.",
+                    external_port
+                ),
+            );
+        }
+
+        let server_cfg = crate::generator::build_server_config(
+            &reality_keys,
+            &short_id,
+            &uuid,
+            &shadow_pass,
+            external_port,
+        );
+        let client_cfg = crate::generator::build_client_config(
+            &host,
+            &reality_keys,
+            &short_id,
+            &uuid,
+            &shadow_pass,
+            external_port,
         );
 
         let deploy_script = include_str!("../scripts/deploy.sh");
@@ -131,9 +200,23 @@ CONFIGEOF
         let exit_status = channel.exit_status().unwrap();
 
         if exit_status == 0 {
+            std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
+            let client_cfg_path = local_data.join("client_config.json");
+            std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
+
             let _ = app.emit(
                 "tunnel-log",
-                "[SSH] Deployment finished successfully!".to_string(),
+                format!(
+                    "[SYSTEM] Client config safely generated at: {:?}",
+                    client_cfg_path
+                ),
+            );
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SSH] Deployment finished successfully! External port: {}",
+                    external_port
+                ),
             );
             Ok(())
         } else {
