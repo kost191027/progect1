@@ -5,6 +5,25 @@ use std::net::TcpStream;
 use tauri::{AppHandle, Emitter, Manager};
 
 const EXTERNAL_PORT_CANDIDATES: [u16; 4] = [443, 5443, 7443, 9443];
+const PINNED_SING_BOX_IMAGE: &str = "ghcr.io/sagernet/sing-box:v1.11.4";
+const CONTAINER_PREFIXES: [&str; 5] = [
+    "sys-networkd",
+    "mdns-relay",
+    "core-authd",
+    "netdiag-agent",
+    "kernel-events",
+];
+
+fn build_container_name(short_id: &str) -> String {
+    let seed = short_id
+        .get(0..2)
+        .and_then(|prefix| u8::from_str_radix(prefix, 16).ok())
+        .unwrap_or(0);
+    let prefix = CONTAINER_PREFIXES[(seed as usize) % CONTAINER_PREFIXES.len()];
+    let suffix = short_id.get(0..6).unwrap_or(short_id);
+
+    format!("{}-{}", prefix, suffix)
+}
 
 fn run_remote_command(sess: &Session, command: &str) -> Result<(String, i32), String> {
     let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
@@ -134,6 +153,15 @@ pub async fn deploy_server(
             );
         }
 
+        let container_name = build_container_name(&short_id);
+        let _ = app.emit(
+            "tunnel-log",
+            format!(
+                "[SSH] Selected pinned image {} and container name {}.",
+                PINNED_SING_BOX_IMAGE, container_name
+            ),
+        );
+
         let server_cfg = crate::generator::build_server_config(
             &reality_keys,
             &short_id,
@@ -156,13 +184,15 @@ pub async fn deploy_server(
         let injected_script = format!(
             r#"#!/bin/bash
 mkdir -p /opt/rkn
-cat << 'CONFIGEOF' > /opt/rkn/config.json
+export RKN_IMAGE='{}'
+export RKN_CONTAINER_NAME='{}'
+cat << 'CONFIGEOF' > /opt/rkn/config.candidate.json
 {}
 CONFIGEOF
 
 {}
 "#,
-            server_cfg, deploy_script
+            PINNED_SING_BOX_IMAGE, container_name, server_cfg, deploy_script
         );
 
         let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
