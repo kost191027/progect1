@@ -24,6 +24,22 @@ export type SavedServerProfile = {
 };
 
 const MAX_LOG_BUFFER = 800;
+const HAS_COMPLETED_FIRST_START_KEY = "rkn.has-completed-first-start";
+
+function profilesMatch(
+  left: SavedServerProfile | null,
+  right: SavedServerProfile | null,
+) {
+  if (!left || !right) {
+    return false;
+  }
+
+  return (
+    left.host === right.host &&
+    left.user === right.user &&
+    left.password === right.password
+  );
+}
 
 function stripLogPrefix(message: string) {
   return message
@@ -53,10 +69,14 @@ export function useControlCenter() {
   const [host, setHost] = useState("");
   const [user, setUser] = useState("root");
   const [password, setPassword] = useState("");
+  const [savedProfile, setSavedProfile] = useState<SavedServerProfile | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [trimmedLogCount, setTrimmedLogCount] = useState(0);
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastUserMessage, setLastUserMessage] = useState("Ready to deploy a server or start an existing tunnel.");
+  const [hasCompletedFirstStart, setHasCompletedFirstStart] = useState<boolean>(() => {
+    return window.localStorage.getItem(HAS_COMPLETED_FIRST_START_KEY) === "true";
+  });
 
   function appendLog(message: string) {
     setLogs((prev) => {
@@ -107,6 +127,7 @@ export function useControlCenter() {
         setHost(profile.host);
         setUser(profile.user);
         setPassword(profile.password);
+        setSavedProfile(profile);
         appendLog("[SYSTEM] Saved server profile loaded.");
       } catch (error) {
         if (!isMounted) {
@@ -163,6 +184,8 @@ export function useControlCenter() {
       if (event.payload) {
         setLastError(null);
         setLastUserMessage("Tunnel is active and ready to carry protected traffic.");
+        setHasCompletedFirstStart(true);
+        window.localStorage.setItem(HAS_COMPLETED_FIRST_START_KEY, "true");
       }
     });
 
@@ -235,6 +258,7 @@ export function useControlCenter() {
 
     try {
       await invoke("deploy_server", { host, user, pass: password });
+      setSavedProfile({ host, user, password });
     } catch (error) {
       appendLog(`[MAIN ERROR] Deploy failed: ${error}`);
     } finally {
@@ -331,12 +355,27 @@ export function useControlCenter() {
     };
   }, [guardState, isDeploying, isRunning, isStarting, lastError, lastUserMessage]);
 
+  const currentProfile = useMemo<SavedServerProfile | null>(() => {
+    if (!host || !user || !password) {
+      return null;
+    }
+
+    return { host, user, password };
+  }, [host, password, user]);
+
+  const deployActionLabel = useMemo(() => {
+    return profilesMatch(savedProfile, currentProfile) ? "Update" : "Deploy";
+  }, [currentProfile, savedProfile]);
+
   return {
     host,
     user,
     password,
+    savedProfile,
     logs,
     trimmedLogCount,
+    hasCompletedFirstStart,
+    deployActionLabel,
     guardState,
     statusSummary,
     isRunning,
@@ -356,3 +395,5 @@ export function useControlCenter() {
     copyLogs,
   };
 }
+
+export type ControlCenterModel = ReturnType<typeof useControlCenter>;

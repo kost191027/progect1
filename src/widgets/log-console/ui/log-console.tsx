@@ -1,19 +1,16 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-
-import { Button } from "../../../shared/ui/button";
+import { useDeferredValue, useEffect, useMemo, useRef } from "react";
 
 const DEFAULT_VISIBLE_LOGS = 160;
 
 type LogConsoleProps = {
   logs: string[];
   trimmedLogCount: number;
-  onCopyLogs: () => void;
+  showAll: boolean;
 };
 
-export function LogConsole({ logs, trimmedLogCount, onCopyLogs }: LogConsoleProps) {
+export function LogConsole({ logs, trimmedLogCount, showAll }: LogConsoleProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
-  const [copied, setCopied] = useState(false);
-  const [expanded, setExpanded] = useState(false);
   const deferredLogs = useDeferredValue(logs);
 
   const logSummary = useMemo(() => {
@@ -41,53 +38,31 @@ export function LogConsole({ logs, trimmedLogCount, onCopyLogs }: LogConsoleProp
   }, [deferredLogs]);
 
   const visibleLogs = useMemo(() => {
-    if (expanded) {
+    if (showAll) {
       return deferredLogs;
     }
 
     return deferredLogs.slice(-DEFAULT_VISIBLE_LOGS);
-  }, [deferredLogs, expanded]);
+  }, [deferredLogs, showAll]);
 
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: expanded ? "auto" : "smooth" });
-  }, [expanded, visibleLogs]);
-
-  useEffect(() => {
-    if (!copied) {
+    if (!containerRef.current) {
       return;
     }
 
-    const timeoutId = window.setTimeout(() => setCopied(false), 1500);
-    return () => window.clearTimeout(timeoutId);
-  }, [copied]);
+    const target = containerRef.current.scrollHeight;
+    containerRef.current.scrollTo({
+      top: target,
+      behavior: showAll ? "auto" : "smooth",
+    });
+  }, [showAll, visibleLogs]);
 
   return (
-    <div className="group relative flex h-96 w-full flex-col overflow-y-auto rounded-2xl border border-zinc-800 bg-[#0a0a0a] p-5 font-mono text-sm">
+    <div
+      ref={containerRef}
+      className="relative flex h-[320px] w-full flex-col overflow-y-auto rounded-2xl border border-zinc-800 bg-[#0a0a0a] p-4 font-mono text-sm sm:h-[360px] sm:p-5 lg:h-[420px]"
+    >
       <div className="pointer-events-none absolute left-0 top-0 z-10 h-8 w-full bg-gradient-to-b from-[#0a0a0a] to-transparent" />
-
-      {logs.length > 0 && (
-        <div className="absolute right-4 top-2 z-20 flex items-center gap-2 opacity-0 transition-opacity group-hover:opacity-100">
-          <Button
-            variant="secondary"
-            className="px-3 py-1 text-xs normal-case tracking-normal"
-            onClick={() => {
-              setExpanded((prev) => !prev);
-            }}
-          >
-            {expanded ? "Show Latest" : `Show All (${logSummary.total})`}
-          </Button>
-          <Button
-            variant="secondary"
-            className="px-3 py-1 text-xs normal-case tracking-normal"
-            onClick={() => {
-              void onCopyLogs();
-              setCopied(true);
-            }}
-          >
-            {copied ? "Copied!" : "Copy Logs"}
-          </Button>
-        </div>
-      )}
 
       {logs.length === 0 ? (
         <div className="m-auto flex select-none flex-col items-center gap-2 italic text-zinc-600">
@@ -110,7 +85,7 @@ export function LogConsole({ logs, trimmedLogCount, onCopyLogs }: LogConsoleProp
             <span>System: {logSummary.system}</span>
           </div>
 
-          {!expanded && deferredLogs.length > DEFAULT_VISIBLE_LOGS && (
+          {!showAll && deferredLogs.length > DEFAULT_VISIBLE_LOGS && (
             <div className="rounded-xl border border-zinc-800 bg-[#111212] px-3 py-2 text-xs text-zinc-500">
               Showing the latest {DEFAULT_VISIBLE_LOGS} log lines to keep the console responsive.
             </div>

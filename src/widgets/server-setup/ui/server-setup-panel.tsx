@@ -8,6 +8,7 @@ type ServerSetupPanelProps = {
   password: string;
   isRunning: boolean;
   isDeploying: boolean;
+  deployActionLabel: string;
   onHostChange: (value: string) => void;
   onUserChange: (value: string) => void;
   onPasswordChange: (value: string) => void;
@@ -20,6 +21,7 @@ export function ServerSetupPanel({
   password,
   isRunning,
   isDeploying,
+  deployActionLabel,
   onHostChange,
   onUserChange,
   onPasswordChange,
@@ -40,20 +42,20 @@ export function ServerSetupPanel({
             onChange={(event) => onHostChange(event.target.value)}
           />
 
-          <div className="flex gap-3">
+          <div className="flex flex-col gap-3 sm:flex-row">
             <Input
               type="text"
               placeholder="Login"
               value={user}
               onChange={(event) => onUserChange(event.target.value)}
-              className="w-1/3"
+              className="sm:w-1/3"
             />
             <Input
               type="password"
               placeholder="Password"
               value={password}
               onChange={(event) => onPasswordChange(event.target.value)}
-              className="w-2/3"
+              className="sm:w-2/3"
             />
           </div>
         </div>
@@ -71,7 +73,7 @@ export function ServerSetupPanel({
               Deploying...
             </>
           ) : (
-            "Deploy or Update"
+            deployActionLabel
           )}
         </Button>
       </div>

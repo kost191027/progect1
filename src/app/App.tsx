@@ -1,7 +1,7 @@
-import { HomePage } from "../pages/home/ui/home-page";
+import { RootPage } from "../pages/root/ui/root-page";
 
 export function App() {
-  return <HomePage />;
+  return <RootPage />;
 }
 
 export default App;
