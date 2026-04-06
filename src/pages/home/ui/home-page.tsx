@@ -28,6 +28,7 @@ export function HomePage() {
           <SystemStatusPanel
             isRunning={controlCenter.isRunning}
             guardState={controlCenter.guardState}
+            statusSummary={controlCenter.statusSummary}
           />
 
           <ServerSetupPanel

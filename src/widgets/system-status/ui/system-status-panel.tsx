@@ -1,30 +1,46 @@
-import type { GuardState } from "../../../features/control-center/model/use-control-center";
+import type {
+  GuardState,
+  StatusSummary,
+} from "../../../features/control-center/model/use-control-center";
 import { Panel } from "../../../shared/ui/panel";
 import { StatusBadge } from "../../../shared/ui/status-badge";
 
 type SystemStatusPanelProps = {
   isRunning: boolean;
   guardState: GuardState;
+  statusSummary: StatusSummary;
 };
 
-export function SystemStatusPanel({ isRunning, guardState }: SystemStatusPanelProps) {
+const toneClasses: Record<StatusSummary["state"], string> = {
+  inactive: "border-zinc-800 bg-[#181818] text-zinc-200",
+  deploying: "border-blue-900/60 bg-blue-950/20 text-blue-100",
+  connecting: "border-sky-900/60 bg-sky-950/20 text-sky-100",
+  protected: "border-emerald-900/60 bg-emerald-950/20 text-emerald-100",
+  engaged: "border-amber-900/60 bg-amber-950/20 text-amber-100",
+  error: "border-red-900/60 bg-red-950/20 text-red-100",
+};
+
+export function SystemStatusPanel({
+  isRunning,
+  guardState,
+  statusSummary,
+}: SystemStatusPanelProps) {
   return (
     <Panel
-      title="Connection"
-      subtitle={
-        isRunning
-          ? "Tunnel is active. Protection state is shown below."
-          : "Tunnel is not active. Deploy or start when you are ready."
-      }
+      title="Status"
+      subtitle="A simple summary of the current protection state."
       className="bg-[#1a1a1a]"
     >
       <div className="flex flex-col gap-4">
-        <div className="flex items-center justify-between rounded-xl border border-zinc-800 bg-[#181818] px-4 py-3">
+        <div
+          className={`flex items-start justify-between rounded-xl border px-4 py-4 ${toneClasses[statusSummary.state]}`}
+        >
           <div>
-            <div className="text-xs font-bold uppercase tracking-wider text-zinc-500">Core Status</div>
-            <div className="mt-1 text-base font-semibold text-white">
-              {isRunning ? "Tunnel running" : "Tunnel stopped"}
+            <div className="text-xs font-bold uppercase tracking-wider text-zinc-500">
+              User-facing status
             </div>
+            <div className="mt-1 text-base font-semibold text-white">{statusSummary.title}</div>
+            <p className="mt-2 max-w-xl text-sm leading-6 text-zinc-300">{statusSummary.description}</p>
           </div>
 
           <div
@@ -36,7 +52,16 @@ export function SystemStatusPanel({ isRunning, guardState }: SystemStatusPanelPr
           />
         </div>
 
-        <StatusBadge label="Guard" state={guardState} />
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="rounded-xl border border-zinc-800 bg-[#181818] px-4 py-3 text-sm">
+            <div className="text-xs font-bold uppercase tracking-wider text-zinc-500">Core</div>
+            <div className="mt-1 font-semibold text-white">
+              {isRunning ? "Tunnel running" : "Tunnel stopped"}
+            </div>
+          </div>
+
+          <StatusBadge label="Guard" state={guardState} />
+        </div>
       </div>
     </Panel>
   );

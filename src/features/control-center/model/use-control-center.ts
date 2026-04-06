@@ -1,8 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 export type GuardState = "inactive" | "active" | "engaged";
+export type UserFacingState =
+  | "inactive"
+  | "deploying"
+  | "connecting"
+  | "protected"
+  | "engaged"
+  | "error";
+
+export type StatusSummary = {
+  state: UserFacingState;
+  title: string;
+  description: string;
+};
 
 export type SavedServerProfile = {
   host: string;
@@ -10,20 +23,58 @@ export type SavedServerProfile = {
   password: string;
 };
 
+function stripLogPrefix(message: string) {
+  return message
+    .replace(/^\[(SYSTEM|WARN|ERROR|MAIN ERROR)\]\s*/i, "")
+    .replace(/^---\s*/g, "")
+    .trim();
+}
+
+function isErrorLog(message: string) {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("[error]") ||
+    lower.includes("[main error]") ||
+    lower.includes(" fatal") ||
+    lower.startsWith("fatal")
+  );
+}
+
 export function useControlCenter() {
   const [isRunning, setIsRunning] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
   const [isRotatingSni, setIsRotatingSni] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
   const [guardState, setGuardState] = useState<GuardState>("inactive");
   const [host, setHost] = useState("");
   const [user, setUser] = useState("root");
   const [password, setPassword] = useState("");
   const [logs, setLogs] = useState<string[]>([]);
+  const [lastError, setLastError] = useState<string | null>(null);
+  const [lastUserMessage, setLastUserMessage] = useState("Ready to deploy a server or start an existing tunnel.");
+
+  function appendLog(message: string) {
+    setLogs((prev) => [...prev, message]);
+
+    if (isErrorLog(message)) {
+      setLastError(stripLogPrefix(message));
+      return;
+    }
+
+    if (
+      message.startsWith("[SYSTEM]") ||
+      message.startsWith("[WARN]") ||
+      message.startsWith("---")
+    ) {
+      setLastUserMessage(stripLogPrefix(message));
+    }
+  }
 
   useEffect(() => {
     const unlisten = listen<string>("tunnel-log", (event) => {
-      setLogs((prev) => [...prev, event.payload]);
+      appendLog(event.payload);
     });
 
     return () => {
@@ -44,13 +95,13 @@ export function useControlCenter() {
         setHost(profile.host);
         setUser(profile.user);
         setPassword(profile.password);
-        setLogs((prev) => [...prev, "[SYSTEM] Saved server profile loaded."]);
+        appendLog("[SYSTEM] Saved server profile loaded.");
       } catch (error) {
         if (!isMounted) {
           return;
         }
 
-        setLogs((prev) => [...prev, `[WARN] Failed to load saved server profile: ${error}`]);
+        appendLog(`[WARN] Failed to load saved server profile: ${error}`);
       }
     }
 
@@ -73,16 +124,15 @@ export function useControlCenter() {
 
         setIsRunning(true);
         setGuardState("active");
-        setLogs((prev) => [
-          ...prev,
-          `[SYSTEM] Active sing-box session restored from previous launch (PID ${pid}).`,
-        ]);
+        setLastError(null);
+        setLastUserMessage("Tunnel session restored from the previous launch.");
+        appendLog(`[SYSTEM] Active sing-box session restored from previous launch (PID ${pid}).`);
       } catch (error) {
         if (!isMounted) {
           return;
         }
 
-        setLogs((prev) => [...prev, `[WARN] Failed to restore tunnel session: ${error}`]);
+        appendLog(`[WARN] Failed to restore tunnel session: ${error}`);
       }
     }
 
@@ -96,6 +146,12 @@ export function useControlCenter() {
   useEffect(() => {
     const unlisten = listen<boolean>("tunnel-state", (event) => {
       setIsRunning(event.payload);
+      setIsStarting(false);
+      setIsStopping(false);
+      if (event.payload) {
+        setLastError(null);
+        setLastUserMessage("Tunnel is active and ready to carry protected traffic.");
+      }
     });
 
     return () => {
@@ -111,6 +167,14 @@ export function useControlCenter() {
         event.payload === "inactive"
       ) {
         setGuardState(event.payload);
+        if (event.payload === "engaged") {
+          setLastUserMessage(
+            "Proxy path is degraded. Protected routes remain blocked until the tunnel is healthy again.",
+          );
+        } else if (event.payload === "active") {
+          setLastError(null);
+          setLastUserMessage("Tunnel is healthy. Protected traffic is routed through the proxy path.");
+        }
       }
     });
 
@@ -120,36 +184,47 @@ export function useControlCenter() {
   }, []);
 
   async function startTunnel() {
+    setIsStarting(true);
+    setLastError(null);
+    setLastUserMessage("Starting the local tunnel and requesting system permissions if needed.");
+
     try {
       await invoke("start_tunnel");
-      setLogs((prev) => [...prev, "--- TUNNEL ROUTING ACTIVE ---"]);
+      appendLog("--- TUNNEL ROUTING ACTIVE ---");
     } catch (error) {
-      setLogs((prev) => [...prev, `[ERROR] starting tunnel: ${error}`]);
+      appendLog(`[ERROR] starting tunnel: ${error}`);
+      setIsStarting(false);
     }
   }
 
   async function stopTunnel() {
+    setIsStopping(true);
+    setLastUserMessage("Stopping the tunnel and removing local routing.");
+
     try {
       await invoke("stop_tunnel");
-      setLogs((prev) => [...prev, "--- TUNNEL ROUTING STOPPED ---"]);
+      appendLog("--- TUNNEL ROUTING STOPPED ---");
     } catch (error) {
-      setLogs((prev) => [...prev, `[ERROR] stopping tunnel: ${error}`]);
+      appendLog(`[ERROR] stopping tunnel: ${error}`);
+      setIsStopping(false);
     }
   }
 
   async function deployServer() {
     if (!host || !user || !password) {
-      setLogs((prev) => [...prev, "[MAIN ERROR] Please fill in Host IP, Username, and Password."]);
+      appendLog("[MAIN ERROR] Please fill in Host IP, Username, and Password.");
       return;
     }
 
     setIsDeploying(true);
-    setLogs((prev) => [...prev, "--- INITIATING REMOTE SERVER DEPLOYMENT ---"]);
+    setLastError(null);
+    setLastUserMessage("Connecting to the server and applying the current transport configuration.");
+    appendLog("--- INITIATING REMOTE SERVER DEPLOYMENT ---");
 
     try {
       await invoke("deploy_server", { host, user, pass: password });
     } catch (error) {
-      setLogs((prev) => [...prev, `[MAIN ERROR] Deploy failed: ${error}`]);
+      appendLog(`[MAIN ERROR] Deploy failed: ${error}`);
     } finally {
       setIsDeploying(false);
     }
@@ -157,12 +232,13 @@ export function useControlCenter() {
 
   async function checkServerStatus() {
     setIsCheckingStatus(true);
-    setLogs((prev) => [...prev, "--- CHECKING REMOTE SERVER STATUS ---"]);
+    setLastUserMessage("Collecting remote diagnostics from the current server.");
+    appendLog("--- CHECKING REMOTE SERVER STATUS ---");
 
     try {
       await invoke("check_server_status");
     } catch (error) {
-      setLogs((prev) => [...prev, `[MAIN ERROR] Server status check failed: ${error}`]);
+      appendLog(`[MAIN ERROR] Server status check failed: ${error}`);
     } finally {
       setIsCheckingStatus(false);
     }
@@ -170,13 +246,16 @@ export function useControlCenter() {
 
   async function rotateSni() {
     setIsRotatingSni(true);
-    setLogs((prev) => [...prev, "--- ROTATING SHADOWTLS COVER DOMAIN ---"]);
+    setLastUserMessage("Rotating the ShadowTLS cover domain and deploying fresh transport credentials.");
+    appendLog("--- ROTATING SHADOWTLS COVER DOMAIN ---");
 
     try {
       const domain = await invoke<string>("rotate_sni");
-      setLogs((prev) => [...prev, `--- SNI ROTATED TO: ${domain} ---`]);
+      setLastError(null);
+      setLastUserMessage(`New cover domain is active: ${domain}.`);
+      appendLog(`--- SNI ROTATED TO: ${domain} ---`);
     } catch (error) {
-      setLogs((prev) => [...prev, `[MAIN ERROR] SNI rotation failed: ${error}`]);
+      appendLog(`[MAIN ERROR] SNI rotation failed: ${error}`);
     } finally {
       setIsRotatingSni(false);
     }
@@ -185,11 +264,60 @@ export function useControlCenter() {
   async function copyLogs() {
     try {
       await navigator.clipboard.writeText(logs.join("\n"));
-      setLogs((prev) => [...prev, "[SYSTEM] Log stream copied to clipboard."]);
+      appendLog("[SYSTEM] Log stream copied to clipboard.");
     } catch (error) {
-      setLogs((prev) => [...prev, `[WARN] Failed to copy logs: ${error}`]);
+      appendLog(`[WARN] Failed to copy logs: ${error}`);
     }
   }
+
+  const statusSummary = useMemo<StatusSummary>(() => {
+    if (isDeploying) {
+      return {
+        state: "deploying",
+        title: "Deploying server",
+        description: "The app is connecting over SSH, updating the transport stack, and preparing a fresh client config.",
+      };
+    }
+
+    if (isStarting) {
+      return {
+        state: "connecting",
+        title: "Starting tunnel",
+        description: "The app is requesting permissions, launching sing-box, and waiting for the tunnel to become active.",
+      };
+    }
+
+    if (isRunning && guardState === "engaged") {
+      return {
+        state: "engaged",
+        title: "Protection degraded",
+        description:
+          "The proxy path is unhealthy. Safe direct routes may still work, while protected traffic stays blocked instead of leaking.",
+      };
+    }
+
+    if (isRunning) {
+      return {
+        state: "protected",
+        title: "Protected",
+        description: "The tunnel is running and the proxy path is currently healthy.",
+      };
+    }
+
+    if (lastError && !isRunning) {
+      return {
+        state: "error",
+        title: "Attention needed",
+        description: lastError,
+      };
+    }
+
+    return {
+      state: "inactive",
+      title: "Tunnel inactive",
+      description: lastUserMessage,
+    };
+  }, [guardState, isDeploying, isRunning, isStarting, lastError, lastUserMessage]);
 
   return {
     host,
@@ -197,10 +325,13 @@ export function useControlCenter() {
     password,
     logs,
     guardState,
+    statusSummary,
     isRunning,
     isDeploying,
     isCheckingStatus,
     isRotatingSni,
+    isStarting,
+    isStopping,
     setHost,
     setUser,
     setPassword,
