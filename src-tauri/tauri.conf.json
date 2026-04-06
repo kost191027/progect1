@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "progect-1",
+  "productName": "RKN",
   "version": "0.1.0",
-  "identifier": "com.konstantinsmygin.progect-1",
+  "identifier": "com.konstantinsmygin.rkn",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "progect-1",
+        "title": "RKN",
         "width": 800,
         "height": 600
       }
