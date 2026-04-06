@@ -2,10 +2,27 @@ use serde_json::json;
 use tauri::AppHandle;
 use tauri_plugin_shell::ShellExt;
 
-#[derive(Debug)]
-pub struct RealityKeys {
-    pub private_key: String,
-    pub public_key: String,
+use crate::geodata::{CURATED_RU_DOMAIN_SUFFIXES, DIRECT_ROUTE_RULE_SET_TAGS, REMOTE_RULE_SETS};
+
+pub const INTERNAL_SS_PORT: u16 = 14433;
+
+/// Cover domains for ShadowTLS handshake — high-traffic TLS sites that DPI
+/// expects to see on any network. Rotated per deploy to diversify fingerprint.
+const COVER_DOMAINS: &[&str] = &[
+    "www.microsoft.com",
+    "www.apple.com",
+    "www.googleapis.com",
+    "cdn.cloudflare.com",
+    "www.amazon.com",
+];
+
+/// Pick a cover domain deterministically from the short_id hex seed.
+pub fn select_cover_domain(short_id: &str) -> &'static str {
+    let seed = short_id
+        .get(0..2)
+        .and_then(|h| u8::from_str_radix(h, 16).ok())
+        .unwrap_or(0) as usize;
+    COVER_DOMAINS[seed % COVER_DOMAINS.len()]
 }
 
 async fn run_singbox_generate(app: &AppHandle, args: &[&str]) -> Result<String, String> {
@@ -35,30 +52,6 @@ fn is_hex_string(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
-pub async fn generate_reality_keypair(app: &AppHandle) -> Result<RealityKeys, String> {
-    let stdout = run_singbox_generate(app, &["generate", "reality-keypair"]).await?;
-
-    let mut private_key = String::new();
-    let mut public_key = String::new();
-
-    for line in stdout.lines() {
-        if line.starts_with("PrivateKey: ") {
-            private_key = line.replace("PrivateKey: ", "").trim().to_string();
-        } else if line.starts_with("PublicKey: ") {
-            public_key = line.replace("PublicKey: ", "").trim().to_string();
-        }
-    }
-
-    if private_key.is_empty() || public_key.is_empty() {
-        return Err("Failed to parse reality keypair from sing-box".to_string());
-    }
-
-    Ok(RealityKeys {
-        private_key,
-        public_key,
-    })
-}
-
 pub async fn generate_short_id(app: &AppHandle) -> Result<String, String> {
     let short_id = run_singbox_generate(app, &["generate", "rand", "8", "--hex"]).await?;
 
@@ -69,33 +62,58 @@ pub async fn generate_short_id(app: &AppHandle) -> Result<String, String> {
     Ok(short_id.to_ascii_lowercase())
 }
 
-pub async fn generate_uuid(app: &AppHandle) -> Result<String, String> {
-    run_singbox_generate(app, &["generate", "uuid"]).await
+pub async fn generate_shadowtls_password(app: &AppHandle) -> Result<String, String> {
+    let password = run_singbox_generate(app, &["generate", "rand", "16", "--hex"]).await?;
+
+    if !is_hex_string(&password) {
+        return Err(format!(
+            "Generated ShadowTLS password is not valid hex: {}",
+            password
+        ));
+    }
+
+    if password.len() < 32 {
+        return Err(format!(
+            "Generated ShadowTLS password is unexpectedly short ({} chars): {}",
+            password.len(),
+            password
+        ));
+    }
+
+    Ok(password.to_ascii_lowercase())
+}
+
+pub async fn generate_ss_password(app: &AppHandle) -> Result<String, String> {
+    run_singbox_generate(app, &["generate", "rand", "16", "--base64"]).await
 }
 
 pub fn build_server_config(
-    keys: &RealityKeys,
-    short_id: &str,
-    uuid: &str,
+    _server_ip: &str,
     shadow_pass: &str,
+    ss_password: &str,
+    external_port: u16,
+    cover_domain: &str,
 ) -> String {
-    let cover_domain = "www.microsoft.com";
+    // Always bind to 0.0.0.0 — on NAT VPS the public IP is not assigned
+    // to any local interface, so bind(public_ip) fails with EADDRNOTAVAIL.
+    let listen_host = "0.0.0.0";
 
     let config = json!({
       "log": {
         "disabled": false,
-        "level": "info",
+        "level": "debug",
         "timestamp": true
       },
       "inbounds": [
         {
           "type": "shadowtls",
           "tag": "in-stls",
-          "listen": "::",
-          "listen_port": 443,
+          "listen": listen_host,
+          "listen_port": external_port,
           "version": 3,
           "users": [
             {
+              "name": "default",
               "password": shadow_pass
             }
           ],
@@ -103,32 +121,17 @@ pub fn build_server_config(
             "server": cover_domain,
             "server_port": 443
           },
-          "detour": "in-reality"
+          "detour": "ss-in"
         },
         {
-          "type": "vless",
-          "tag": "in-reality",
+          "type": "shadowsocks",
+          "tag": "ss-in",
           "listen": "127.0.0.1",
-          "listen_port": 8443,
-          "users": [
-            {
-              "name": "rkn-user",
-              "uuid": uuid,
-              "flow": "xtls-rprx-vision"
-            }
-          ],
-          "tls": {
-            "enabled": true,
-            "server_name": cover_domain,
-            "reality": {
-              "enabled": true,
-              "handshake": {
-                "server": cover_domain,
-                "server_port": 443
-              },
-              "private_key": keys.private_key,
-              "short_id": [short_id]
-            }
+          "listen_port": INTERNAL_SS_PORT,
+          "method": "2022-blake3-aes-128-gcm",
+          "password": ss_password,
+          "multiplex": {
+            "enabled": true
           }
         }
       ],
@@ -137,7 +140,14 @@ pub fn build_server_config(
           "type": "direct",
           "tag": "direct"
         }
-      ]
+      ],
+      "route": {
+        "rules": [
+          {
+            "outbound": "direct"
+          }
+        ]
+      }
     });
 
     serde_json::to_string_pretty(&config).unwrap()
@@ -145,24 +155,18 @@ pub fn build_server_config(
 
 pub fn build_client_config(
     server_ip: &str,
-    keys: &RealityKeys,
-    short_id: &str,
-    uuid: &str,
     shadow_pass: &str,
+    ss_password: &str,
+    external_port: u16,
+    cover_domain: &str,
 ) -> String {
-    let cover_domain = "www.microsoft.com";
-
     let mut tun_inbound = json!({
       "type": "tun",
       "tag": "tun-in",
-      "address": [
-        "172.19.0.1/30",
-        "fdfe:dcba:9876::1/126"
-      ],
+      "address": ["172.19.0.1/30"],
       "auto_route": true,
       "strict_route": true,
-      "stack": "system",
-      "mtu": 1280
+      "stack": "system"
     });
 
     if !cfg!(target_os = "macos") {
@@ -171,78 +175,50 @@ pub fn build_client_config(
 
     let config = json!({
       "log": {
-        "level": "info",
-        "timestamp": true
+        "level": "info"
       },
 
-      // --- DNS: sing-box 1.12+ новый формат серверов ---
       "dns": {
         "servers": [
           {
-            "type": "https",
-            "tag": "dns-remote",
-            "server": "1.1.1.1",
-            "server_port": 443,
-            "domain_resolver": "dns-bootstrap"
-          },
-          {
-            "type": "https",
-            "tag": "dns-direct",
-            "server": "dns.google",
-            "server_port": 443,
-            "domain_resolver": "dns-bootstrap"
-          },
-          {
+            "tag": "proxy-dns",
             "type": "udp",
-            "tag": "dns-bootstrap",
-            "server": "8.8.8.8"
+            "server": "1.1.1.1"
+          },
+          {
+            "tag": "direct-dns",
+            "type": "udp",
+            "server": "77.88.8.8"
           }
         ],
-        "strategy": "prefer_ipv4",
         "rules": [
           {
-            "rule_set": "geosite-category-ads-all",
-            "action": "reject"
+            "rule_set": DIRECT_ROUTE_RULE_SET_TAGS,
+            "server": "direct-dns"
           },
           {
-            "rule_set": [
-              "geosite-category-gov-ru",
-              "geosite-yandex",
-              "geosite-vk"
-            ],
-            "server": "dns-direct"
+            "domain_suffix": CURATED_RU_DOMAIN_SUFFIXES,
+            "server": "direct-dns"
           }
         ],
-        "final": "dns-remote",
-        "independent_cache": true
+        "final": "proxy-dns"
       },
 
-      // --- TUN Inbound: перехват всего системного трафика ---
       "inbounds": [
         tun_inbound
       ],
 
-      // --- Outbounds ---
       "outbounds": [
         {
-          "type": "vless",
+          "type": "shadowsocks",
           "tag": "proxy",
           "server": server_ip,
-          "server_port": 8443,
-          "uuid": uuid,
-          "flow": "xtls-rprx-vision",
-          "tls": {
-            "enabled": true,
-            "server_name": cover_domain,
-            "utls": {
-              "enabled": true,
-              "fingerprint": "chrome"
-            },
-            "reality": {
-              "enabled": true,
-              "public_key": keys.public_key,
-              "short_id": short_id
-            }
+          "server_port": external_port,
+          "method": "2022-blake3-aes-128-gcm",
+          "password": ss_password,
+          "udp_over_tcp": true,
+          "multiplex": {
+            "enabled": true
           },
           "detour": "shadowtls-out"
         },
@@ -250,7 +226,7 @@ pub fn build_client_config(
           "type": "shadowtls",
           "tag": "shadowtls-out",
           "server": server_ip,
-          "server_port": 443,
+          "server_port": external_port,
           "version": 3,
           "password": shadow_pass,
           "tls": {
@@ -268,87 +244,47 @@ pub fn build_client_config(
         }
       ],
 
-      // --- Route: Умная маршрутизация (sing-box 1.11+ actions) ---
       "route": {
         "rules": [
-          // Sniff: определяет протокол трафика
           {
             "action": "sniff"
           },
-          // DNS-запросы → перехватываем и отправляем в DNS-модуль
           {
             "protocol": "dns",
             "action": "hijack-dns"
           },
-          // Российские сайты и IP — напрямую (Split-Tunneling)
           {
-            "rule_set": [
-              "geoip-ru",
-              "geosite-category-gov-ru",
-              "geosite-yandex",
-              "geosite-vk"
-            ],
+            "ip_cidr": [format!("{}/32", server_ip)],
             "action": "route",
             "outbound": "direct"
           },
-          // Реклама — блочим
           {
-            "rule_set": "geosite-category-ads-all",
-            "action": "reject"
+            "domain_suffix": CURATED_RU_DOMAIN_SUFFIXES,
+            "action": "route",
+            "outbound": "direct"
           },
-          // Приватные сети (192.168.x.x, 10.x.x.x) — напрямую
           {
-            "ip_is_private": true,
+            "rule_set": DIRECT_ROUTE_RULE_SET_TAGS,
             "action": "route",
             "outbound": "direct"
           }
         ],
-        // Всё остальное — через зашифрованный туннель
         "final": "proxy",
+        "default_domain_resolver": "direct-dns",
         "auto_detect_interface": true,
-        "default_domain_resolver": {
-          "server": "dns-bootstrap",
-          "strategy": "prefer_ipv4"
-        },
-
-        // GeoIP / GeoSite базы — sing-box скачает сам (remote rule-set)
-        "rule_set": [
-          {
-            "tag": "geoip-ru",
+        "rule_set": REMOTE_RULE_SETS
+        .iter()
+        .filter(|rule_set| DIRECT_ROUTE_RULE_SET_TAGS.contains(&rule_set.tag))
+        .map(|rule_set| {
+          json!({
+            "tag": rule_set.tag,
             "type": "remote",
             "format": "binary",
-            "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
+            "url": rule_set.url,
             "download_detour": "direct"
-          },
-          {
-            "tag": "geosite-category-gov-ru",
-            "type": "remote",
-            "format": "binary",
-            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-gov-ru.srs",
-            "download_detour": "direct"
-          },
-          {
-            "tag": "geosite-yandex",
-            "type": "remote",
-            "format": "binary",
-            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-yandex.srs",
-            "download_detour": "direct"
-          },
-          {
-            "tag": "geosite-vk",
-            "type": "remote",
-            "format": "binary",
-            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-vk.srs",
-            "download_detour": "direct"
-          },
-          {
-            "tag": "geosite-category-ads-all",
-            "type": "remote",
-            "format": "binary",
-            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
-            "download_detour": "direct"
-          }
-        ]
+          })
+        })
+        .collect::<Vec<_>>()
       }
     });
 
