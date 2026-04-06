@@ -6,9 +6,6 @@ pub struct RemoteRuleSet {
 
 pub const ADS_RULE_SET_TAG: &str = "geosite-category-ads-all";
 
-pub const DNS_DIRECT_RULE_SET_TAGS: &[&str] =
-    &["geosite-category-gov-ru", "geosite-yandex", "geosite-vk"];
-
 pub const DIRECT_ROUTE_RULE_SET_TAGS: &[&str] = &[
     "geoip-ru",
     "geosite-category-gov-ru",

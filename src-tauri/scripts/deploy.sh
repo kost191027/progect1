@@ -111,7 +111,17 @@ docker run -d --name "$CONTAINER_NAME" \
 NEW_CONTAINER_CREATED=1
 
 # 5. Простая проверка
-if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" = "true" ]; then
+echo "[INFO] Waiting for container to stay healthy..."
+sleep 3
+for attempt in 1 2 3 4 5; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || echo false)" = "true" ]; then
+        sleep 1
+    else
+        break
+    fi
+done
+
+if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || echo false)" = "true" ]; then
     echo "$CONTAINER_NAME" > "$ACTIVE_CONTAINER_FILE"
 
     if [ -n "$ROLLBACK_CONTAINER" ] && docker inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
@@ -124,5 +134,6 @@ if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" = "true" ]; t
     echo "[SUCCESS] RKN Deploy Script Finished & Container is UP!"
 else
     echo "[ERROR] Container failed to start. Rollback needed."
+    docker logs --tail 30 "$CONTAINER_NAME" 2>&1 || true
     exit 1
 fi

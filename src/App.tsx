@@ -3,9 +3,17 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
+type SavedServerProfile = {
+  host: string;
+  user: string;
+  password: string;
+};
+
 function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
+  const [isCheckingStatus, setIsCheckingStatus] = useState(false);
+  const [isRotatingSni, setIsRotatingSni] = useState(false);
   const [guardState, setGuardState] = useState<"inactive" | "active" | "engaged">("inactive");
   
   // SSH Credentials state
@@ -22,6 +30,68 @@ function App() {
     });
     return () => {
       unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadSavedProfile() {
+      try {
+        const profile = await invoke<SavedServerProfile | null>("load_saved_server_profile");
+        if (!isMounted || !profile) {
+          return;
+        }
+
+        setHost(profile.host);
+        setUser(profile.user);
+        setPassword(profile.password);
+        setLogs((prev) => [...prev, "[SYSTEM] Saved server profile loaded."]);
+      } catch (err) {
+        if (!isMounted) {
+          return;
+        }
+
+        setLogs((prev) => [...prev, `[WARN] Failed to load saved server profile: ${err}`]);
+      }
+    }
+
+    void loadSavedProfile();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function restoreTunnelSession() {
+      try {
+        const pid = await invoke<number | null>("restore_tunnel_session");
+        if (!isMounted || pid === null) {
+          return;
+        }
+
+        setIsRunning(true);
+        setGuardState("active");
+        setLogs((prev) => [
+          ...prev,
+          `[SYSTEM] Active sing-box session restored from previous launch (PID ${pid}).`,
+        ]);
+      } catch (err) {
+        if (!isMounted) {
+          return;
+        }
+
+        setLogs((prev) => [...prev, `[WARN] Failed to restore tunnel session: ${err}`]);
+      }
+    }
+
+    void restoreTunnelSession();
+
+    return () => {
+      isMounted = false;
     };
   }, []);
 
@@ -89,6 +159,31 @@ function App() {
     }
   }
 
+  async function checkServerStatus() {
+    setIsCheckingStatus(true);
+    setLogs((prev) => [...prev, "--- CHECKING REMOTE SERVER STATUS ---"]);
+    try {
+      await invoke("check_server_status");
+    } catch (err) {
+      setLogs((prev) => [...prev, `[MAIN ERROR] Server status check failed: ${err}`]);
+    } finally {
+      setIsCheckingStatus(false);
+    }
+  }
+
+  async function rotateSni() {
+    setIsRotatingSni(true);
+    setLogs((prev) => [...prev, "--- ROTATING SHADOWTLS COVER DOMAIN ---"]);
+    try {
+      const domain = await invoke<string>("rotate_sni");
+      setLogs((prev) => [...prev, `--- SNI ROTATED TO: ${domain} ---`]);
+    } catch (err) {
+      setLogs((prev) => [...prev, `[MAIN ERROR] SNI rotation failed: ${err}`]);
+    } finally {
+      setIsRotatingSni(false);
+    }
+  }
+
   return (
     <main className="min-h-screen bg-[#111111] flex flex-col items-center justify-center p-6 text-white font-sans selection:bg-green-500/30">
       <h1 className="text-3xl font-extrabold mb-8 text-transparent bg-clip-text bg-gradient-to-r from-green-400 to-emerald-600 text-center tracking-tight">
@@ -130,9 +225,9 @@ function App() {
 
             <button 
               onClick={deployServer}
-              disabled={isDeploying || isRunning}
+              disabled={isDeploying || isCheckingStatus || isRunning}
               className={`mt-2 w-full py-3 rounded-xl font-bold uppercase tracking-wider transition-all duration-300 flex items-center justify-center gap-2 ${
-                isDeploying || isRunning
+                isDeploying || isCheckingStatus || isRunning
                   ? 'bg-zinc-800 text-zinc-600 cursor-not-allowed' 
                   : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-[0_0_20px_rgba(16,185,129,0.2)] hover:shadow-[0_0_30px_rgba(16,185,129,0.4)] active:scale-95'
               }`}
@@ -141,6 +236,31 @@ function App() {
                 <><span className="animate-spin text-lg">⚙</span> Deploying...</>
               ) : 'Deploy Node'}
             </button>
+
+            <div className="flex gap-2">
+              <button
+                onClick={checkServerStatus}
+                disabled={isDeploying || isCheckingStatus || isRotatingSni}
+                className={`flex-1 py-3 rounded-xl font-bold uppercase tracking-wider transition-all duration-300 text-sm ${
+                  isDeploying || isCheckingStatus || isRotatingSni
+                    ? 'bg-zinc-800 text-zinc-600 cursor-not-allowed'
+                    : 'bg-zinc-700 hover:bg-zinc-600 text-white active:scale-95'
+                }`}
+              >
+                {isCheckingStatus ? "Checking..." : "Server Status"}
+              </button>
+              <button
+                onClick={rotateSni}
+                disabled={isDeploying || isCheckingStatus || isRotatingSni || isRunning}
+                className={`flex-1 py-3 rounded-xl font-bold uppercase tracking-wider transition-all duration-300 text-sm ${
+                  isDeploying || isCheckingStatus || isRotatingSni || isRunning
+                    ? 'bg-zinc-800 text-zinc-600 cursor-not-allowed'
+                    : 'bg-violet-700 hover:bg-violet-600 text-white active:scale-95'
+                }`}
+              >
+                {isRotatingSni ? "Rotating..." : "Rotate SNI"}
+              </button>
+            </div>
           </div>
 
           {/* Правая панель: Локальный туннель */}
@@ -196,7 +316,20 @@ function App() {
 
         {/* Консоль логов */}
         <div className="w-full bg-[#0a0a0a] p-5 h-96 overflow-y-auto font-mono text-sm flex flex-col relative group">
-          <div className="absolute top-0 left-0 w-full h-8 bg-gradient-to-b from-[#0a0a0a] to-transparent pointer-events-none"></div>
+          <div className="absolute top-0 left-0 w-full h-8 bg-gradient-to-b from-[#0a0a0a] to-transparent pointer-events-none z-10"></div>
+          {logs.length > 0 && (
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(logs.join("\n"));
+                const btn = document.getElementById("copy-logs-btn");
+                if (btn) { btn.textContent = "Copied!"; setTimeout(() => { btn.textContent = "Copy Logs"; }, 1500); }
+              }}
+              id="copy-logs-btn"
+              className="absolute top-2 right-4 z-20 px-3 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white text-xs font-mono transition-all opacity-0 group-hover:opacity-100"
+            >
+              Copy Logs
+            </button>
+          )}
           
           {logs.length === 0 ? (
             <div className="m-auto text-zinc-600 italic select-none flex flex-col items-center gap-2">

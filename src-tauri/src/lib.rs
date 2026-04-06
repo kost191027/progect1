@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::{fs, path::PathBuf};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
@@ -17,6 +18,43 @@ struct AppState {
     recovery_in_progress: Mutex<bool>,
     proxy_failure_count: Mutex<u8>,
     kill_switch_engaged: Mutex<bool>,
+}
+
+fn tunnel_pid_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    Ok(local_data.join("active_tunnel_pid"))
+}
+
+fn save_tunnel_pid(app: &AppHandle, pid: u32) -> Result<(), String> {
+    let pid_path = tunnel_pid_path(app)?;
+
+    if let Some(parent) = pid_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    fs::write(pid_path, pid.to_string()).map_err(|e| e.to_string())
+}
+
+fn load_saved_tunnel_pid(app: &AppHandle) -> Result<Option<u32>, String> {
+    let pid_path = tunnel_pid_path(app)?;
+
+    if !pid_path.exists() {
+        return Ok(None);
+    }
+
+    let pid_raw = fs::read_to_string(pid_path).map_err(|e| e.to_string())?;
+    let pid = pid_raw
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| format!("Failed to parse saved tunnel PID: {}", e))?;
+
+    Ok(Some(pid))
+}
+
+fn clear_saved_tunnel_pid(app: &AppHandle) {
+    if let Ok(pid_path) = tunnel_pid_path(app) {
+        let _ = fs::remove_file(pid_path);
+    }
 }
 
 fn emit_tunnel_state(app: &AppHandle, is_running: bool) {
@@ -213,14 +251,13 @@ fn register_proxy_failure(app: &AppHandle, state: &AppState) {
 fn classify_proxy_failure(line: &str) -> bool {
     let lower = line.to_lowercase();
 
-    lower.contains("outbound/vless[proxy]")
-        && (lower.contains("handshake failure")
+    lower.contains("outbound/shadowsocks[proxy]")
+        && (lower.contains("context deadline exceeded")
             || lower.contains("connection refused")
-            || lower.contains("timed out")
-            || lower.contains("timeout")
+            || lower.contains("i/o timeout")
             || lower.contains("network is unreachable")
             || lower.contains("no route to host")
-            || lower.contains("eof"))
+            || lower.contains("connection reset"))
 }
 
 /// Находит абсолютный путь до sidecar-бинарника `sing-box`
@@ -237,14 +274,20 @@ fn resolve_singbox_path() -> Result<String, String> {
         return Err("Unsupported architecture".to_string());
     };
 
-    let sidecar_name = format!("sing-box-{}", arch_suffix);
-    let sidecar_path = dir.join(&sidecar_name);
-
-    if sidecar_path.exists() {
-        Ok(sidecar_path.to_string_lossy().to_string())
-    } else {
-        Ok("sing-box".to_string())
+    // Tauri v2 dev build: sing-box-<arch> (from bins/)
+    let sidecar_with_arch = dir.join(format!("sing-box-{}", arch_suffix));
+    if sidecar_with_arch.exists() {
+        return Ok(sidecar_with_arch.to_string_lossy().to_string());
     }
+
+    // Tauri v2 bundle / debug copy: sing-box (arch suffix stripped by Tauri)
+    let sidecar_plain = dir.join("sing-box");
+    if sidecar_plain.exists() {
+        return Ok(sidecar_plain.to_string_lossy().to_string());
+    }
+
+    // Fallback: system PATH
+    Ok("sing-box".to_string())
 }
 
 async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result<u32, String> {
@@ -268,7 +311,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
     }
 
     let shell_cmd = format!(
-        "{} run -c '{}' > {} 2>&1 & echo $!",
+        "'{}' run -c '{}' > {} 2>&1 & echo $!",
         singbox_path, config_str, log_path
     );
 
@@ -325,6 +368,7 @@ async fn verify_tunnel_start(
         }
 
         set_network_fingerprint(state, None);
+        clear_saved_tunnel_pid(app);
         emit_tunnel_state(app, false);
 
         let log_tail = recent_log_tail(log_path, 20);
@@ -339,6 +383,7 @@ async fn verify_tunnel_start(
 
     set_network_fingerprint(state, current_network_fingerprint());
     reset_guard_state(state);
+    save_tunnel_pid(app, pid)?;
     emit_tunnel_state(app, true);
     emit_guard_state(app, "active");
 
@@ -416,6 +461,7 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
                         *guard = None;
                     }
                     set_network_fingerprint(&state, None);
+                    clear_saved_tunnel_pid(&app);
                     finish_recovery(&state);
                     reset_guard_state(&state);
                 }
@@ -479,6 +525,7 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                     *guard = None;
                 }
             }
+            clear_saved_tunnel_pid(&app);
 
             match launch_tunnel_process(&app, false).await {
                 Ok(new_pid) => {
@@ -578,6 +625,7 @@ async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
             }
 
             let _ = std::fs::remove_file("/tmp/rkn-tun.log");
+            clear_saved_tunnel_pid(&app);
             set_network_fingerprint(&state, None);
             finish_recovery(&state);
             reset_guard_state(&state);
@@ -592,6 +640,7 @@ async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
                 "[SYSTEM] No active tunnel to stop.".to_string(),
             );
             set_network_fingerprint(&state, None);
+            clear_saved_tunnel_pid(&app);
             finish_recovery(&state);
             reset_guard_state(&state);
             emit_tunnel_state(&app, false);
@@ -599,6 +648,47 @@ async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
             Ok(())
         }
     }
+}
+
+#[tauri::command]
+async fn restore_tunnel_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<u32>, String> {
+    {
+        let current_pid = *state.singbox_pid.lock().unwrap();
+        if current_pid.is_some() {
+            return Ok(current_pid);
+        }
+    }
+
+    let Some(saved_pid) = load_saved_tunnel_pid(&app)? else {
+        emit_tunnel_state(&app, false);
+        emit_guard_state(&app, "inactive");
+        return Ok(None);
+    };
+
+    if !process_exists(saved_pid) {
+        clear_saved_tunnel_pid(&app);
+        emit_tunnel_state(&app, false);
+        emit_guard_state(&app, "inactive");
+        return Ok(None);
+    }
+
+    {
+        let mut guard = state.singbox_pid.lock().unwrap();
+        *guard = Some(saved_pid);
+    }
+
+    set_network_fingerprint(&state, current_network_fingerprint());
+    reset_guard_state(&state);
+    emit_tunnel_state(&app, true);
+    emit_guard_state(&app, "active");
+    spawn_log_reader(app.clone(), saved_pid, "/tmp/rkn-tun.log");
+    spawn_process_exit_monitor(app.clone(), saved_pid);
+    spawn_network_recovery_monitor(app.clone(), saved_pid);
+
+    Ok(Some(saved_pid))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -641,6 +731,7 @@ pub fn run() {
                             let _ = terminate_root_process(pid);
                             let _ = std::fs::remove_file("/tmp/rkn-tun.log");
                         }
+                        clear_saved_tunnel_pid(app);
                         reset_guard_state(&state);
                         emit_tunnel_state(app, false);
                         emit_guard_state(app, "inactive");
@@ -663,7 +754,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_tunnel,
             stop_tunnel,
-            ssh::deploy_server
+            restore_tunnel_session,
+            ssh::deploy_server,
+            ssh::load_saved_server_profile,
+            ssh::check_server_status,
+            ssh::rotate_sni
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
