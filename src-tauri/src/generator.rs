@@ -183,14 +183,12 @@ pub fn build_client_config(
           {
             "tag": "proxy-dns",
             "type": "udp",
-            "server": "1.1.1.1",
-            "detour": "proxy"
+            "server": "1.1.1.1"
           },
           {
             "tag": "direct-dns",
             "type": "udp",
-            "server": "77.88.8.8",
-            "detour": "direct"
+            "server": "77.88.8.8"
           }
         ],
         "rules": [
@@ -272,6 +270,7 @@ pub fn build_client_config(
           }
         ],
         "final": "proxy",
+        "default_domain_resolver": "direct-dns",
         "auto_detect_interface": true,
         "rule_set": REMOTE_RULE_SETS
         .iter()

@@ -7,8 +7,16 @@ const faqItems = [
     body: "Open Settings, enter the server IP, login, and password, then run Deploy or Update. After the first successful tunnel start, the app opens on the Start / Stop screen on later launches.",
   },
   {
+    title: "Is the app private and safe to use?",
+    body: "The app talks directly to your server over SSH and does not use a third-party backend for your server credentials or tunnel traffic. For convenience, the current MVP stores the last successful server credentials locally on this Mac so you do not need to type them every launch. They are not synced to cloud services, and the traffic itself is handled by sing-box on your device and your own server.",
+  },
+  {
     title: "What server is recommended?",
     body: "Use a clean Ubuntu or Debian VPS with a public IPv4 address, SSH access, and Docker support. For a personal setup, 1 vCPU and 1 GB RAM is a practical minimum; 2 GB RAM is a safer choice if you expect heavier browsing or multiple devices later.",
+  },
+  {
+    title: "Can I install it on a busy server?",
+    body: "Yes. The client is designed for both a fresh VPS and a server that already runs other software. It checks Docker, creates its own folder under /opt/rkn, pulls the required sing-box image, and starts its own container on the first free port from the current candidate list. It does not modify nginx, websites, databases, unrelated containers, or system configs. It only works inside /opt/rkn and manages its own RKN container. If all candidate ports are already occupied, deploy stops with a clear error instead of overwriting another service.",
   },
   {
     title: "Which ports should be available?",
@@ -40,6 +48,21 @@ export function InfoScreen() {
         title="Setup notes and FAQ"
         description="This screen collects the practical notes a user may need after installation: setup flow, server requirements, and a short explanation of the transport stack used in the current MVP build."
       />
+
+      <div className="rounded-2xl border border-zinc-800 bg-[#121313] px-5 py-5">
+        <div className="text-[11px] font-bold uppercase tracking-[0.22em] text-zinc-500">
+          What this app does
+        </div>
+        <p className="mt-3 text-sm leading-6 text-zinc-300">
+          Recursive Kinetic Network prepares your server, generates the transport configuration,
+          and runs a local tunnel through sing-box with a simple desktop control layer on top.
+        </p>
+        <p className="mt-3 text-sm leading-6 text-zinc-400">
+          In everyday use, the app is meant to feel like a quiet on and off switch: configure once,
+          start protection when needed, and keep the advanced details available without forcing the
+          user to read raw network internals.
+        </p>
+      </div>
 
       <div className="flex flex-col gap-3">
         {faqItems.map((item) => (

@@ -17,6 +17,12 @@ export type StatusSummary = {
   description: string;
 };
 
+export type ServerStatusSummary = {
+  title: string;
+  description: string;
+  tone: "neutral" | "ready" | "attention";
+};
+
 export type SavedServerProfile = {
   host: string;
   user: string;
@@ -25,6 +31,7 @@ export type SavedServerProfile = {
 
 const MAX_LOG_BUFFER = 800;
 const HAS_COMPLETED_FIRST_START_KEY = "rkn.has-completed-first-start";
+const LAST_DEPLOYED_AT_KEY = "rkn.last-deployed-at";
 
 function profilesMatch(
   left: SavedServerProfile | null,
@@ -76,6 +83,9 @@ export function useControlCenter() {
   const [lastUserMessage, setLastUserMessage] = useState("Ready to deploy a server or start an existing tunnel.");
   const [hasCompletedFirstStart, setHasCompletedFirstStart] = useState<boolean>(() => {
     return window.localStorage.getItem(HAS_COMPLETED_FIRST_START_KEY) === "true";
+  });
+  const [lastDeployedAt, setLastDeployedAt] = useState<string | null>(() => {
+    return window.localStorage.getItem(LAST_DEPLOYED_AT_KEY);
   });
 
   function appendLog(message: string) {
@@ -225,7 +235,7 @@ export function useControlCenter() {
 
     try {
       await invoke("start_tunnel");
-      appendLog("--- TUNNEL ROUTING ACTIVE ---");
+      appendLog("[SYSTEM] Tunnel routing active.");
     } catch (error) {
       appendLog(`[ERROR] starting tunnel: ${error}`);
       setIsStarting(false);
@@ -238,7 +248,7 @@ export function useControlCenter() {
 
     try {
       await invoke("stop_tunnel");
-      appendLog("--- TUNNEL ROUTING STOPPED ---");
+      appendLog("[SYSTEM] Tunnel routing stopped.");
     } catch (error) {
       appendLog(`[ERROR] stopping tunnel: ${error}`);
       setIsStopping(false);
@@ -259,6 +269,9 @@ export function useControlCenter() {
     try {
       await invoke("deploy_server", { host, user, pass: password });
       setSavedProfile({ host, user, password });
+      const deployedAt = new Date().toISOString();
+      setLastDeployedAt(deployedAt);
+      window.localStorage.setItem(LAST_DEPLOYED_AT_KEY, deployedAt);
     } catch (error) {
       appendLog(`[MAIN ERROR] Deploy failed: ${error}`);
     } finally {
@@ -367,11 +380,88 @@ export function useControlCenter() {
     return profilesMatch(savedProfile, currentProfile) ? "Update" : "Deploy";
   }, [currentProfile, savedProfile]);
 
+  const formattedLastDeployedAt = useMemo(() => {
+    if (!lastDeployedAt) {
+      return "Not yet";
+    }
+
+    const date = new Date(lastDeployedAt);
+    if (Number.isNaN(date.getTime())) {
+      return "Not yet";
+    }
+
+    return new Intl.DateTimeFormat(undefined, {
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(date);
+  }, [lastDeployedAt]);
+
+  const serverStatusSummary = useMemo<ServerStatusSummary>(() => {
+    if (!host || !user || !password) {
+      return {
+        title: "Not configured",
+        description: "Add the server address and access credentials to prepare the first deploy.",
+        tone: "attention",
+      };
+    }
+
+    if (!savedProfile) {
+      return {
+        title: "Ready for first deploy",
+        description: "The current server details are filled in. Deploy will prepare the node and create a client config.",
+        tone: "neutral",
+      };
+    }
+
+    if (!profilesMatch(savedProfile, currentProfile)) {
+      return {
+        title: "Needs deploy",
+        description: "The server details were changed locally. Run Deploy to apply the new configuration.",
+        tone: "attention",
+      };
+    }
+
+    return {
+      title: "Configured",
+      description: "The current server profile matches the last successful deploy and is ready to use.",
+      tone: "ready",
+    };
+  }, [currentProfile, host, password, savedProfile, user]);
+
+  const powerQuickStatus = useMemo(() => {
+    if (isDeploying) {
+      return "Deploying server";
+    }
+
+    if (!savedProfile || !profilesMatch(savedProfile, currentProfile)) {
+      return "Needs deploy";
+    }
+
+    if (isStarting) {
+      return "Connecting";
+    }
+
+    if (isRunning && guardState === "engaged") {
+      return "Protection degraded";
+    }
+
+    if (isRunning) {
+      return "Protected";
+    }
+
+    return "Ready to start";
+  }, [currentProfile, guardState, isDeploying, isRunning, isStarting, savedProfile]);
+
   return {
     host,
     user,
     password,
     savedProfile,
+    formattedLastDeployedAt,
+    serverStatusSummary,
+    powerQuickStatus,
     logs,
     trimmedLogCount,
     hasCompletedFirstStart,

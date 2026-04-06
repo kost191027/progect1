@@ -7,6 +7,7 @@ type PowerScreenProps = {
   isBusy: boolean;
   guardState: GuardState;
   statusSummary: StatusSummary;
+  powerQuickStatus: string;
   onStart: () => void;
   onStop: () => void;
 };
@@ -16,6 +17,7 @@ export function PowerScreen({
   isBusy,
   guardState,
   statusSummary,
+  powerQuickStatus,
   onStart,
   onStop,
 }: PowerScreenProps) {
@@ -52,6 +54,10 @@ export function PowerScreen({
             />
           </div>
         </button>
+
+        <div className="rounded-full border border-zinc-800 bg-[#121313] px-4 py-2 text-sm text-zinc-300">
+          {powerQuickStatus}
+        </div>
 
         <div className="w-full max-w-2xl rounded-2xl border border-zinc-800 bg-[#121313] px-5 py-5 text-center">
           <div className="text-[11px] font-bold uppercase tracking-[0.24em] text-zinc-500">

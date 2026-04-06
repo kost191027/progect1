@@ -37,6 +37,7 @@ export function RootPage() {
               }
               guardState={controlCenter.guardState}
               statusSummary={controlCenter.statusSummary}
+              powerQuickStatus={controlCenter.powerQuickStatus}
               onStart={controlCenter.startTunnel}
               onStop={controlCenter.stopTunnel}
             />
