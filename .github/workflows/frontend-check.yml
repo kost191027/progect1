@@ -1,4 +1,4 @@
-name: Frontend Check
+name: RKN Checks
 
 on:
   push:
@@ -6,8 +6,16 @@ on:
       - "**"
   pull_request:
 
+concurrency:
+  group: rkn-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: Progect1
+
 jobs:
-  build-check:
+  checks:
     runs-on: ubuntu-latest
     env:
       VITE_APP_BUILD: ${{ github.run_number }}
@@ -21,9 +29,13 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: Progect1/package-lock.json
 
       - name: Install dependencies
         run: npm ci
 
       - name: TypeScript build check
         run: npm run build-check
+
+      - name: Rust cargo check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
