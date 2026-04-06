@@ -51,7 +51,7 @@ export function LogConsole({ logs, onCopyLogs }: LogConsoleProps) {
               d="M8 9l3 3-3 3m5 0h3M4 17h16a2 2 0 002-2V5a2 2 0 00-2-2H4a2 2 0 00-2 2v10a2 2 0 002 2z"
             />
           </svg>
-          No logs. Awaiting deployment or tunnel connection...
+          Logs will appear here during deploy, startup, and diagnostics.
         </div>
       ) : (
         <div className="flex flex-col gap-1 pb-4">

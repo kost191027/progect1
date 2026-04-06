@@ -27,15 +27,15 @@ export function ServerSetupPanel({
 }: ServerSetupPanelProps) {
   return (
     <Panel
-      title="Server"
-      subtitle="Enter SSH access once, then deploy or update the node from this screen."
+      title="Server Access"
+      subtitle="Save the server address and credentials locally, then deploy or update the node from here."
       className="bg-[#1a1a1a]"
     >
       <div className="flex flex-col gap-4">
         <div className="flex flex-col gap-3">
           <Input
             type="text"
-            placeholder="Server IP (e.g. 192.168.1.1)"
+            placeholder="Server IP"
             value={host}
             onChange={(event) => onHostChange(event.target.value)}
           />
@@ -43,7 +43,7 @@ export function ServerSetupPanel({
           <div className="flex gap-3">
             <Input
               type="text"
-              placeholder="Username"
+              placeholder="Login"
               value={user}
               onChange={(event) => onUserChange(event.target.value)}
               className="w-1/3"
@@ -61,7 +61,7 @@ export function ServerSetupPanel({
         <Button
           variant="success"
           fullWidth
-          className="mt-2 flex items-center justify-center gap-2 py-3"
+          className="mt-2 flex items-center justify-center gap-2"
           disabled={isDeploying || isRunning}
           onClick={onDeploy}
         >
@@ -71,7 +71,7 @@ export function ServerSetupPanel({
               Deploying...
             </>
           ) : (
-            "Deploy Node"
+            "Deploy or Update"
           )}
         </Button>
       </div>

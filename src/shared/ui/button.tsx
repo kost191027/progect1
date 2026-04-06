@@ -12,13 +12,13 @@ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
 
 const variantClasses: Record<ButtonVariant, string> = {
   primary:
-    "bg-blue-600 text-white shadow-[0_0_20px_rgba(37,99,235,0.3)] hover:bg-blue-500 hover:shadow-[0_0_30px_rgba(37,99,235,0.5)]",
-  secondary: "bg-zinc-700 text-white hover:bg-zinc-600",
+    "border border-[#2f5f86] bg-[#1a2f40] text-[#d9edf9] hover:bg-[#20394d]",
+  secondary: "border border-zinc-700 bg-[#202121] text-zinc-200 hover:bg-[#282929]",
   success:
-    "bg-emerald-600 text-white shadow-[0_0_20px_rgba(16,185,129,0.2)] hover:bg-emerald-500 hover:shadow-[0_0_30px_rgba(16,185,129,0.4)]",
+    "border border-[#3f6a4f] bg-[#1b2c20] text-[#dce8e0] hover:bg-[#223627]",
   danger:
-    "bg-red-600 text-white shadow-[0_0_20px_rgba(239,68,68,0.3)] hover:bg-red-500 hover:shadow-[0_0_30px_rgba(239,68,68,0.5)]",
-  accent: "bg-violet-700 text-white hover:bg-violet-600",
+    "border border-[#6b4440] bg-[#341f1d] text-[#f1dedb] hover:bg-[#412725]",
+  accent: "border border-[#57586a] bg-[#242530] text-[#e6e6ef] hover:bg-[#2c2d39]",
 };
 
 export function Button({
@@ -32,10 +32,10 @@ export function Button({
   return (
     <button
       className={cn(
-        "rounded-xl font-bold uppercase tracking-wider transition-all duration-300 active:scale-95",
+        "rounded-lg px-4 py-3 text-sm font-semibold uppercase tracking-[0.18em] transition-colors duration-100 active:translate-y-px",
         fullWidth && "w-full",
         disabled
-          ? "cursor-not-allowed bg-zinc-800 text-zinc-600 shadow-none"
+          ? "cursor-not-allowed border border-zinc-800 bg-[#171717] text-zinc-600"
           : variantClasses[variant],
         className,
       )}

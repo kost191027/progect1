@@ -17,7 +17,7 @@ export function TunnelControlsPanel({
   return (
     <Panel
       title="Tunnel"
-      subtitle="Main action area. Turn protection on or off from here."
+      subtitle="This is the main action area. Use it to turn protection on or off."
       className="bg-[#1a1a1a]"
     >
       <div className="flex w-full flex-col items-center gap-4">

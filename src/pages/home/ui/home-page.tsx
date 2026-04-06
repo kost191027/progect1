@@ -12,15 +12,15 @@ export function HomePage() {
     <main className="min-h-screen bg-[#111111] p-6 font-sans text-white selection:bg-green-500/30">
       <div className="mx-auto flex min-h-screen w-full max-w-3xl flex-col justify-center">
         <div className="mb-8">
-          <div className="mb-3 text-center text-xs font-bold uppercase tracking-[0.3em] text-zinc-500">
+          <div className="mb-3 text-center text-[11px] font-bold uppercase tracking-[0.34em] text-zinc-500">
             Recursive Kinetic Network
           </div>
-          <h1 className="text-center text-3xl font-extrabold tracking-tight text-transparent bg-gradient-to-r from-green-400 to-emerald-600 bg-clip-text">
-            Simple control over your stealth tunnel
+          <h1 className="text-center text-3xl font-extrabold tracking-tight text-zinc-100">
+            Quiet control over your tunnel
           </h1>
           <p className="mx-auto mt-3 max-w-2xl text-center text-sm leading-6 text-zinc-400">
-            Configure the server once, deploy it, and control protection from a single screen.
-            Technical details stay available, but they no longer compete with the main path.
+            Set up the server once, deploy it from this screen, and switch protection on or off
+            without digging through technical panels.
           </p>
         </div>
 
@@ -52,7 +52,7 @@ export function HomePage() {
 
           <details className="rounded-2xl border border-zinc-800 bg-[#161616]">
             <summary className="cursor-pointer list-none px-6 py-4 text-sm font-bold uppercase tracking-[0.2em] text-zinc-300">
-              Advanced Actions
+              Diagnostics
             </summary>
             <div className="px-4 pb-4">
               <DiagnosticsActionsPanel
@@ -68,7 +68,7 @@ export function HomePage() {
 
           <details className="rounded-2xl border border-zinc-800 bg-[#141414]" open>
             <summary className="cursor-pointer list-none px-6 py-4 text-sm font-bold uppercase tracking-[0.2em] text-zinc-300">
-              Technical Logs
+              Activity Log
             </summary>
             <div className="px-4 pb-4">
               <LogConsole logs={controlCenter.logs} onCopyLogs={controlCenter.copyLogs} />

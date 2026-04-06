@@ -21,7 +21,7 @@ export function DiagnosticsActionsPanel({
   return (
     <Panel
       title="Diagnostics"
-      subtitle="Secondary tools for support cases and transport diagnostics."
+      subtitle="Use these actions only when you need extra server details or want to rotate the cover domain."
       className="bg-[#161616]"
     >
       <div className="flex flex-col gap-3 sm:flex-row">

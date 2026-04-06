@@ -28,7 +28,7 @@ export function SystemStatusPanel({
   return (
     <Panel
       title="Status"
-      subtitle="A simple summary of the current protection state."
+      subtitle="The app keeps a simple summary here so the main state is visible without reading the raw log stream."
       className="bg-[#1a1a1a]"
     >
       <div className="flex flex-col gap-4">
@@ -37,7 +37,7 @@ export function SystemStatusPanel({
         >
           <div>
             <div className="text-xs font-bold uppercase tracking-wider text-zinc-500">
-              User-facing status
+              Current state
             </div>
             <div className="mt-1 text-base font-semibold text-white">{statusSummary.title}</div>
             <p className="mt-2 max-w-xl text-sm leading-6 text-zinc-300">{statusSummary.description}</p>
