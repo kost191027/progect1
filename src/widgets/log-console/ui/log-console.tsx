@@ -25,7 +25,7 @@ export function LogConsole({ logs, onCopyLogs }: LogConsoleProps) {
   }, [copied]);
 
   return (
-    <div className="group relative flex h-96 w-full flex-col overflow-y-auto bg-[#0a0a0a] p-5 font-mono text-sm">
+    <div className="group relative flex h-96 w-full flex-col overflow-y-auto rounded-2xl border border-zinc-800 bg-[#0a0a0a] p-5 font-mono text-sm">
       <div className="pointer-events-none absolute left-0 top-0 z-10 h-8 w-full bg-gradient-to-b from-[#0a0a0a] to-transparent" />
 
       {logs.length > 0 && (
