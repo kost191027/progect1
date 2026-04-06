@@ -23,6 +23,8 @@ export type SavedServerProfile = {
   password: string;
 };
 
+const MAX_LOG_BUFFER = 800;
+
 function stripLogPrefix(message: string) {
   return message
     .replace(/^\[(SYSTEM|WARN|ERROR|MAIN ERROR)\]\s*/i, "")
@@ -52,11 +54,21 @@ export function useControlCenter() {
   const [user, setUser] = useState("root");
   const [password, setPassword] = useState("");
   const [logs, setLogs] = useState<string[]>([]);
+  const [trimmedLogCount, setTrimmedLogCount] = useState(0);
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastUserMessage, setLastUserMessage] = useState("Ready to deploy a server or start an existing tunnel.");
 
   function appendLog(message: string) {
-    setLogs((prev) => [...prev, message]);
+    setLogs((prev) => {
+      const nextLogs = [...prev, message];
+
+      if (nextLogs.length <= MAX_LOG_BUFFER) {
+        return nextLogs;
+      }
+
+      setTrimmedLogCount((prevCount) => prevCount + (nextLogs.length - MAX_LOG_BUFFER));
+      return nextLogs.slice(-MAX_LOG_BUFFER);
+    });
 
     if (isErrorLog(message)) {
       setLastError(stripLogPrefix(message));
@@ -324,6 +336,7 @@ export function useControlCenter() {
     user,
     password,
     logs,
+    trimmedLogCount,
     guardState,
     statusSummary,
     isRunning,

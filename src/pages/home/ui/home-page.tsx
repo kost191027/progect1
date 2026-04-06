@@ -71,7 +71,11 @@ export function HomePage() {
               Activity Log
             </summary>
             <div className="px-4 pb-4">
-              <LogConsole logs={controlCenter.logs} onCopyLogs={controlCenter.copyLogs} />
+              <LogConsole
+                logs={controlCenter.logs}
+                trimmedLogCount={controlCenter.trimmedLogCount}
+                onCopyLogs={controlCenter.copyLogs}
+              />
             </div>
           </details>
         </div>
