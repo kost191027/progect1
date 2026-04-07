@@ -21,7 +21,7 @@ defaults:
     working-directory: .
 
 jobs:
-  checks:
+  frontend-checks:
     runs-on: ubuntu-latest
     env:
       VITE_APP_BUILD: ${{ github.run_number }}
@@ -43,16 +43,27 @@ jobs:
       - name: TypeScript build check
         run: npm run build-check
 
-      - name: Install Linux system dependencies for Tauri checks
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            patchelf
+  rust-check-macos:
+    runs-on: macos-14
+    env:
+      VITE_APP_BUILD: ${{ github.run_number }}
+      VITE_GITHUB_RUN_NUMBER: ${{ github.run_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
 
       - name: Rust cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml
