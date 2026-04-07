@@ -1,0 +1,141 @@
+name: RKN Release Builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rkn-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: .
+
+jobs:
+  build-macos:
+    name: Build macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-13
+            target: x86_64-apple-darwin
+          - arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+
+    runs-on: ${{ matrix.runner }}
+    env:
+      VITE_APP_BUILD: ${{ github.run_number }}
+      VITE_GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+
+          if [[ "${REF_TYPE}" == "tag" ]]; then
+            tag_version="${REF_NAME#v}"
+            if [[ -n "${tag_version}" ]]; then
+              version="${tag_version}"
+            fi
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "VITE_APP_VERSION=${version}" >> "$GITHUB_ENV"
+
+      - name: Build Tauri release
+        run: npm run tauri build -- --target ${{ matrix.target }}
+
+      - name: Normalize release asset names
+        id: package
+        shell: bash
+        run: |
+          version="${{ steps.meta.outputs.version }}"
+          release_dir="dist/release/${{ matrix.arch }}"
+          dmg_dir="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
+          app_dir="src-tauri/target/${{ matrix.target }}/release/bundle/macos"
+
+          mkdir -p "${release_dir}"
+
+          dmg_src="$(find "${dmg_dir}" -maxdepth 1 -name '*.dmg' | head -n 1)"
+          app_src="$(find "${app_dir}" -maxdepth 1 -name '*.app' | head -n 1)"
+
+          if [[ -z "${dmg_src}" || -z "${app_src}" ]]; then
+            echo "Expected .dmg and .app artifacts were not produced."
+            exit 1
+          fi
+
+          dmg_name="RKN-${version}-${{ matrix.arch }}.dmg"
+          app_zip_name="RKN-${version}-${{ matrix.arch }}-app.zip"
+
+          cp "${dmg_src}" "${release_dir}/${dmg_name}"
+          ditto -c -k --sequesterRsrc --keepParent "${app_src}" "${release_dir}/${app_zip_name}"
+
+          echo "dmg_path=${release_dir}/${dmg_name}" >> "$GITHUB_OUTPUT"
+          echo "app_zip_path=${release_dir}/${app_zip_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload macOS bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RKN-${{ steps.meta.outputs.version }}-${{ matrix.arch }}
+          path: |
+            ${{ steps.package.outputs.dmg_path }}
+            ${{ steps.package.outputs.app_zip_path }}
+          retention-days: 14
+
+  publish-release:
+    name: Publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: build-macos
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: RKN-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: RKN ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release-assets/*.dmg
+            release-assets/*.zip

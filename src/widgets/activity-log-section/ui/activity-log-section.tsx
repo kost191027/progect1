@@ -28,13 +28,13 @@ export function ActivityLogSection({
 
   return (
     <details className="rounded-2xl border border-zinc-800 bg-[#141414]" open>
-      <summary className="flex cursor-pointer list-none flex-col items-start justify-between gap-3 px-6 py-4 sm:flex-row sm:items-center">
-        <span className="text-sm font-bold uppercase tracking-[0.2em] text-zinc-300">
-          Activity Log
-        </span>
+      <summary className="cursor-pointer px-6 py-4 text-sm font-bold uppercase tracking-[0.2em] text-zinc-300 marker:text-zinc-300">
+        Activity Log
+      </summary>
 
+      <div className="px-4 pb-4">
         {logs.length > 0 && (
-          <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
+          <div className="mb-3 flex flex-wrap items-center justify-end gap-2 px-2">
             <Button
               variant="secondary"
               className="px-3 py-1 text-xs normal-case tracking-normal"
@@ -61,9 +61,7 @@ export function ActivityLogSection({
             </Button>
           </div>
         )}
-      </summary>
 
-      <div className="px-4 pb-4">
         <LogConsole logs={logs} trimmedLogCount={trimmedLogCount} showAll={showAll} />
       </div>
     </details>

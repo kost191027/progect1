@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 use std::{fs, path::PathBuf};
+use tauri::image::Image;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
@@ -10,6 +11,8 @@ use tokio::time::{sleep, Duration};
 mod generator;
 mod geodata;
 mod ssh;
+
+const TRAY_ICON: Image<'_> = tauri::include_image!("./icons/tray-icon.png");
 
 struct AppState {
     /// PID процесса sing-box, запущенного root-правами через osascript
@@ -715,6 +718,8 @@ pub fn run() {
                 .build()?;
 
             let _tray = TrayIconBuilder::new()
+                .icon(TRAY_ICON)
+                .icon_as_template(false)
                 .tooltip("RKN — Recursive Kinetic Network")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
