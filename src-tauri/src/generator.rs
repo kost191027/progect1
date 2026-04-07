@@ -6,17 +6,13 @@ use crate::geodata::{CURATED_RU_DOMAIN_SUFFIXES, DIRECT_ROUTE_RULE_SET_TAGS, REM
 
 pub const INTERNAL_SS_PORT: u16 = 14433;
 
-/// Cover domains for ShadowTLS handshake — high-traffic TLS sites that DPI
-/// expects to see on any network. Rotated per deploy to diversify fingerprint.
-const COVER_DOMAINS: &[&str] = &[
-    "www.microsoft.com",
-    "www.apple.com",
-    "www.googleapis.com",
-    "cdn.cloudflare.com",
-    "www.amazon.com",
-];
+/// ShadowTLS cover domains.
+///
+/// We keep rotation, but only across a short allowlist of domains that are
+/// safer for the current product profile. `www.amazon.com` was removed after
+/// real-world pinning failures in production logs.
+const COVER_DOMAINS: &[&str] = &["www.microsoft.com", "www.apple.com", "www.googleapis.com"];
 
-/// Pick a cover domain deterministically from the short_id hex seed.
 pub fn select_cover_domain(short_id: &str) -> &'static str {
     let seed = short_id
         .get(0..2)
