@@ -58,6 +58,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Verify version sync
+        run: npm run version:check
+
       - name: Resolve release metadata
         id: meta
         shell: bash
@@ -69,8 +72,9 @@ jobs:
 
           if [[ "${REF_TYPE}" == "tag" ]]; then
             tag_version="${REF_NAME#v}"
-            if [[ -n "${tag_version}" ]]; then
-              version="${tag_version}"
+            if [[ -n "${tag_version}" && "${tag_version}" != "${version}" ]]; then
+              echo "Tag version ${tag_version} does not match package.json version ${version}."
+              exit 1
             fi
           fi
 

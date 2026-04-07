@@ -1,7 +1,7 @@
 {
   "name": "rkn",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,9 @@
     "lint": "eslint \"src/**/*.{ts,tsx}\"",
     "preview": "vite preview",
     "tauri": "tauri",
+    "version:sync": "node scripts/version-manager.mjs sync",
+    "version:check": "node scripts/version-manager.mjs check",
+    "version:bump": "node scripts/version-manager.mjs bump",
     "prepare": "husky"
   },
   "lint-staged": {

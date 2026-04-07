@@ -241,6 +241,18 @@ Release build:
 npm run tauri build
 ```
 
+Version bump:
+
+```bash
+npm run version:bump -- 0.1.1
+```
+
+Quick semver bump:
+
+```bash
+npm run version:bump -- patch
+```
+
 ## CI/CD
 
 GitHub Actions is used for:
