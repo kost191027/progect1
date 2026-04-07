@@ -15,7 +15,7 @@ concurrency:
 
 defaults:
   run:
-    working-directory: Progect1
+    working-directory: .
 
 jobs:
   checks:
@@ -32,7 +32,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: Progect1/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Install dependencies
         run: npm ci

@@ -15,7 +15,7 @@ concurrency:
 
 defaults:
   run:
-    working-directory: Progect1
+    working-directory: .
 
 jobs:
   build-macos:
@@ -45,7 +45,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: Progect1/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -110,8 +110,8 @@ jobs:
         with:
           name: RKN-${{ steps.meta.outputs.version }}-${{ matrix.arch }}
           path: |
-            Progect1/${{ steps.package.outputs.dmg_path }}
-            Progect1/${{ steps.package.outputs.app_zip_path }}
+            ${{ steps.package.outputs.dmg_path }}
+            ${{ steps.package.outputs.app_zip_path }}
           retention-days: 14
 
   publish-release:
