@@ -7,6 +7,15 @@ It combines a lightweight desktop shell, a high-performance native backend, and 
 `enter server -> deploy node -> start tunnel -> stay protected`
 
 <p>
+  <a href="https://github.com/kost191027/progect1/releases/latest/download/RKN-latest-x64.dmg">
+    <img alt="Download for Intel Mac" src="https://img.shields.io/badge/Download%20for-Intel%20Mac-1F2937?style=for-the-badge&logo=apple&logoColor=white">
+  </a>
+  <a href="https://github.com/kost191027/progect1/releases/latest/download/RKN-latest-arm64.dmg">
+    <img alt="Download for Apple Silicon" src="https://img.shields.io/badge/Download%20for-Apple%20Silicon-111827?style=for-the-badge&logo=apple&logoColor=white">
+  </a>
+</p>
+
+<p>
   <img alt="Tauri v2" src="https://img.shields.io/badge/Tauri-v2-24C8DB?style=flat-square&logo=tauri&logoColor=white">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-backend-000000?style=flat-square&logo=rust&logoColor=white">
   <img alt="React" src="https://img.shields.io/badge/React-frontend-61DAFB?style=flat-square&logo=react&logoColor=0B0F16">

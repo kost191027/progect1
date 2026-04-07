@@ -28,10 +28,10 @@ jobs:
       matrix:
         include:
           - arch: x64
-            runner: macos-13
+            runner: macos-15-intel
             target: x86_64-apple-darwin
           - arch: arm64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
 
     runs-on: ${{ matrix.runner }}
@@ -104,42 +104,43 @@ jobs:
           fi
 
           dmg_name="RKN-${version}-${{ matrix.arch }}.dmg"
+          dmg_alias_name="RKN-latest-${{ matrix.arch }}.dmg"
           app_zip_name="RKN-${version}-${{ matrix.arch }}-app.zip"
 
           cp "${dmg_src}" "${release_dir}/${dmg_name}"
+          cp "${dmg_src}" "${release_dir}/${dmg_alias_name}"
           ditto -c -k --sequesterRsrc --keepParent "${app_src}" "${release_dir}/${app_zip_name}"
 
           echo "dmg_path=${release_dir}/${dmg_name}" >> "$GITHUB_OUTPUT"
+          echo "dmg_alias_path=${release_dir}/${dmg_alias_name}" >> "$GITHUB_OUTPUT"
           echo "app_zip_path=${release_dir}/${app_zip_name}" >> "$GITHUB_OUTPUT"
 
       - name: Upload macOS bundle artifacts
+        if: github.ref_type != 'tag'
         uses: actions/upload-artifact@v4
         with:
           name: RKN-${{ steps.meta.outputs.version }}-${{ matrix.arch }}
           path: |
             ${{ steps.package.outputs.dmg_path }}
+            ${{ steps.package.outputs.dmg_alias_path }}
             ${{ steps.package.outputs.app_zip_path }}
           retention-days: 14
+          compression-level: 0
 
-  publish-release:
-    name: Publish GitHub release
-    if: github.ref_type == 'tag'
-    needs: build-macos
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download release artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: RKN-*
-          merge-multiple: true
-          path: release-assets
-
-      - name: Publish GitHub release
+      - name: Publish release assets for ${{ matrix.arch }}
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          name: RKN ${{ github.ref_name }}
+          name: RKN ${{ steps.meta.outputs.version }}
+          tag_name: ${{ github.ref_name }}
           generate_release_notes: true
+          body: |
+            Download the correct installer for your Mac:
+
+            - `RKN-${{ steps.meta.outputs.version }}-x64.dmg` — Intel Mac
+            - `RKN-${{ steps.meta.outputs.version }}-arm64.dmg` — Apple Silicon (M-series)
+            - `RKN-latest-x64.dmg` — stable Intel download link
+            - `RKN-latest-arm64.dmg` — stable Apple Silicon download link
           files: |
-            release-assets/*.dmg
-            release-assets/*.zip
+            ${{ steps.package.outputs.dmg_path }}
+            ${{ steps.package.outputs.dmg_alias_path }}
