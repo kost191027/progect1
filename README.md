@@ -252,6 +252,15 @@ GitHub Actions is used for:
 
 The current release direction is GitHub Releases with attached build assets.
 
+## Release QA
+
+Packaged builds are validated with a dedicated manual QA flow:
+
+- [macOS release checklist](docs/qa/macos-release-checklist.md)
+- [release report template](docs/qa/release-report-template.md)
+
+This keeps release testing focused on the real `.app` and `.dmg` behavior instead of only the dev environment.
+
 ## Design philosophy
 
 RKN should feel like a quiet system tool, not a noisy consumer app.
