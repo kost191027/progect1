@@ -1,4 +1,4 @@
-name: Build RKN
+name: RKN Release Builds
 
 on:
   workflow_dispatch:
@@ -6,8 +6,11 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 concurrency:
-  group: rkn-release-${{ github.ref }}
+  group: rkn-release-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -16,6 +19,7 @@ defaults:
 
 jobs:
   build-macos:
+    name: Build macOS ${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
@@ -29,7 +33,6 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
     env:
-      VITE_APP_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
       VITE_APP_BUILD: ${{ github.run_number }}
       VITE_GITHUB_RUN_NUMBER: ${{ github.run_number }}
 
@@ -52,13 +55,84 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+
+          if [[ "${REF_TYPE}" == "tag" ]]; then
+            tag_version="${REF_NAME#v}"
+            if [[ -n "${tag_version}" ]]; then
+              version="${tag_version}"
+            fi
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "VITE_APP_VERSION=${version}" >> "$GITHUB_ENV"
+
       - name: Build Tauri release
         run: npm run tauri build -- --target ${{ matrix.target }}
+
+      - name: Normalize release asset names
+        id: package
+        shell: bash
+        run: |
+          version="${{ steps.meta.outputs.version }}"
+          release_dir="dist/release/${{ matrix.arch }}"
+          dmg_dir="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
+          app_dir="src-tauri/target/${{ matrix.target }}/release/bundle/macos"
+
+          mkdir -p "${release_dir}"
+
+          dmg_src="$(find "${dmg_dir}" -maxdepth 1 -name '*.dmg' | head -n 1)"
+          app_src="$(find "${app_dir}" -maxdepth 1 -name '*.app' | head -n 1)"
+
+          if [[ -z "${dmg_src}" || -z "${app_src}" ]]; then
+            echo "Expected .dmg and .app artifacts were not produced."
+            exit 1
+          fi
+
+          dmg_name="RKN-${version}-${{ matrix.arch }}.dmg"
+          app_zip_name="RKN-${version}-${{ matrix.arch }}-app.zip"
+
+          cp "${dmg_src}" "${release_dir}/${dmg_name}"
+          ditto -c -k --sequesterRsrc --keepParent "${app_src}" "${release_dir}/${app_zip_name}"
+
+          echo "dmg_path=${release_dir}/${dmg_name}" >> "$GITHUB_OUTPUT"
+          echo "app_zip_path=${release_dir}/${app_zip_name}" >> "$GITHUB_OUTPUT"
 
       - name: Upload macOS bundle artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: RKN-${{ matrix.arch }}
+          name: RKN-${{ steps.meta.outputs.version }}-${{ matrix.arch }}
           path: |
-            Progect1/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
-            Progect1/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
+            Progect1/${{ steps.package.outputs.dmg_path }}
+            Progect1/${{ steps.package.outputs.app_zip_path }}
+          retention-days: 14
+
+  publish-release:
+    name: Publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: build-macos
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: RKN-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: RKN ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release-assets/*.dmg
+            release-assets/*.zip
