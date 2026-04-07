@@ -10,6 +10,9 @@ CONFIG_DIR="/opt/rkn"
 ACTIVE_CONFIG="$CONFIG_DIR/config.json"
 CANDIDATE_CONFIG="$CONFIG_DIR/config.candidate.json"
 BACKUP_CONFIG="$CONFIG_DIR/config.previous.json"
+ACTIVE_BOOTSTRAP="$CONFIG_DIR/bootstrap.json"
+CANDIDATE_BOOTSTRAP="$CONFIG_DIR/bootstrap.candidate.json"
+BACKUP_BOOTSTRAP="$CONFIG_DIR/bootstrap.previous.json"
 ACTIVE_CONTAINER_FILE="$CONFIG_DIR/container_name"
 LEGACY_CONTAINER_NAME="sys-network-helper"
 
@@ -34,6 +37,10 @@ rollback() {
         cp "$BACKUP_CONFIG" "$ACTIVE_CONFIG" || true
     fi
 
+    if [ -f "$BACKUP_BOOTSTRAP" ]; then
+        cp "$BACKUP_BOOTSTRAP" "$ACTIVE_BOOTSTRAP" || true
+    fi
+
     if [ -n "$ROLLBACK_CONTAINER" ] && docker inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
         docker rename "$ROLLBACK_CONTAINER" "$PREVIOUS_CONTAINER" >/dev/null 2>&1 || true
         docker start "$PREVIOUS_CONTAINER" >/dev/null 2>&1 || true
@@ -41,6 +48,7 @@ rollback() {
     fi
 
     rm -f "$CANDIDATE_CONFIG"
+    rm -f "$CANDIDATE_BOOTSTRAP"
 
     exit "$exit_code"
 }
@@ -73,6 +81,11 @@ if [ ! -f "$CANDIDATE_CONFIG" ]; then
     exit 1
 fi
 
+if [ ! -f "$CANDIDATE_BOOTSTRAP" ]; then
+    echo "[ERROR] Candidate bootstrap metadata was not uploaded."
+    exit 1
+fi
+
 echo "[INFO] Pulling pinned sing-box image..."
 docker pull "$IMAGE"
 
@@ -92,6 +105,10 @@ if [ -f "$ACTIVE_CONFIG" ]; then
     cp "$ACTIVE_CONFIG" "$BACKUP_CONFIG"
 fi
 
+if [ -f "$ACTIVE_BOOTSTRAP" ]; then
+    cp "$ACTIVE_BOOTSTRAP" "$BACKUP_BOOTSTRAP"
+fi
+
 if [ -n "$PREVIOUS_CONTAINER" ]; then
     ROLLBACK_CONTAINER="${PREVIOUS_CONTAINER}-rollback"
     echo "[INFO] Preparing rollback snapshot from container $PREVIOUS_CONTAINER..."
@@ -102,6 +119,7 @@ fi
 
 # 3. Активация новой конфигурации
 mv "$CANDIDATE_CONFIG" "$ACTIVE_CONFIG"
+mv "$CANDIDATE_BOOTSTRAP" "$ACTIVE_BOOTSTRAP"
 
 # 4. Запуск нового контейнера sing-box
 echo "[INFO] Starting core container..."

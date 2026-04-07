@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use ssh2::Session;
 use std::io::ErrorKind;
 use std::io::Read;
@@ -35,11 +36,19 @@ struct RemoteDeployTarget {
     migrating_to_primary_port: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedServerProfile {
     pub host: String,
     pub user: String,
     pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteTransportBootstrap {
+    external_port: u16,
+    cover_domain: String,
+    shadow_pass: String,
+    ss_password: String,
 }
 
 fn emit_ssh_stage(app: &AppHandle, stage: &str, message: impl Into<String>) {
@@ -61,6 +70,150 @@ fn save_server_profile(app: &AppHandle, profile: &SavedServerProfile) -> Result<
 
     let profile_json = serde_json::to_vec_pretty(profile).map_err(|e| e.to_string())?;
     std::fs::write(profile_path, profile_json).map_err(|e| e.to_string())
+}
+
+fn local_client_config_exists(local_data: &std::path::Path) -> bool {
+    local_data.join("client_config.json").exists()
+}
+
+fn parse_remote_bootstrap_from_server_config(
+    config_json: &str,
+) -> Result<RemoteTransportBootstrap, String> {
+    let parsed = serde_json::from_str::<Value>(config_json)
+        .map_err(|e| format!("Failed to parse remote server config JSON: {}", e))?;
+    let inbounds = parsed
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Remote server config is missing inbounds array".to_string())?;
+
+    let shadowtls_inbound = inbounds
+        .iter()
+        .find(|inbound| inbound.get("type").and_then(Value::as_str) == Some("shadowtls"))
+        .ok_or_else(|| "Remote server config is missing shadowtls inbound".to_string())?;
+    let shadowsocks_inbound = inbounds
+        .iter()
+        .find(|inbound| inbound.get("type").and_then(Value::as_str) == Some("shadowsocks"))
+        .ok_or_else(|| "Remote server config is missing shadowsocks inbound".to_string())?;
+
+    let external_port = shadowtls_inbound
+        .get("listen_port")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "Remote server config is missing shadowtls listen_port".to_string())?
+        as u16;
+    let cover_domain = shadowtls_inbound
+        .get("handshake")
+        .and_then(|handshake| handshake.get("server"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Remote server config is missing ShadowTLS cover domain".to_string())?
+        .to_string();
+    let shadow_pass = shadowtls_inbound
+        .get("users")
+        .and_then(Value::as_array)
+        .and_then(|users| users.first())
+        .and_then(|user| user.get("password"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Remote server config is missing ShadowTLS password".to_string())?
+        .to_string();
+    let ss_password = shadowsocks_inbound
+        .get("password")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Remote server config is missing Shadowsocks password".to_string())?
+        .to_string();
+
+    Ok(RemoteTransportBootstrap {
+        external_port,
+        cover_domain,
+        shadow_pass,
+        ss_password,
+    })
+}
+
+fn load_remote_container_name(sess: &Session) -> Result<Option<String>, String> {
+    let command = format!(
+        r#"bash -lc '
+CONFIG_DIR="/opt/rkn"
+ACTIVE_CONTAINER_FILE="$CONFIG_DIR/container_name"
+CONTAINER_NAME=""
+
+if [ -f "$ACTIVE_CONTAINER_FILE" ]; then
+  CONTAINER_NAME="$(cat "$ACTIVE_CONTAINER_FILE" 2>/dev/null || true)"
+fi
+
+if [ -z "$CONTAINER_NAME" ] && docker inspect "{legacy_container_name}" >/dev/null 2>&1; then
+  CONTAINER_NAME="{legacy_container_name}"
+fi
+
+if [ -n "$CONTAINER_NAME" ] && docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+  echo "$CONTAINER_NAME"
+fi
+'"#,
+        legacy_container_name = LEGACY_CONTAINER_NAME
+    );
+
+    let (stdout, exit_status) = run_remote_command(sess, &command)?;
+    if exit_status != 0 {
+        return Err(format!(
+            "Failed to read active remote container name. Output: {}",
+            stdout.trim()
+        ));
+    }
+
+    let container_name = stdout.trim();
+    if container_name.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(container_name.to_string()))
+    }
+}
+
+fn load_remote_transport_bootstrap(
+    sess: &Session,
+) -> Result<Option<RemoteTransportBootstrap>, String> {
+    let command = r#"bash -lc '
+CONFIG_DIR="/opt/rkn"
+BOOTSTRAP_FILE="$CONFIG_DIR/bootstrap.json"
+ACTIVE_CONFIG="$CONFIG_DIR/config.json"
+
+if [ -f "$BOOTSTRAP_FILE" ]; then
+  echo "__BOOTSTRAP__"
+  cat "$BOOTSTRAP_FILE"
+  exit 0
+fi
+
+if [ -f "$ACTIVE_CONFIG" ]; then
+  echo "__CONFIG__"
+  cat "$ACTIVE_CONFIG"
+  exit 0
+fi
+
+exit 0
+'"#;
+
+    let (stdout, exit_status) = run_remote_command(sess, command)?;
+    if exit_status != 0 {
+        return Err(format!(
+            "Failed to read remote transport bootstrap. Output: {}",
+            stdout.trim()
+        ));
+    }
+
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(json_payload) = trimmed.strip_prefix("__BOOTSTRAP__") {
+        let bootstrap = serde_json::from_str::<RemoteTransportBootstrap>(json_payload.trim())
+            .map_err(|e| format!("Failed to parse remote bootstrap JSON: {}", e))?;
+        return Ok(Some(bootstrap));
+    }
+
+    if let Some(config_payload) = trimmed.strip_prefix("__CONFIG__") {
+        let bootstrap = parse_remote_bootstrap_from_server_config(config_payload.trim())?;
+        return Ok(Some(bootstrap));
+    }
+
+    Ok(None)
 }
 
 fn verify_external_port_reachable(host: &str, external_port: u16) -> Result<(), String> {
@@ -402,12 +555,124 @@ pub async fn deploy_server(
     user: String,
     pass: String,
 ) -> Result<(), String> {
+    let local_data = app
+        .path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let attach_only = !local_client_config_exists(&local_data);
+    let saved_profile = SavedServerProfile {
+        host: host.clone(),
+        user: user.clone(),
+        password: pass.clone(),
+    };
+    let attach_saved_profile = saved_profile.clone();
+
+    let attach_result = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        let host = host.clone();
+        let user = user.clone();
+        let pass = pass.clone();
+        let local_data = local_data.clone();
+        move || -> Result<Option<RemoteTransportBootstrap>, String> {
+            let _ = app.emit(
+                "tunnel-log",
+                format!("--- [SSH] Connecting to {}:22 ---", host),
+            );
+
+            let sess = connect_ssh_session(&app, &host, &user, &pass)?;
+            emit_ssh_stage(&app, "AUTH", "Authenticated successfully.");
+
+            if !attach_only {
+                return Ok(None);
+            }
+
+            emit_ssh_stage(
+                &app,
+                "PREFLIGHT",
+                "Checking whether this device can attach to an existing RKN server...",
+            );
+
+            let remote_bootstrap = load_remote_transport_bootstrap(&sess)?;
+            let Some(remote_bootstrap) = remote_bootstrap else {
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SSH] No existing transport bootstrap found on remote server. Proceeding with a fresh deploy.".to_string(),
+                );
+                return Ok(None);
+            };
+
+            let Some(container_name) = load_remote_container_name(&sess)? else {
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SSH] Existing config was found, but no active RKN container is currently available. Proceeding with a fresh deploy.".to_string(),
+                );
+                return Ok(None);
+            };
+
+            let _ = app.emit(
+                "tunnel-log",
+                "[SSH] Existing RKN transport detected on this server. Attach to existing server mode is active for this device.".to_string(),
+
+            );
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SSH] Reusing remote container {} and external port {} without reinstalling the server stack.",
+                    container_name, remote_bootstrap.external_port
+                ),
+            );
+
+            validate_remote_runtime(&sess, &container_name, remote_bootstrap.external_port)?;
+            verify_external_port_reachable(&host, remote_bootstrap.external_port)?;
+
+            let client_cfg = crate::generator::build_client_config(
+                &host,
+                &remote_bootstrap.shadow_pass,
+                &remote_bootstrap.ss_password,
+                remote_bootstrap.external_port,
+                &remote_bootstrap.cover_domain,
+            );
+
+            std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
+            let client_cfg_path = local_data.join("client_config.json");
+            std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
+            save_server_profile(&app, &attach_saved_profile)?;
+            crate::refresh_tray_toggle_item(&app);
+
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SYSTEM] Client config safely generated at: {:?}",
+                    client_cfg_path
+                ),
+            );
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SSH] Attach to existing server completed successfully. External port: {}",
+                    remote_bootstrap.external_port
+                ),
+            );
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Server credentials saved locally for next launch.".to_string(),
+            );
+
+            Ok(Some(remote_bootstrap))
+        }
+    })
+    .await
+    .unwrap()?;
+
+    if attach_result.is_some() {
+        return Ok(());
+    }
+
     let _ = app.emit(
         "tunnel-log",
         "[SYSTEM] Generating transport credentials via sing-box...".to_string(),
     );
 
-    // 1. Generate transport secrets asynchronously using local sing-box
     let short_id = crate::generator::generate_short_id(&app)
         .await
         .map_err(|e| format!("Transport secret error: {}", e))?;
@@ -426,18 +691,6 @@ pub async fn deploy_server(
         ),
     );
 
-    // Получаем путь к AppData
-    let local_data = app
-        .path()
-        .app_local_data_dir()
-        .unwrap_or_else(|_| std::env::temp_dir());
-    let saved_profile = SavedServerProfile {
-        host: host.clone(),
-        user: user.clone(),
-        password: pass.clone(),
-    };
-
-    // 4. Perform SSH upload and deployment (Blocking)
     tauri::async_runtime::spawn_blocking(move || {
         let _ = app.emit(
             "tunnel-log",
@@ -501,6 +754,13 @@ pub async fn deploy_server(
             crate::generator::build_server_config(&host, &shadow_pass, &ss_password, external_port, cover_domain);
         let client_cfg =
             crate::generator::build_client_config(&host, &shadow_pass, &ss_password, external_port, cover_domain);
+        let bootstrap_cfg = json!({
+            "external_port": external_port,
+            "cover_domain": cover_domain,
+            "shadow_pass": shadow_pass,
+            "ss_password": ss_password
+        })
+        .to_string();
 
         emit_ssh_stage(
             &app,
@@ -517,9 +777,13 @@ cat << 'CONFIGEOF' > /opt/rkn/config.candidate.json
 {}
 CONFIGEOF
 
+cat << 'BOOTSTRAPEOF' > /opt/rkn/bootstrap.candidate.json
+{}
+BOOTSTRAPEOF
+
 {}
 "#,
-            PINNED_SING_BOX_IMAGE, container_name, server_cfg, deploy_script
+            PINNED_SING_BOX_IMAGE, container_name, server_cfg, bootstrap_cfg, deploy_script
         );
 
         emit_ssh_stage(&app, "UPLOAD", "Uploading generated config and deploy script...");
@@ -578,6 +842,7 @@ CONFIGEOF
         let client_cfg_path = local_data.join("client_config.json");
         std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
         save_server_profile(&app, &saved_profile)?;
+        crate::refresh_tray_toggle_item(&app);
 
         let _ = app.emit(
             "tunnel-log",

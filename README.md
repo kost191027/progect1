@@ -15,6 +15,18 @@ It combines a lightweight desktop shell, a high-performance native backend, and 
   </a>
 </p>
 
+## First launch on macOS
+
+If macOS says that **RKN is damaged and cannot be opened**, do not worry. This is a standard warning for unsigned or not-yet-notarized builds.
+
+After copying the app into `Applications`, run:
+
+```bash
+sudo xattr -rd com.apple.quarantine "/Applications/RKN.app"
+```
+
+Then launch `RKN.app` again from `Applications`.
+
 <p>
   <img alt="Tauri v2" src="https://img.shields.io/badge/Tauri-v2-24C8DB?style=flat-square&logo=tauri&logoColor=white">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-backend-000000?style=flat-square&logo=rust&logoColor=white">

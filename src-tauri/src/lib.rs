@@ -1,9 +1,9 @@
 use std::sync::Mutex;
 use std::{fs, path::PathBuf};
 use tauri::image::Image;
-use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, Wry};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{sleep, Duration};
@@ -21,6 +21,7 @@ struct AppState {
     recovery_in_progress: Mutex<bool>,
     proxy_failure_count: Mutex<u8>,
     kill_switch_engaged: Mutex<bool>,
+    tray_toggle_item: Mutex<Option<MenuItem<Wry>>>,
 }
 
 fn tunnel_pid_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -66,6 +67,49 @@ fn emit_tunnel_state(app: &AppHandle, is_running: bool) {
 
 fn emit_guard_state(app: &AppHandle, state: &str) {
     let _ = app.emit("tunnel-guard-state", state.to_string());
+}
+
+fn emit_screen_navigation(app: &AppHandle, screen: &str) {
+    let _ = app.emit("navigate-screen", screen.to_string());
+}
+
+fn client_config_exists(app: &AppHandle) -> bool {
+    app.path()
+        .app_local_data_dir()
+        .map(|path| path.join("client_config.json").exists())
+        .unwrap_or(false)
+}
+
+pub(crate) fn refresh_tray_toggle_item(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let maybe_item = state.tray_toggle_item.lock().unwrap().clone();
+
+    let Some(item) = maybe_item else {
+        return;
+    };
+
+    let is_configured = client_config_exists(app);
+    let is_running = state.singbox_pid.lock().unwrap().is_some();
+    let label = if is_running {
+        "Stop Tunnel"
+    } else {
+        "Start Tunnel"
+    };
+
+    let _ = item.set_text(label);
+    let _ = item.set_enabled(is_configured);
+}
+
+fn show_main_window(app: &AppHandle, screen: Option<&str>) {
+    if let Some(screen) = screen {
+        emit_screen_navigation(app, screen);
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -205,16 +249,6 @@ fn set_network_fingerprint(state: &AppState, fingerprint: Option<String>) {
 
 fn get_network_fingerprint(state: &AppState) -> Option<String> {
     state.network_fingerprint.lock().unwrap().clone()
-}
-
-fn try_begin_recovery(state: &AppState) -> bool {
-    let mut guard = state.recovery_in_progress.lock().unwrap();
-    if *guard {
-        false
-    } else {
-        *guard = true;
-        true
-    }
 }
 
 fn finish_recovery(state: &AppState) {
@@ -508,71 +542,20 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
             }
 
             let state = app.state::<AppState>();
-            if !try_begin_recovery(&state) {
-                continue;
-            }
-
             if let Some(fingerprint) = current_fingerprint.clone() {
                 set_network_fingerprint(&state, Some(fingerprint));
             }
 
             let _ = app.emit(
                 "tunnel-log",
-                "[SYSTEM] Network change detected. Reinitializing tunnel...".to_string(),
+                "[SYSTEM] Network change detected. Keeping tunnel active and updating the network context.".to_string(),
             );
-
-            let _ = terminate_root_process(pid);
-            {
-                let mut guard = state.singbox_pid.lock().unwrap();
-                if guard.as_ref() == Some(&pid) {
-                    *guard = None;
-                }
-            }
-            clear_saved_tunnel_pid(&app);
-
-            match launch_tunnel_process(&app, false).await {
-                Ok(new_pid) => {
-                    let _ = app.emit(
-                        "tunnel-log",
-                        format!("[SYSTEM] Tunnel recovered with new PID {}.", new_pid),
-                    );
-
-                    if verify_tunnel_start(&app, &state, new_pid, "/tmp/rkn-tun.log")
-                        .await
-                        .is_ok()
-                    {
-                        spawn_log_reader(app.clone(), new_pid, "/tmp/rkn-tun.log");
-                        spawn_process_exit_monitor(app.clone(), new_pid);
-                        spawn_network_recovery_monitor(app.clone(), new_pid);
-                    } else {
-                        let _ = app.emit(
-                            "tunnel-log",
-                            "[WARN] Tunnel recovery failed during startup verification."
-                                .to_string(),
-                        );
-                        emit_tunnel_state(&app, false);
-                        emit_guard_state(&app, "inactive");
-                    }
-                }
-                Err(err) => {
-                    let _ = app.emit(
-                        "tunnel-log",
-                        format!("[WARN] Tunnel recovery failed: {}", err),
-                    );
-                    emit_tunnel_state(&app, false);
-                    emit_guard_state(&app, "inactive");
-                }
-            }
-
-            let state = app.state::<AppState>();
-            finish_recovery(&state);
-            break;
         }
     });
 }
 
-#[tauri::command]
-async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
     {
         let guard = state.singbox_pid.lock().unwrap();
         if guard.is_some() {
@@ -597,12 +580,13 @@ async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
         "tunnel-log",
         "[SYSTEM] TUN adapter initialized. Routing active.".to_string(),
     );
+    refresh_tray_toggle_item(&app);
 
     Ok(())
 }
 
-#[tauri::command]
-async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
     let pid = {
         let mut guard = state.singbox_pid.lock().unwrap();
         guard.take()
@@ -634,6 +618,7 @@ async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
             reset_guard_state(&state);
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
+            refresh_tray_toggle_item(&app);
 
             Ok(())
         }
@@ -648,9 +633,20 @@ async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
             reset_guard_state(&state);
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
+            refresh_tray_toggle_item(&app);
             Ok(())
         }
     }
+}
+
+#[tauri::command]
+async fn start_tunnel(app: AppHandle) -> Result<(), String> {
+    start_tunnel_inner(app).await
+}
+
+#[tauri::command]
+async fn stop_tunnel(app: AppHandle) -> Result<(), String> {
+    stop_tunnel_inner(app).await
 }
 
 #[tauri::command]
@@ -690,6 +686,7 @@ async fn restore_tunnel_session(
     spawn_log_reader(app.clone(), saved_pid, "/tmp/rkn-tun.log");
     spawn_process_exit_monitor(app.clone(), saved_pid);
     spawn_network_recovery_monitor(app.clone(), saved_pid);
+    refresh_tray_toggle_item(&app);
 
     Ok(Some(saved_pid))
 }
@@ -705,14 +702,27 @@ pub fn run() {
             recovery_in_progress: Mutex::new(false),
             proxy_failure_count: Mutex::new(0),
             kill_switch_engaged: Mutex::new(false),
+            tray_toggle_item: Mutex::new(None),
         })
         .setup(|app| {
             // --- System Tray (живёт в менюбаре macOS) ---
-            let show_item = MenuItemBuilder::with_id("show", "Show RKN").build(app)?;
+            let app_handle = app.app_handle().clone();
+            let toggle_item = MenuItemBuilder::with_id("toggle_tunnel", "Start Tunnel")
+                .enabled(client_config_exists(&app_handle))
+                .build(app)?;
+            let settings_item = MenuItemBuilder::with_id("open_settings", "Settings").build(app)?;
+            let info_item = MenuItemBuilder::with_id("open_info", "Info").build(app)?;
             let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
+            {
+                let state = app.state::<AppState>();
+                *state.tray_toggle_item.lock().unwrap() = Some(toggle_item.clone());
+            }
+
             let menu = MenuBuilder::new(app)
-                .item(&show_item)
+                .item(&toggle_item)
+                .item(&settings_item)
+                .item(&info_item)
                 .separator()
                 .item(&quit_item)
                 .build()?;
@@ -723,11 +733,34 @@ pub fn run() {
                 .tooltip("RKN — Recursive Kinetic Network")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                    "toggle_tunnel" => {
+                        let app_handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let is_running = {
+                                let state = app_handle.state::<AppState>();
+                                let is_running = state.singbox_pid.lock().unwrap().is_some();
+                                is_running
+                            };
+
+                            let result = if is_running {
+                                stop_tunnel_inner(app_handle.clone()).await
+                            } else {
+                                start_tunnel_inner(app_handle.clone()).await
+                            };
+
+                            if let Err(error) = result {
+                                let _ = app_handle.emit(
+                                    "tunnel-log",
+                                    format!("[ERROR] tray tunnel action failed: {}", error),
+                                );
+                            }
+                        });
+                    }
+                    "open_settings" => {
+                        show_main_window(app, Some("settings"));
+                    }
+                    "open_info" => {
+                        show_main_window(app, Some("info"));
                     }
                     "quit" => {
                         // Убиваем sing-box процесс перед выходом
@@ -745,6 +778,8 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+
+            refresh_tray_toggle_item(&app_handle);
 
             Ok(())
         })
@@ -765,6 +800,11 @@ pub fn run() {
             ssh::check_server_status,
             ssh::rotate_sni
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let RunEvent::Reopen { .. } = event {
+                show_main_window(app, None);
+            }
+        });
 }

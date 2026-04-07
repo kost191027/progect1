@@ -1,34 +1,25 @@
-<svg width="660" height="400" viewBox="0 0 660 400" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect width="660" height="400" rx="28" fill="#0B0E13"/>
-  <rect x="24" y="24" width="612" height="352" rx="24" fill="url(#panel)"/>
-  <rect x="24" y="24" width="612" height="352" rx="24" stroke="rgba(255,255,255,0.08)"/>
+<svg width="660" height="430" viewBox="0 0 660 430" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="660" height="430" rx="28" fill="#10141C"/>
+  <rect x="24" y="24" width="612" height="382" rx="24" fill="url(#panel)"/>
+  <rect x="24" y="24" width="612" height="382" rx="24" stroke="rgba(255,255,255,0.05)"/>
 
-  <circle cx="330" cy="196" r="112" fill="url(#glow)" opacity="0.9"/>
-  <path d="M272 198H383" stroke="#E8EEF7" stroke-width="16" stroke-linecap="round"/>
-  <path d="M350 165L383 198L350 231" stroke="#E8EEF7" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
-
-  <text x="56" y="78" fill="#F6F8FB" font-size="28" font-family="SF Pro Display, -apple-system, BlinkMacSystemFont, sans-serif" font-weight="700">
-    Install RKN
-  </text>
-  <text x="56" y="112" fill="#9EACBF" font-size="15" font-family="SF Pro Text, -apple-system, BlinkMacSystemFont, sans-serif">
-    Drag the app into Applications to copy it to your Mac.
+  <text x="56" y="92" fill="#F4F7FB" font-size="44" font-family="SF Pro Display, -apple-system, BlinkMacSystemFont, sans-serif" font-weight="700" letter-spacing="0.02em">
+    RKN
   </text>
 
-  <text x="90" y="320" text-anchor="middle" fill="#C7D0DE" font-size="16" font-family="SF Pro Text, -apple-system, BlinkMacSystemFont, sans-serif" font-weight="600">
-    RKN.app
+  <text x="56" y="136" fill="#A7B3C4" font-size="16" font-family="SF Pro Text, -apple-system, BlinkMacSystemFont, sans-serif">
+    If macOS says the app is damaged, run this command after moving RKN to Applications:
   </text>
-  <text x="570" y="320" text-anchor="middle" fill="#C7D0DE" font-size="16" font-family="SF Pro Text, -apple-system, BlinkMacSystemFont, sans-serif" font-weight="600">
-    Applications
+
+  <rect x="56" y="158" width="548" height="44" rx="14" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.06)"/>
+  <text x="76" y="186" fill="#EEF2F8" font-size="15" font-family="SF Mono, Menlo, Monaco, monospace" font-weight="600">
+    sudo xattr -rd com.apple.quarantine "/Applications/RKN.app"
   </text>
 
   <defs>
-    <linearGradient id="panel" x1="330" y1="24" x2="330" y2="376" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#121722"/>
-      <stop offset="1" stop-color="#0E121A"/>
+    <linearGradient id="panel" x1="330" y1="24" x2="330" y2="406" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#171D27"/>
+      <stop offset="1" stop-color="#11161E"/>
     </linearGradient>
-    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(330 196) rotate(90) scale(112)">
-      <stop stop-color="#3C6DFF" stop-opacity="0.28"/>
-      <stop offset="1" stop-color="#3C6DFF" stop-opacity="0"/>
-    </radialGradient>
   </defs>
 </svg>
