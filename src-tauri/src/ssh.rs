@@ -72,10 +72,6 @@ fn save_server_profile(app: &AppHandle, profile: &SavedServerProfile) -> Result<
     std::fs::write(profile_path, profile_json).map_err(|e| e.to_string())
 }
 
-fn local_client_config_exists(local_data: &std::path::Path) -> bool {
-    local_data.join("client_config.json").exists()
-}
-
 fn parse_remote_bootstrap_from_server_config(
     config_json: &str,
 ) -> Result<RemoteTransportBootstrap, String> {
@@ -559,7 +555,7 @@ pub async fn deploy_server(
         .path()
         .app_local_data_dir()
         .unwrap_or_else(|_| std::env::temp_dir());
-    let attach_only = !local_client_config_exists(&local_data);
+    let local_client_config_present = local_data.join("client_config.json").exists();
     let saved_profile = SavedServerProfile {
         host: host.clone(),
         user: user.clone(),
@@ -582,14 +578,10 @@ pub async fn deploy_server(
             let sess = connect_ssh_session(&app, &host, &user, &pass)?;
             emit_ssh_stage(&app, "AUTH", "Authenticated successfully.");
 
-            if !attach_only {
-                return Ok(None);
-            }
-
             emit_ssh_stage(
                 &app,
                 "PREFLIGHT",
-                "Checking whether this device can attach to an existing RKN server...",
+                "Checking whether this server already has an active RKN transport...",
             );
 
             let remote_bootstrap = load_remote_transport_bootstrap(&sess)?;
@@ -611,14 +603,26 @@ pub async fn deploy_server(
 
             let _ = app.emit(
                 "tunnel-log",
-                "[SSH] Existing RKN transport detected on this server. Attach to existing server mode is active for this device.".to_string(),
-
+                "[SSH] Existing RKN transport detected on this server. Reusing it instead of rotating transport credentials.".to_string(),
             );
+            let local_message = if local_client_config_present {
+                "[SSH] Local client config already exists on this device. Refreshing it from the active remote transport."
+            } else {
+                "[SSH] Attach to existing server mode is active for this device."
+            };
+            let _ = app.emit("tunnel-log", local_message.to_string());
             let _ = app.emit(
                 "tunnel-log",
                 format!(
                     "[SSH] Reusing remote container {} and external port {} without reinstalling the server stack.",
                     container_name, remote_bootstrap.external_port
+                ),
+            );
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SSH] Active remote cover domain: {}",
+                    remote_bootstrap.cover_domain
                 ),
             );
 
@@ -1000,6 +1004,13 @@ pub async fn rotate_sni(app: AppHandle) -> Result<String, String> {
             external_port,
             cover_domain,
         );
+        let bootstrap_cfg = json!({
+            "external_port": external_port,
+            "cover_domain": cover_domain,
+            "shadow_pass": shadow_pass,
+            "ss_password": ss_password
+        })
+        .to_string();
 
         let injected_script = format!(
             r#"#!/bin/bash
@@ -1010,9 +1021,13 @@ cat << 'CONFIGEOF' > /opt/rkn/config.candidate.json
 {}
 CONFIGEOF
 
+cat << 'BOOTSTRAPEOF' > /opt/rkn/bootstrap.candidate.json
+{}
+BOOTSTRAPEOF
+
 {}
 "#,
-            PINNED_SING_BOX_IMAGE, container_name, server_cfg, deploy_script
+            PINNED_SING_BOX_IMAGE, container_name, server_cfg, bootstrap_cfg, deploy_script
         );
 
         emit_ssh_stage(&app, "ROTATE", "Deploying new cover domain to server...");

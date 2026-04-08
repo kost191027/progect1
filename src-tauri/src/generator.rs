@@ -9,9 +9,14 @@ pub const INTERNAL_SS_PORT: u16 = 14433;
 /// ShadowTLS cover domains.
 ///
 /// We keep rotation, but only across a short allowlist of domains that are
-/// safer for the current product profile. `www.amazon.com` was removed after
-/// real-world pinning failures in production logs.
-const COVER_DOMAINS: &[&str] = &["www.microsoft.com", "www.apple.com", "www.googleapis.com"];
+/// explicitly compatible with common ShadowTLS v3 practice. `www.amazon.com`
+/// and `www.microsoft.com` were removed after real-world pinning failures in
+/// production logs.
+const COVER_DOMAINS: &[&str] = &[
+    "captive.apple.com",
+    "publicassets.cdn-apple.com",
+    "weather-data.apple.com",
+];
 
 pub fn select_cover_domain(short_id: &str) -> &'static str {
     let seed = short_id
