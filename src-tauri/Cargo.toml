@@ -1,6 +1,6 @@
 [package]
 name = "rkn"
-version = "0.1.3"
+version = "0.1.4"
 description = "Recursive Kinetic Network"
 authors = ["RKN"]
 edition = "2021"
