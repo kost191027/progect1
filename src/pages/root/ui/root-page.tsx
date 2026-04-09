@@ -7,6 +7,7 @@ import { InfoScreen } from "../../info/ui/info-screen";
 import { PowerScreen } from "../../power/ui/power-screen";
 import { BottomNavigation, type ScreenId } from "../../../widgets/bottom-navigation/ui/bottom-navigation";
 import { BlockingModal } from "../../../shared/ui/blocking-modal";
+import { InviteLinkModal } from "../../../shared/ui/invite-link-modal";
 
 export function RootPage() {
   const controlCenter = useControlCenter();
@@ -46,9 +47,11 @@ export function RootPage() {
               isRunning={controlCenter.isRunning}
               isBusy={
                 controlCenter.isDeploying ||
+                controlCenter.isImportingInvite ||
                 controlCenter.isStarting ||
                 controlCenter.isStopping ||
-                controlCenter.requiresRedeploy
+                controlCenter.requiresRedeploy ||
+                controlCenter.requiresInviteRefresh
               }
               guardState={controlCenter.guardState}
               statusSummary={controlCenter.statusSummary}
@@ -63,7 +66,7 @@ export function RootPage() {
         <BottomNavigation activeScreen={activeScreen} onChange={setActiveScreen} />
       </div>
 
-      {controlCenter.requiresRedeploy ? (
+      {controlCenter.appRole === "master" && controlCenter.requiresRedeploy ? (
         <BlockingModal
           title="Configuration changed on another app"
           description={
@@ -74,6 +77,36 @@ export function RootPage() {
           actionLabel="Refresh Configuration"
           isBusy={controlCenter.isDeploying}
           onAction={controlCenter.refreshConfiguration}
+        />
+      ) : null}
+
+      {controlCenter.appRole === "subordinate" &&
+      controlCenter.requiresInviteRefresh &&
+      !controlCenter.isInviteModalOpen ? (
+        <BlockingModal
+          title="Master app rotated the configuration"
+          description="The invite link on this device is stale. Ask the master app for a fresh invite link, then paste it here before starting the tunnel again."
+          actionLabel="Paste Fresh Invite Link"
+          isBusy={controlCenter.isImportingInvite}
+          onAction={controlCenter.openInviteLinkModal}
+        />
+      ) : null}
+
+      {controlCenter.isInviteModalOpen ? (
+        <InviteLinkModal
+          title="Import invite link"
+          description="Paste the share link from the master app. This device will rebuild its local client config without using SSH credentials."
+          value={controlCenter.inviteLinkInput}
+          errorMessage={controlCenter.inviteLinkError}
+          statusMessage={
+            controlCenter.isImportingInvite
+              ? "Valid invite link detected. Importing automatically..."
+              : "The clipboard is checked when this window opens. A valid invite link imports automatically as soon as it appears here."
+          }
+          isBusy={controlCenter.isImportingInvite}
+          onChange={controlCenter.setInviteLinkInput}
+          onClose={controlCenter.closeInviteLinkModal}
+          onSubmit={controlCenter.importInviteLink}
         />
       ) : null}
     </main>

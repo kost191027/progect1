@@ -34,6 +34,22 @@ pub const CURATED_RU_DOMAIN_SUFFIXES: &[&str] = &[
     "wildberries.ru",
 ];
 
+pub const PROXY_PRIORITY_DOMAIN_SUFFIXES: &[&str] = &[
+    "youtube.com",
+    "youtu.be",
+    "youtubei.googleapis.com",
+    "ytimg.com",
+    "googlevideo.com",
+    "ggpht.com",
+    "google.com",
+    "gstatic.com",
+    "googleapis.com",
+    "googleusercontent.com",
+    "withgoogle.com",
+    "gemini.google.com",
+    "ai.google.dev",
+];
+
 pub const REMOTE_RULE_SETS: &[RemoteRuleSet] = &[
     RemoteRuleSet {
         tag: "geoip-ru",

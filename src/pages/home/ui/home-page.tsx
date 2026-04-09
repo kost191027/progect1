@@ -2,6 +2,7 @@ import type { ControlCenterModel } from "../../../features/control-center/model/
 import { ScreenHeader } from "../../../shared/ui/screen-header";
 import { ActivityLogSection } from "../../../widgets/activity-log-section/ui/activity-log-section";
 import { DiagnosticsActionsPanel } from "../../../widgets/diagnostics-actions/ui/diagnostics-actions-panel";
+import { InviteAccessPanel } from "../../../widgets/invite-access/ui/invite-access-panel";
 import { ServerSetupPanel } from "../../../widgets/server-setup/ui/server-setup-panel";
 import { SystemStatusPanel } from "../../../widgets/system-status/ui/system-status-panel";
 import { TunnelControlsPanel } from "../../../widgets/tunnel-controls/ui/tunnel-controls-panel";
@@ -17,7 +18,11 @@ export function HomePage({ controlCenter }: HomePageProps) {
       <ScreenHeader
         screenName="Settings"
         title="Quiet control over your tunnel"
-        description="Use this screen for setup, deploy, diagnostics, and the detailed activity log."
+        description={
+          controlCenter.appRole === "master"
+            ? "Use this screen for setup, deploy, sharing access, diagnostics, and the detailed activity log."
+            : "This installation follows a master app. Import invite links here, refresh configuration when asked, and inspect tunnel activity."
+        }
       />
 
       <div className="grid gap-3 sm:grid-cols-3">
@@ -49,7 +54,13 @@ export function HomePage({ controlCenter }: HomePageProps) {
             {controlCenter.host || "Not set"}
           </div>
           <p className="mt-2 text-sm leading-6 text-zinc-400">
-            {controlCenter.user ? `Login: ${controlCenter.user}` : "Add login details to prepare the node."}
+            {controlCenter.appRole === "master"
+              ? controlCenter.user
+                ? `Login: ${controlCenter.user}`
+                : "Add login details to prepare the node."
+              : controlCenter.currentCoverDomain
+                ? `Active cover domain: ${controlCenter.currentCoverDomain}`
+                : "This device is waiting for an invite link from the master app."}
           </p>
           <div className="mt-3 text-[11px] font-bold uppercase tracking-[0.22em] text-zinc-500">
             Mode: {controlCenter.appRole === "master" ? "Master app" : "Subordinate app"}
@@ -64,12 +75,31 @@ export function HomePage({ controlCenter }: HomePageProps) {
             {controlCenter.formattedLastDeployedAt}
           </div>
           <p className="mt-2 text-sm leading-6 text-zinc-400">
-            The app remembers when the last successful configuration was applied on this Mac.
+            {controlCenter.appRole === "master"
+              ? "The app remembers when the last successful configuration was applied on this Mac."
+              : "The app remembers when the last invite link was imported or refreshed on this Mac."}
           </p>
         </div>
       </div>
 
       <div className="flex flex-col gap-4 lg:gap-5">
+        <InviteAccessPanel
+          appRole={controlCenter.appRole}
+          host={controlCenter.host}
+          canPasteInviteLink={!controlCenter.savedProfile}
+          currentCoverDomain={controlCenter.currentCoverDomain}
+          requiresInviteRefresh={controlCenter.requiresInviteRefresh}
+          isGeneratingInvite={controlCenter.isGeneratingInvite}
+          isImportingInvite={controlCenter.isImportingInvite}
+          inviteCopySuccessMessage={controlCenter.inviteCopySuccessMessage}
+          inviteImportSuccessMessage={controlCenter.inviteImportSuccessMessage}
+          generatedInviteLink={controlCenter.generatedInviteLink}
+          resetSuccessMessage={controlCenter.localDataResetMessage}
+          onGenerateInvite={controlCenter.generateInviteLink}
+          onEnterInvite={controlCenter.openInviteLinkModal}
+          onResetLocalData={controlCenter.resetLocalData}
+        />
+
         {controlCenter.appRole === "master" ? (
           <ServerSetupPanel
             host={controlCenter.host}
@@ -79,6 +109,7 @@ export function HomePage({ controlCenter }: HomePageProps) {
             isDeploying={controlCenter.isDeploying}
             isResettingLocalData={controlCenter.isResettingLocalData}
             deployActionLabel={controlCenter.deployActionLabel}
+            resetSuccessMessage={controlCenter.localDataResetMessage}
             onHostChange={controlCenter.setHost}
             onUserChange={controlCenter.setUser}
             onPasswordChange={controlCenter.setPassword}

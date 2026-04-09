@@ -2,7 +2,10 @@ use serde_json::{json, Value};
 use tauri::AppHandle;
 use tauri_plugin_shell::ShellExt;
 
-use crate::geodata::{CURATED_RU_DOMAIN_SUFFIXES, DIRECT_ROUTE_RULE_SET_TAGS, REMOTE_RULE_SETS};
+use crate::geodata::{
+    CURATED_RU_DOMAIN_SUFFIXES, DIRECT_ROUTE_RULE_SET_TAGS, PROXY_PRIORITY_DOMAIN_SUFFIXES,
+    REMOTE_RULE_SETS,
+};
 
 pub const INTERNAL_SS_PORT: u16 = 14433;
 
@@ -307,10 +310,14 @@ pub fn build_client_config(
           {
             "tag": "direct-dns",
             "type": "udp",
-            "server": "77.88.8.8"
+            "server": "1.1.1.1"
           }
         ],
         "rules": [
+          {
+            "domain_suffix": PROXY_PRIORITY_DOMAIN_SUFFIXES,
+            "server": "proxy-dns"
+          },
           {
             "rule_set": DIRECT_ROUTE_RULE_SET_TAGS,
             "server": "direct-dns"
@@ -373,6 +380,11 @@ pub fn build_client_config(
             "action": "hijack-dns"
           },
           {
+            "domain_suffix": PROXY_PRIORITY_DOMAIN_SUFFIXES,
+            "action": "route",
+            "outbound": "proxy"
+          },
+          {
             "ip_cidr": [format!("{}/32", server_ip)],
             "action": "route",
             "outbound": "direct"
@@ -389,7 +401,7 @@ pub fn build_client_config(
           }
         ],
         "final": "proxy",
-        "default_domain_resolver": "direct-dns",
+        "default_domain_resolver": "proxy-dns",
         "auto_detect_interface": true,
         "rule_set": REMOTE_RULE_SETS
         .iter()

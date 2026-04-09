@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::sync::Mutex;
 use std::{fs, path::PathBuf};
 use tauri::image::Image;
@@ -166,6 +167,60 @@ fn recent_log_tail(log_path: &str, max_lines: usize) -> String {
         .collect::<Vec<_>>();
     lines.reverse();
     lines.join("\n")
+}
+
+#[tauri::command]
+fn write_clipboard_text(text: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut child = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to launch pbcopy: {}", e))?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("Failed to write clipboard text: {}", e))?;
+        }
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("Failed to wait for pbcopy: {}", e))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err("pbcopy exited with a non-zero status".to_string())
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = text;
+        Err("Clipboard write is not implemented for this platform yet.".to_string())
+    }
+}
+
+#[tauri::command]
+fn read_clipboard_text() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("pbpaste")
+            .output()
+            .map_err(|e| format!("Failed to launch pbpaste: {}", e))?;
+
+        if !output.status.success() {
+            return Err("pbpaste exited with a non-zero status".to_string());
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Clipboard read is not implemented for this platform yet.".to_string())
+    }
 }
 
 fn current_network_fingerprint() -> Option<String> {
@@ -879,7 +934,12 @@ pub fn run() {
             stop_tunnel,
             reset_local_data,
             restore_tunnel_session,
+            write_clipboard_text,
+            read_clipboard_text,
             ssh::deploy_server,
+            ssh::generate_invite_link,
+            ssh::import_invite_link,
+            ssh::get_local_installation_state,
             ssh::get_transport_state_snapshot,
             ssh::load_saved_server_profile,
             ssh::check_server_status,

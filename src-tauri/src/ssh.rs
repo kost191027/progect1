@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ssh2::Session;
@@ -11,6 +13,8 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tauri::{AppHandle, Emitter, Manager};
 
 const PRIMARY_EXTERNAL_PORT: u16 = 4433;
@@ -25,6 +29,7 @@ const CONTAINER_PREFIXES: [&str; 5] = [
 ];
 const LEGACY_CONTAINER_NAME: &str = "sys-network-helper";
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SSH_SESSION_TIMEOUT: Duration = Duration::from_secs(15);
 const REMOTE_DEPLOY_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOTE_DEPLOY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_FALLBACK_COVER_DOMAINS: usize = 4;
@@ -69,6 +74,40 @@ pub struct TransportStateSnapshot {
     requires_redeploy: bool,
 }
 
+fn snapshot_for_cover_domain(cover_domain: impl Into<String>) -> TransportStateSnapshot {
+    let cover_domain = cover_domain.into();
+
+    TransportStateSnapshot {
+        current_cover_domain: Some(cover_domain.clone()),
+        available_cover_domains: crate::generator::available_cover_domains(),
+        local_cover_domain: Some(cover_domain),
+        requires_redeploy: false,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InviteLinkPayload {
+    version: u8,
+    host: String,
+    external_port: u16,
+    cover_domain: String,
+    shadow_pass: String,
+    ss_password: String,
+    generated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InviteImportResult {
+    host: String,
+    cover_domain: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalInstallationState {
+    has_saved_server_profile: bool,
+    has_client_config: bool,
+}
+
 fn emit_ssh_stage(app: &AppHandle, stage: &str, message: impl Into<String>) {
     let _ = app.emit("tunnel-log", format!("[SSH:{}] {}", stage, message.into()));
 }
@@ -88,6 +127,16 @@ fn save_server_profile(app: &AppHandle, profile: &SavedServerProfile) -> Result<
 
     let profile_json = serde_json::to_vec_pretty(profile).map_err(|e| e.to_string())?;
     std::fs::write(profile_path, profile_json).map_err(|e| e.to_string())
+}
+
+fn remove_saved_server_profile(app: &AppHandle) -> Result<(), String> {
+    let profile_path = server_profile_path(app)?;
+
+    match std::fs::remove_file(profile_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn parse_remote_bootstrap_from_server_config(
@@ -226,6 +275,17 @@ fn load_local_client_transport_state(
         shadow_pass,
         ss_password,
     }))
+}
+
+#[tauri::command]
+pub fn get_local_installation_state(app: AppHandle) -> Result<LocalInstallationState, String> {
+    let profile_path = server_profile_path(&app)?;
+    let client_config_path = local_client_config_path(&app)?;
+
+    Ok(LocalInstallationState {
+        has_saved_server_profile: profile_path.exists(),
+        has_client_config: client_config_path.exists(),
+    })
 }
 
 fn local_transport_requires_redeploy(
@@ -410,6 +470,58 @@ exit 0
     Ok(None)
 }
 
+fn extract_invite_payload_segment(invite_link: &str) -> &str {
+    let trimmed = invite_link.trim();
+
+    if let Some(payload) = trimmed.strip_prefix("rkn://invite/") {
+        return payload.trim();
+    }
+
+    if let Some(payload) = trimmed.strip_prefix("rkn-invite:") {
+        return payload.trim();
+    }
+
+    if let Some(payload) = trimmed.strip_prefix("rkn://invite?data=") {
+        return payload.trim();
+    }
+
+    if let Some(index) = trimmed.find("data=") {
+        return trimmed[(index + 5)..].trim();
+    }
+
+    trimmed
+}
+
+fn parse_invite_link_payload(invite_link: &str) -> Result<InviteLinkPayload, String> {
+    let payload_segment = extract_invite_payload_segment(invite_link);
+    if payload_segment.is_empty() {
+        return Err("Invite link is empty.".to_string());
+    }
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(payload_segment)
+        .map_err(|e| format!("Failed to decode invite link payload: {}", e))?;
+    let payload = serde_json::from_slice::<InviteLinkPayload>(&payload_bytes)
+        .map_err(|e| format!("Failed to parse invite link payload JSON: {}", e))?;
+
+    if payload.version != 1 {
+        return Err(format!(
+            "Unsupported invite link version: {}",
+            payload.version
+        ));
+    }
+
+    if payload.host.trim().is_empty()
+        || payload.cover_domain.trim().is_empty()
+        || payload.shadow_pass.trim().is_empty()
+        || payload.ss_password.trim().is_empty()
+    {
+        return Err("Invite link payload is incomplete.".to_string());
+    }
+
+    Ok(payload)
+}
+
 fn verify_external_port_reachable(host: &str, external_port: u16) -> Result<(), String> {
     let address = format!("{}:{}", host, external_port);
     let mut resolved_addrs = address
@@ -459,6 +571,8 @@ fn connect_tcp_with_timeout(addrs: &[SocketAddr]) -> Result<TcpStream, String> {
         match TcpStream::connect_timeout(addr, SSH_CONNECT_TIMEOUT) {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
+                let _ = stream.set_read_timeout(Some(SSH_SESSION_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(SSH_SESSION_TIMEOUT));
                 return Ok(stream);
             }
             Err(err) => {
@@ -496,6 +610,7 @@ fn connect_ssh_session(
     emit_ssh_stage(app, "HANDSHAKE", "TCP connected. Starting SSH handshake...");
 
     let mut sess = Session::new().map_err(|e| e.to_string())?;
+    sess.set_timeout(SSH_SESSION_TIMEOUT.as_millis() as u32);
     sess.set_tcp_stream(tcp);
     sess.handshake()
         .map_err(|e| format!("SSH handshake failed: {}", e))?;
@@ -748,7 +863,7 @@ pub async fn deploy_server(
     host: String,
     user: String,
     pass: String,
-) -> Result<(), String> {
+) -> Result<TransportStateSnapshot, String> {
     let local_data = app
         .path()
         .app_local_data_dir()
@@ -866,13 +981,13 @@ pub async fn deploy_server(
     .await
     .unwrap()?;
 
-    if attach_result.is_some() {
+    if let Some(remote_bootstrap) = attach_result {
         crate::restart_tunnel_if_running(
             &app,
             "Tunnel config changed after attaching to the existing server. Restarting core to apply the updated client config.",
         )
         .await?;
-        return Ok(());
+        return Ok(snapshot_for_cover_domain(remote_bootstrap.cover_domain));
     }
 
     let _ = app.emit(
@@ -899,7 +1014,7 @@ pub async fn deploy_server(
     );
 
     let deploy_app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let deploy_snapshot = tauri::async_runtime::spawn_blocking(move || {
         let _ = deploy_app.emit(
             "tunnel-log",
             format!("--- [SSH] Connecting to {}:22 ---", host),
@@ -1071,7 +1186,7 @@ BOOTSTRAPEOF
             "tunnel-log",
             "[SYSTEM] Server credentials saved locally for next launch.".to_string(),
         );
-        Ok(())
+        Ok(snapshot_for_cover_domain(cover_domain))
     })
     .await
     .unwrap()?;
@@ -1082,7 +1197,7 @@ BOOTSTRAPEOF
     )
     .await?;
 
-    Ok(())
+    Ok(deploy_snapshot)
 }
 
 #[tauri::command]
@@ -1107,6 +1222,101 @@ pub async fn get_transport_state_snapshot(
     tauri::async_runtime::spawn_blocking(move || load_transport_state_snapshot_sync(&app))
         .await
         .unwrap()
+}
+
+#[tauri::command]
+pub async fn generate_invite_link(app: AppHandle) -> Result<String, String> {
+    let profile = load_saved_server_profile(app.clone())?
+        .ok_or_else(|| "Saved server profile not found. Deploy once first.".to_string())?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let sess = connect_ssh_session(&app, &profile.host, &profile.user, &profile.password)?;
+        let remote_bootstrap = load_remote_transport_bootstrap(&sess)?.ok_or_else(|| {
+            "Remote transport bootstrap not found. Deploy the server first.".to_string()
+        })?;
+        let generated_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs();
+
+        let payload = InviteLinkPayload {
+            version: 1,
+            host: profile.host,
+            external_port: remote_bootstrap.external_port,
+            cover_domain: remote_bootstrap.cover_domain,
+            shadow_pass: remote_bootstrap.shadow_pass,
+            ss_password: remote_bootstrap.ss_password,
+            generated_at,
+        };
+        let payload_json =
+            serde_json::to_vec(&payload).map_err(|e| format!("Invite payload error: {}", e))?;
+        let encoded = URL_SAFE_NO_PAD.encode(payload_json);
+
+        Ok(format!("rkn://invite/{}", encoded))
+    })
+    .await
+    .unwrap()
+}
+
+#[tauri::command]
+pub async fn import_invite_link(
+    app: AppHandle,
+    invite_link: String,
+) -> Result<InviteImportResult, String> {
+    if load_saved_server_profile(app.clone())?.is_some() {
+        return Err(
+            "This app already has master access for a server. Reset local data before importing an invite link here."
+                .to_string(),
+        );
+    }
+
+    let local_data = app
+        .path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+
+    let result = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        move || -> Result<InviteImportResult, String> {
+            let payload = parse_invite_link_payload(&invite_link)?;
+            let client_cfg = crate::generator::build_client_config(
+                &payload.host,
+                &payload.shadow_pass,
+                &payload.ss_password,
+                payload.external_port,
+                &payload.cover_domain,
+            );
+
+            std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
+            let client_cfg_path = local_data.join("client_config.json");
+            std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
+            remove_saved_server_profile(&app)?;
+            crate::refresh_tray_toggle_item(&app);
+
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SYSTEM] Invite link imported successfully. Client config updated at: {:?}",
+                    client_cfg_path
+                ),
+            );
+
+            Ok(InviteImportResult {
+                host: payload.host,
+                cover_domain: payload.cover_domain,
+            })
+        }
+    })
+    .await
+    .unwrap()?;
+
+    crate::restart_tunnel_if_running(
+        &app,
+        "Tunnel config changed after importing an invite link. Restarting core to apply the updated client config.",
+    )
+    .await?;
+
+    Ok(result)
 }
 
 #[tauri::command]

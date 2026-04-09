@@ -10,6 +10,7 @@ type ServerSetupPanelProps = {
   isDeploying: boolean;
   isResettingLocalData: boolean;
   deployActionLabel: string;
+  resetSuccessMessage: string | null;
   onHostChange: (value: string) => void;
   onUserChange: (value: string) => void;
   onPasswordChange: (value: string) => void;
@@ -25,6 +26,7 @@ export function ServerSetupPanel({
   isDeploying,
   isResettingLocalData,
   deployActionLabel,
+  resetSuccessMessage,
   onHostChange,
   onUserChange,
   onPasswordChange,
@@ -92,6 +94,12 @@ export function ServerSetupPanel({
             {isResettingLocalData ? "Resetting..." : "Reset Local Data"}
           </Button>
         </div>
+
+        {resetSuccessMessage ? (
+          <div className="rounded-2xl border border-emerald-900/50 bg-emerald-950/20 px-4 py-3 text-sm leading-6 text-emerald-200">
+            {resetSuccessMessage}
+          </div>
+        ) : null}
       </div>
     </Panel>
   );

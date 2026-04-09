@@ -38,10 +38,38 @@ export type TransportStateSnapshot = {
   requires_redeploy: boolean;
 };
 
+type LocalInstallationState = {
+  has_saved_server_profile: boolean;
+  has_client_config: boolean;
+};
+
+type InviteImportResult = {
+  host: string;
+  cover_domain: string;
+};
+
 const MAX_LOG_BUFFER = 800;
 const HAS_COMPLETED_FIRST_START_KEY = "rkn.has-completed-first-start";
 const LAST_DEPLOYED_AT_KEY = "rkn.last-deployed-at";
 const APP_ROLE_KEY = "rkn.app-role";
+const SUBORDINATE_HOST_KEY = "rkn.subordinate-host";
+const SUBORDINATE_COVER_DOMAIN_KEY = "rkn.subordinate-cover-domain";
+
+function normalizeInviteLink(value: string) {
+  return value.trim();
+}
+
+function looksLikeInviteLink(value: string) {
+  return normalizeInviteLink(value).toLowerCase().startsWith("rkn://invite/");
+}
+
+async function copyTextToClipboard(text: string) {
+  await invoke("write_clipboard_text", { text });
+}
+
+async function readTextFromClipboard() {
+  return invoke<string>("read_clipboard_text");
+}
 
 function profilesMatch(
   left: SavedServerProfile | null,
@@ -81,16 +109,31 @@ export function useControlCenter() {
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
   const [isRotatingSni, setIsRotatingSni] = useState(false);
   const [isResettingLocalData, setIsResettingLocalData] = useState(false);
+  const [isGeneratingInvite, setIsGeneratingInvite] = useState(false);
+  const [isImportingInvite, setIsImportingInvite] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [guardState, setGuardState] = useState<GuardState>("inactive");
-  const [host, setHost] = useState("");
+  const [host, setHost] = useState(() => {
+    return window.localStorage.getItem(SUBORDINATE_HOST_KEY) ?? "";
+  });
   const [user, setUser] = useState("root");
   const [password, setPassword] = useState("");
   const [savedProfile, setSavedProfile] = useState<SavedServerProfile | null>(null);
-  const [currentCoverDomain, setCurrentCoverDomain] = useState<string | null>(null);
+  const [currentCoverDomain, setCurrentCoverDomain] = useState<string | null>(() => {
+    return window.localStorage.getItem(SUBORDINATE_COVER_DOMAIN_KEY);
+  });
   const [availableCoverDomains, setAvailableCoverDomains] = useState<string[]>([]);
   const [requiresRedeploy, setRequiresRedeploy] = useState(false);
+  const [requiresInviteRefresh, setRequiresInviteRefresh] = useState(false);
+  const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
+  const [inviteLinkInput, setInviteLinkInput] = useState("");
+  const [inviteLinkError, setInviteLinkError] = useState<string | null>(null);
+  const [inviteCopySuccessMessage, setInviteCopySuccessMessage] = useState<string | null>(null);
+  const [inviteImportSuccessMessage, setInviteImportSuccessMessage] = useState<string | null>(null);
+  const [generatedInviteLink, setGeneratedInviteLink] = useState<string | null>(null);
+  const [localDataResetMessage, setLocalDataResetMessage] = useState<string | null>(null);
+  const [lastAutoImportedInvite, setLastAutoImportedInvite] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [trimmedLogCount, setTrimmedLogCount] = useState(0);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -133,28 +176,6 @@ export function useControlCenter() {
     }
   }
 
-  async function refreshTransportState(silent = false) {
-    try {
-      const snapshot =
-        await invoke<TransportStateSnapshot>("get_transport_state_snapshot");
-
-      setCurrentCoverDomain(snapshot.current_cover_domain);
-      setAvailableCoverDomains(snapshot.available_cover_domains);
-      if (snapshot.requires_redeploy && !requiresRedeploy) {
-        const remoteDomain = snapshot.current_cover_domain ?? "unknown";
-        const message = `Remote cover domain changed to ${remoteDomain} on another client. Run Deploy/Update on this device before starting the tunnel.`;
-        appendLog(`[SYSTEM] ${message}`);
-        setLastUserMessage(message);
-      }
-
-      setRequiresRedeploy(snapshot.requires_redeploy);
-    } catch (error) {
-      if (!silent) {
-        appendLog(`[WARN] Failed to load remote transport state: ${error}`);
-      }
-    }
-  }
-
   useEffect(() => {
     const unlisten = listen<string>("tunnel-log", (event) => {
       appendLog(event.payload);
@@ -168,20 +189,56 @@ export function useControlCenter() {
   useEffect(() => {
     let isMounted = true;
 
-    async function loadSavedProfile() {
+    async function loadLocalState() {
       try {
-        const profile = await invoke<SavedServerProfile | null>("load_saved_server_profile");
-        if (!isMounted || !profile) {
+        const installationState = await invoke<LocalInstallationState>(
+          "get_local_installation_state",
+        );
+        if (!isMounted) {
           return;
         }
 
-        setHost(profile.host);
-        setUser(profile.user);
-        setPassword(profile.password);
-        setSavedProfile(profile);
+        if (installationState.has_saved_server_profile) {
+          const profile = await invoke<SavedServerProfile | null>("load_saved_server_profile");
+          if (!isMounted || !profile) {
+            return;
+          }
+
+          setHost(profile.host);
+          setUser(profile.user);
+          setPassword(profile.password);
+          setSavedProfile(profile);
+          setAppRole("master");
+          setCurrentCoverDomain(null);
+          setRequiresInviteRefresh(false);
+          window.localStorage.setItem(APP_ROLE_KEY, "master");
+          window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
+          window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
+          appendLog("[SYSTEM] Saved server profile loaded.");
+          return;
+        }
+
+        if (installationState.has_client_config) {
+          setAppRole("subordinate");
+          setSavedProfile(null);
+          setUser("root");
+          setPassword("");
+          setRequiresRedeploy(false);
+          window.localStorage.setItem(APP_ROLE_KEY, "subordinate");
+          return;
+        }
+
         setAppRole("master");
-        window.localStorage.setItem(APP_ROLE_KEY, "master");
-        appendLog("[SYSTEM] Saved server profile loaded.");
+        window.localStorage.removeItem(APP_ROLE_KEY);
+        window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
+        window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
+        setHost("");
+        setUser("root");
+        setPassword("");
+        setSavedProfile(null);
+        setCurrentCoverDomain(null);
+        setRequiresInviteRefresh(false);
+        setRequiresRedeploy(false);
       } catch (error) {
         if (!isMounted) {
           return;
@@ -191,7 +248,7 @@ export function useControlCenter() {
       }
     }
 
-    void loadSavedProfile();
+    void loadLocalState();
 
     return () => {
       isMounted = false;
@@ -199,15 +256,14 @@ export function useControlCenter() {
   }, []);
 
   useEffect(() => {
-    if (!savedProfile) {
-      setCurrentCoverDomain(null);
-      setAvailableCoverDomains([]);
-      setRequiresRedeploy(false);
+    if (savedProfile || appRole !== "master") {
       return;
     }
 
-    void refreshTransportState(true);
-  }, [savedProfile]);
+    setCurrentCoverDomain(null);
+    setAvailableCoverDomains([]);
+    setRequiresRedeploy(false);
+  }, [appRole, savedProfile]);
 
   useEffect(() => {
     let isMounted = true;
@@ -239,6 +295,43 @@ export function useControlCenter() {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    const latestLog = logs.length > 0 ? logs[logs.length - 1]?.toLowerCase() : undefined;
+    if (
+      appRole === "subordinate" &&
+      latestLog?.includes("traffic hijacked") &&
+      !requiresInviteRefresh
+    ) {
+      setRequiresInviteRefresh(true);
+      setLastUserMessage(
+        "This subordinate app is no longer in sync with the master app. Paste a fresh invite link before starting the tunnel again.",
+      );
+    }
+  }, [appRole, logs, requiresInviteRefresh]);
+
+  useEffect(() => {
+    if (
+      !isInviteModalOpen ||
+      isImportingInvite ||
+      !looksLikeInviteLink(inviteLinkInput)
+    ) {
+      return;
+    }
+
+    const candidate = normalizeInviteLink(inviteLinkInput);
+    if (candidate === lastAutoImportedInvite) {
+      return;
+    }
+
+    setLastAutoImportedInvite(candidate);
+    void importInviteLinkValue(candidate, true);
+  }, [
+    inviteLinkInput,
+    isImportingInvite,
+    isInviteModalOpen,
+    lastAutoImportedInvite,
+  ]);
 
   useEffect(() => {
     const unlisten = listen<boolean>("tunnel-state", (event) => {
@@ -283,9 +376,17 @@ export function useControlCenter() {
   }, []);
 
   async function startTunnel() {
-    if (requiresRedeploy) {
+    if (appRole === "master" && requiresRedeploy) {
       const message =
         "Remote transport changed on another client. Run Deploy/Update on this device before starting the tunnel.";
+      setLastUserMessage(message);
+      appendLog(`[SYSTEM] ${message}`);
+      return;
+    }
+
+    if (appRole === "subordinate" && requiresInviteRefresh) {
+      const message =
+        "The master app changed the transport configuration. Paste a fresh invite link on this device before starting the tunnel.";
       setLastUserMessage(message);
       appendLog(`[SYSTEM] ${message}`);
       return;
@@ -341,11 +442,12 @@ export function useControlCenter() {
   ) {
     setIsDeploying(true);
     setLastError(null);
+    setLocalDataResetMessage(null);
     setLastUserMessage(options.userMessage);
     appendLog(options.logHeader);
 
     try {
-      await invoke("deploy_server", {
+      const snapshot = await invoke<TransportStateSnapshot>("deploy_server", {
         host: profile.host,
         user: profile.user,
         pass: profile.password,
@@ -355,12 +457,16 @@ export function useControlCenter() {
       setPassword(profile.password);
       setSavedProfile(profile);
       setAppRole("master");
+      setRequiresInviteRefresh(false);
       window.localStorage.setItem(APP_ROLE_KEY, "master");
-      setRequiresRedeploy(false);
+      window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
+      window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
+      setCurrentCoverDomain(snapshot.current_cover_domain);
+      setAvailableCoverDomains(snapshot.available_cover_domains);
+      setRequiresRedeploy(snapshot.requires_redeploy);
       const deployedAt = new Date().toISOString();
       setLastDeployedAt(deployedAt);
       window.localStorage.setItem(LAST_DEPLOYED_AT_KEY, deployedAt);
-      await refreshTransportState(true);
     } catch (error) {
       appendLog(`[MAIN ERROR] Deploy failed: ${error}`);
     } finally {
@@ -383,6 +489,167 @@ export function useControlCenter() {
       userMessage:
         "Refreshing this app from the saved server profile so the local tunnel config matches the active remote transport.",
     });
+  }
+
+  async function generateInviteLink() {
+    setIsGeneratingInvite(true);
+    setLastError(null);
+    setInviteCopySuccessMessage(null);
+    setGeneratedInviteLink(null);
+    setLastUserMessage("Preparing a shareable invite link from the active remote transport.");
+
+    try {
+      const inviteLink = await invoke<string>("generate_invite_link");
+      setGeneratedInviteLink(inviteLink);
+
+      try {
+        await copyTextToClipboard(inviteLink);
+        appendLog("[SYSTEM] Invite link copied to clipboard.");
+        setInviteCopySuccessMessage(
+          "Invite link copied. Paste it into the other app to link this server without SSH credentials.",
+        );
+        setLastUserMessage(
+          "Invite link copied to clipboard. Send it to the other device and import it there.",
+        );
+      } catch (clipboardError) {
+        appendLog(
+          `[WARN] Invite link was generated, but clipboard copy failed: ${clipboardError}`,
+        );
+        setInviteCopySuccessMessage(
+          "Invite link generated, but automatic clipboard copy was blocked. Copy it manually from the field below.",
+        );
+        setLastUserMessage(
+          "Invite link generated successfully. Clipboard access was blocked, so copy the link manually from the field below.",
+        );
+      }
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Invite link generation failed: ${error}`);
+    } finally {
+      setIsGeneratingInvite(false);
+    }
+  }
+
+  async function openInviteLinkModal() {
+    setInviteLinkError(null);
+    setInviteImportSuccessMessage(null);
+    setInviteLinkInput("");
+    setLastAutoImportedInvite(null);
+    setIsInviteModalOpen(true);
+
+    try {
+      const clipboardText = await readTextFromClipboard();
+      const normalizedClipboard = normalizeInviteLink(clipboardText);
+
+      if (!normalizedClipboard) {
+        return;
+      }
+
+      setInviteLinkInput(normalizedClipboard);
+      if (looksLikeInviteLink(normalizedClipboard)) {
+        setLastUserMessage(
+          "A valid invite link was found in the clipboard. Import will begin automatically.",
+        );
+      }
+    } catch {
+      // Clipboard access can fail in some environments; manual paste still works.
+    }
+  }
+
+  function closeInviteLinkModal() {
+    setInviteLinkError(null);
+    setInviteLinkInput("");
+    setLastAutoImportedInvite(null);
+    setIsInviteModalOpen(false);
+  }
+
+  function updateInviteLinkInput(value: string) {
+    setInviteLinkInput(value);
+    setInviteLinkError(null);
+    setInviteImportSuccessMessage(null);
+    setLastAutoImportedInvite(null);
+  }
+
+  function updateHost(value: string) {
+    setLocalDataResetMessage(null);
+    setHost(value);
+  }
+
+  function updateUser(value: string) {
+    setLocalDataResetMessage(null);
+    setUser(value);
+  }
+
+  function updatePassword(value: string) {
+    setLocalDataResetMessage(null);
+    setPassword(value);
+  }
+
+  async function importInviteLinkValue(inviteLink: string, isAutomatic = false) {
+    const normalizedInviteLink = normalizeInviteLink(inviteLink);
+
+    if (!normalizedInviteLink) {
+      setInviteLinkError("Paste the invite link from the master app first.");
+      return;
+    }
+
+    if (appRole === "master" && savedProfile) {
+      setInviteLinkError(
+        "This app is currently the master app for this server. Reset local data first if you really want to relink it from an invite.",
+      );
+      return;
+    }
+
+    setIsImportingInvite(true);
+    setInviteLinkError(null);
+    setInviteImportSuccessMessage(null);
+    setLocalDataResetMessage(null);
+    setLastError(null);
+    setLastUserMessage(
+      isAutomatic
+        ? "Valid invite link detected. Importing it and rebuilding the subordinate client config on this device."
+        : "Importing the invite link and creating a subordinate client config on this device.",
+    );
+
+    try {
+      const result = await invoke<InviteImportResult>("import_invite_link", {
+        inviteLink: normalizedInviteLink,
+      });
+      setAppRole("subordinate");
+      window.localStorage.setItem(APP_ROLE_KEY, "subordinate");
+      window.localStorage.setItem(SUBORDINATE_HOST_KEY, result.host);
+      window.localStorage.setItem(SUBORDINATE_COVER_DOMAIN_KEY, result.cover_domain);
+      setSavedProfile(null);
+      setHost(result.host);
+      setUser("root");
+      setPassword("");
+      setCurrentCoverDomain(result.cover_domain);
+      setAvailableCoverDomains([]);
+      setRequiresRedeploy(false);
+      setRequiresInviteRefresh(false);
+      setLastError(null);
+      const importedAt = new Date().toISOString();
+      setLastDeployedAt(importedAt);
+      window.localStorage.setItem(LAST_DEPLOYED_AT_KEY, importedAt);
+      setGeneratedInviteLink(null);
+      setInviteImportSuccessMessage(
+        `Invite imported. This app now follows ${result.host} and is ready to start the tunnel.`,
+      );
+      closeInviteLinkModal();
+      appendLog("[SYSTEM] Invite link imported. This device now follows the master app.");
+      setLastUserMessage(
+        "Invite link imported successfully. This device is now in subordinate mode and ready to start the tunnel.",
+      );
+    } catch (error) {
+      const message = String(error);
+      setInviteLinkError(message);
+      appendLog(`[MAIN ERROR] Invite link import failed: ${message}`);
+    } finally {
+      setIsImportingInvite(false);
+    }
+  }
+
+  async function importInviteLink() {
+    await importInviteLinkValue(inviteLinkInput, false);
   }
 
   async function checkServerStatus() {
@@ -415,8 +682,8 @@ export function useControlCenter() {
       setLastError(null);
       setLastUserMessage(`New cover domain is active: ${domain}.`);
       appendLog(`--- SNI ROTATED TO: ${domain} ---`);
+      setCurrentCoverDomain(domain);
       setRequiresRedeploy(false);
-      await refreshTransportState(true);
     } catch (error) {
       appendLog(`[MAIN ERROR] SNI rotation failed: ${error}`);
     } finally {
@@ -426,7 +693,7 @@ export function useControlCenter() {
 
   async function copyLogs() {
     try {
-      await navigator.clipboard.writeText(logs.join("\n"));
+      await copyTextToClipboard(logs.join("\n"));
       appendLog("[SYSTEM] Log stream copied to clipboard.");
     } catch (error) {
       appendLog(`[WARN] Failed to copy logs: ${error}`);
@@ -434,20 +701,28 @@ export function useControlCenter() {
   }
 
   async function resetLocalData() {
-    const confirmed = window.confirm(
-      "Remove the saved server profile and the local client config from this Mac? The tunnel will be stopped first if it is running.",
-    );
-
-    if (!confirmed) {
-      return;
-    }
-
     setIsResettingLocalData(true);
     setLastError(null);
+    setInviteCopySuccessMessage(null);
+    setInviteImportSuccessMessage(null);
+    setGeneratedInviteLink(null);
+    setLocalDataResetMessage(null);
     setLastUserMessage("Removing the saved local server profile and client config from this Mac.");
+    appendLog("--- RESETTING LOCAL APP DATA ---");
 
     try {
       await invoke("reset_local_data");
+      const installationState = await invoke<LocalInstallationState>(
+        "get_local_installation_state",
+      );
+      if (
+        installationState.has_saved_server_profile ||
+        installationState.has_client_config
+      ) {
+        throw new Error(
+          "Some local data is still present after reset. Try again after stopping the tunnel completely.",
+        );
+      }
       setHost("");
       setUser("root");
       setPassword("");
@@ -455,12 +730,21 @@ export function useControlCenter() {
       setCurrentCoverDomain(null);
       setAvailableCoverDomains([]);
       setRequiresRedeploy(false);
+      setRequiresInviteRefresh(false);
+      setInviteCopySuccessMessage(null);
+      setInviteImportSuccessMessage(null);
       setLastDeployedAt(null);
       setHasCompletedFirstStart(false);
       setAppRole("master");
       window.localStorage.removeItem(APP_ROLE_KEY);
+      window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
+      window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
       window.localStorage.removeItem(LAST_DEPLOYED_AT_KEY);
       window.localStorage.removeItem(HAS_COMPLETED_FIRST_START_KEY);
+      setLocalDataResetMessage(
+        "Local data reset completed. This Mac is back in a clean state and ready for a fresh Deploy.",
+      );
+      closeInviteLinkModal();
       appendLog("[SYSTEM] Local data reset completed.");
       setLastUserMessage(
         "Local server profile and client config were removed from this Mac. Enter server details again to deploy a fresh config.",
@@ -506,12 +790,21 @@ export function useControlCenter() {
       };
     }
 
-    if (requiresRedeploy) {
+    if (appRole === "master" && requiresRedeploy) {
       return {
         state: "error",
         title: "Deploy required",
         description:
           "Another client changed the active cover domain. Run Deploy on this device before starting the tunnel again.",
+      };
+    }
+
+    if (appRole === "subordinate" && requiresInviteRefresh) {
+      return {
+        state: "error",
+        title: "Invite link update required",
+        description:
+          "The master app changed the transport configuration. Paste a fresh invite link on this device before starting the tunnel again.",
       };
     }
 
@@ -528,7 +821,17 @@ export function useControlCenter() {
       title: "Tunnel inactive",
       description: lastUserMessage,
     };
-  }, [guardState, isDeploying, isRunning, isStarting, lastError, lastUserMessage, requiresRedeploy]);
+  }, [
+    appRole,
+    guardState,
+    isDeploying,
+    isRunning,
+    isStarting,
+    lastError,
+    lastUserMessage,
+    requiresInviteRefresh,
+    requiresRedeploy,
+  ]);
 
   const currentProfile = useMemo<SavedServerProfile | null>(() => {
     if (!host || !user || !password) {
@@ -563,10 +866,11 @@ export function useControlCenter() {
   const serverStatusSummary = useMemo<ServerStatusSummary>(() => {
     if (appRole === "subordinate") {
       return {
-        title: "Managed by master app",
-        description:
-          "This installation is meant to receive and refresh its client config from a master app. Server deploy and SNI rotation stay disabled here.",
-        tone: requiresRedeploy ? "attention" : "ready",
+        title: requiresInviteRefresh ? "Needs fresh invite link" : "Managed by master app",
+        description: requiresInviteRefresh
+          ? "The master app rotated the transport configuration. Paste a fresh invite link on this device before starting the tunnel again."
+          : "This installation is meant to receive and refresh its client config from a master app. Server deploy and SNI rotation stay disabled here.",
+        tone: requiresInviteRefresh ? "attention" : "ready",
       };
     }
 
@@ -615,6 +919,26 @@ export function useControlCenter() {
       return "Deploying server";
     }
 
+    if (appRole === "subordinate") {
+      if (requiresInviteRefresh) {
+        return "Needs fresh invite";
+      }
+
+      if (isStarting) {
+        return "Connecting";
+      }
+
+      if (isRunning && guardState === "engaged") {
+        return "Protection degraded";
+      }
+
+      if (isRunning) {
+        return "Protected";
+      }
+
+      return "Ready to start";
+    }
+
     if (!savedProfile || !profilesMatch(savedProfile, currentProfile)) {
       return "Needs deploy";
     }
@@ -636,7 +960,17 @@ export function useControlCenter() {
     }
 
     return "Ready to start";
-  }, [currentProfile, guardState, isDeploying, isRunning, isStarting, requiresRedeploy, savedProfile]);
+  }, [
+    appRole,
+    currentProfile,
+    guardState,
+    isDeploying,
+    isRunning,
+    isStarting,
+    requiresInviteRefresh,
+    requiresRedeploy,
+    savedProfile,
+  ]);
 
   return {
     appRole,
@@ -647,6 +981,14 @@ export function useControlCenter() {
     currentCoverDomain,
     availableCoverDomains,
     requiresRedeploy,
+    requiresInviteRefresh,
+    isInviteModalOpen,
+    inviteLinkInput,
+    inviteLinkError,
+    inviteCopySuccessMessage,
+    inviteImportSuccessMessage,
+    generatedInviteLink,
+    localDataResetMessage,
     formattedLastDeployedAt,
     serverStatusSummary,
     powerQuickStatus,
@@ -661,16 +1003,23 @@ export function useControlCenter() {
     isCheckingStatus,
     isRotatingSni,
     isResettingLocalData,
+    isGeneratingInvite,
+    isImportingInvite,
     isStarting,
     isStopping,
-    setHost,
-    setUser,
-    setPassword,
+    setHost: updateHost,
+    setUser: updateUser,
+    setPassword: updatePassword,
     startTunnel,
     stopTunnel,
     deployServer,
     checkServerStatus,
     rotateSni,
+    generateInviteLink,
+    openInviteLinkModal,
+    closeInviteLinkModal,
+    setInviteLinkInput: updateInviteLinkInput,
+    importInviteLink,
     refreshConfiguration,
     resetLocalData,
     copyLogs,
