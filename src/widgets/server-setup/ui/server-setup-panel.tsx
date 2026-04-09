@@ -8,11 +8,13 @@ type ServerSetupPanelProps = {
   password: string;
   isRunning: boolean;
   isDeploying: boolean;
+  isResettingLocalData: boolean;
   deployActionLabel: string;
   onHostChange: (value: string) => void;
   onUserChange: (value: string) => void;
   onPasswordChange: (value: string) => void;
   onDeploy: () => void;
+  onResetLocalData: () => void;
 };
 
 export function ServerSetupPanel({
@@ -21,11 +23,13 @@ export function ServerSetupPanel({
   password,
   isRunning,
   isDeploying,
+  isResettingLocalData,
   deployActionLabel,
   onHostChange,
   onUserChange,
   onPasswordChange,
   onDeploy,
+  onResetLocalData,
 }: ServerSetupPanelProps) {
   return (
     <Panel
@@ -60,22 +64,34 @@ export function ServerSetupPanel({
           </div>
         </div>
 
-        <Button
-          variant="success"
-          fullWidth
-          className="mt-2 flex items-center justify-center gap-2"
-          disabled={isDeploying || isRunning}
-          onClick={onDeploy}
-        >
-          {isDeploying ? (
-            <>
-              <span className="animate-spin text-lg">⚙</span>
-              Deploying...
-            </>
-          ) : (
-            deployActionLabel
-          )}
-        </Button>
+        <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_220px]">
+          <Button
+            variant="success"
+            fullWidth
+            className="mt-2 flex items-center justify-center gap-2"
+            disabled={isDeploying || isRunning || isResettingLocalData}
+            onClick={onDeploy}
+          >
+            {isDeploying ? (
+              <>
+                <span className="animate-spin text-lg">⚙</span>
+                Deploying...
+              </>
+            ) : (
+              deployActionLabel
+            )}
+          </Button>
+
+          <Button
+            variant="danger"
+            fullWidth
+            className="mt-2"
+            disabled={isDeploying || isResettingLocalData}
+            onClick={onResetLocalData}
+          >
+            {isResettingLocalData ? "Resetting..." : "Reset Local Data"}
+          </Button>
+        </div>
       </div>
     </Panel>
   );

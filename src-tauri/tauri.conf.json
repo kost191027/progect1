@@ -25,7 +25,8 @@
     "active": true,
     "targets": [
       "app",
-      "dmg"
+      "dmg",
+      "nsis"
     ],
     "externalBin": [
       "bins/sing-box"
@@ -55,6 +56,11 @@
           "x": 450,
           "y": 170
         }
+      }
+    },
+    "windows": {
+      "nsis": {
+        "displayLanguageSelector": false
       }
     }
   }

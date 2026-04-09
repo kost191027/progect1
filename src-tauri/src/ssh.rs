@@ -27,6 +27,7 @@ const LEGACY_CONTAINER_NAME: &str = "sys-network-helper";
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_DEPLOY_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOTE_DEPLOY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_FALLBACK_COVER_DOMAINS: usize = 4;
 
 #[derive(Debug)]
 struct RemoteDeployTarget {
@@ -47,8 +48,25 @@ pub struct SavedServerProfile {
 struct RemoteTransportBootstrap {
     external_port: u16,
     cover_domain: String,
+    #[serde(default)]
+    fallback_cover_domains: Vec<String>,
     shadow_pass: String,
     ss_password: String,
+}
+
+#[derive(Debug, Clone)]
+struct LocalClientTransportState {
+    cover_domain: String,
+    shadow_pass: String,
+    ss_password: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransportStateSnapshot {
+    current_cover_domain: Option<String>,
+    available_cover_domains: Vec<String>,
+    local_cover_domain: Option<String>,
+    requires_redeploy: bool,
 }
 
 fn emit_ssh_stage(app: &AppHandle, stage: &str, message: impl Into<String>) {
@@ -102,6 +120,11 @@ fn parse_remote_bootstrap_from_server_config(
         .and_then(Value::as_str)
         .ok_or_else(|| "Remote server config is missing ShadowTLS cover domain".to_string())?
         .to_string();
+    let fallback_cover_domains = shadowtls_inbound
+        .get("handshake_for_server_name")
+        .and_then(Value::as_object)
+        .map(|mappings| mappings.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
     let shadow_pass = shadowtls_inbound
         .get("users")
         .and_then(Value::as_array)
@@ -119,9 +142,184 @@ fn parse_remote_bootstrap_from_server_config(
     Ok(RemoteTransportBootstrap {
         external_port,
         cover_domain,
+        fallback_cover_domains,
         shadow_pass,
         ss_password,
     })
+}
+
+fn build_rotated_cover_domain_history(
+    current_cover_domain: &str,
+    existing_fallback_cover_domains: &[String],
+    new_cover_domain: &str,
+) -> Vec<String> {
+    let mut fallback_cover_domains = Vec::new();
+
+    let push_unique = |domains: &mut Vec<String>, domain: &str| {
+        if domain != new_cover_domain && !domains.iter().any(|item| item == domain) {
+            domains.push(domain.to_string());
+        }
+    };
+
+    push_unique(&mut fallback_cover_domains, current_cover_domain);
+    for domain in existing_fallback_cover_domains {
+        push_unique(&mut fallback_cover_domains, domain);
+    }
+
+    fallback_cover_domains.truncate(MAX_FALLBACK_COVER_DOMAINS);
+    fallback_cover_domains
+}
+
+fn local_client_config_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    Ok(local_data.join("client_config.json"))
+}
+
+fn load_local_client_transport_state(
+    app: &AppHandle,
+) -> Result<Option<LocalClientTransportState>, String> {
+    let client_config_path = local_client_config_path(app)?;
+
+    if !client_config_path.exists() {
+        return Ok(None);
+    }
+
+    let config_json = std::fs::read_to_string(&client_config_path).map_err(|e| e.to_string())?;
+    let parsed = serde_json::from_str::<Value>(&config_json)
+        .map_err(|e| format!("Failed to parse local client config JSON: {}", e))?;
+    let outbounds = parsed
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Local client config is missing outbounds array".to_string())?;
+
+    let shadowtls_outbound = outbounds
+        .iter()
+        .find(|outbound| outbound.get("type").and_then(Value::as_str) == Some("shadowtls"))
+        .ok_or_else(|| "Local client config is missing shadowtls outbound".to_string())?;
+    let shadowsocks_outbound = outbounds
+        .iter()
+        .find(|outbound| {
+            outbound.get("type").and_then(Value::as_str) == Some("shadowsocks")
+                && outbound.get("tag").and_then(Value::as_str) == Some("proxy")
+        })
+        .ok_or_else(|| "Local client config is missing proxy shadowsocks outbound".to_string())?;
+
+    let cover_domain = shadowtls_outbound
+        .get("tls")
+        .and_then(|tls| tls.get("server_name"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Local client config is missing ShadowTLS server_name".to_string())?
+        .to_string();
+    let shadow_pass = shadowtls_outbound
+        .get("password")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Local client config is missing ShadowTLS password".to_string())?
+        .to_string();
+    let ss_password = shadowsocks_outbound
+        .get("password")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Local client config is missing Shadowsocks password".to_string())?
+        .to_string();
+
+    Ok(Some(LocalClientTransportState {
+        cover_domain,
+        shadow_pass,
+        ss_password,
+    }))
+}
+
+fn local_transport_requires_redeploy(
+    local_state: &LocalClientTransportState,
+    remote_bootstrap: &RemoteTransportBootstrap,
+) -> bool {
+    local_state.cover_domain != remote_bootstrap.cover_domain
+        || local_state.shadow_pass != remote_bootstrap.shadow_pass
+        || local_state.ss_password != remote_bootstrap.ss_password
+}
+
+fn load_transport_state_snapshot_sync(app: &AppHandle) -> Result<TransportStateSnapshot, String> {
+    let available_cover_domains = crate::generator::available_cover_domains();
+    let local_state = load_local_client_transport_state(app)?;
+
+    let Some(profile) = load_saved_server_profile(app.clone())? else {
+        return Ok(TransportStateSnapshot {
+            current_cover_domain: None,
+            available_cover_domains,
+            local_cover_domain: local_state.map(|state| state.cover_domain),
+            requires_redeploy: false,
+        });
+    };
+
+    let sess = connect_ssh_session(app, &profile.host, &profile.user, &profile.password)?;
+    let remote_bootstrap = load_remote_transport_bootstrap(&sess)?;
+
+    let Some(remote_bootstrap) = remote_bootstrap else {
+        return Ok(TransportStateSnapshot {
+            current_cover_domain: None,
+            available_cover_domains,
+            local_cover_domain: local_state.map(|state| state.cover_domain),
+            requires_redeploy: false,
+        });
+    };
+
+    let requires_redeploy = local_state
+        .as_ref()
+        .map(|state| local_transport_requires_redeploy(state, &remote_bootstrap))
+        .unwrap_or(false);
+
+    Ok(TransportStateSnapshot {
+        current_cover_domain: Some(remote_bootstrap.cover_domain),
+        available_cover_domains,
+        local_cover_domain: local_state.map(|state| state.cover_domain),
+        requires_redeploy,
+    })
+}
+
+pub(crate) async fn ensure_local_transport_is_current(app: &AppHandle) -> Result<(), String> {
+    let check_app = app.clone();
+    let snapshot_result = tauri::async_runtime::spawn_blocking(move || {
+        load_transport_state_snapshot_sync(&check_app)
+    })
+    .await
+    .unwrap();
+
+    let snapshot = match snapshot_result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[WARN] Unable to verify whether this device is in sync with the remote transport before starting the tunnel: {}",
+                    error
+                ),
+            );
+            return Ok(());
+        }
+    };
+
+    if !snapshot.requires_redeploy {
+        return Ok(());
+    }
+
+    let remote_cover_domain = snapshot
+        .current_cover_domain
+        .unwrap_or_else(|| "unknown".to_string());
+    let local_cover_domain = snapshot
+        .local_cover_domain
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let _ = app.emit(
+        "tunnel-log",
+        format!(
+            "[SYSTEM] Remote cover domain is {} but this device still has {}. Run Deploy/Update on this device before starting the tunnel.",
+            remote_cover_domain, local_cover_domain
+        ),
+    );
+
+    Err(
+        "Remote transport changed on another client. Run Deploy/Update on this device before starting the tunnel."
+            .to_string(),
+    )
 }
 
 fn load_remote_container_name(sess: &Session) -> Result<Option<String>, String> {
@@ -170,15 +368,15 @@ CONFIG_DIR="/opt/rkn"
 BOOTSTRAP_FILE="$CONFIG_DIR/bootstrap.json"
 ACTIVE_CONFIG="$CONFIG_DIR/config.json"
 
-if [ -f "$BOOTSTRAP_FILE" ]; then
-  echo "__BOOTSTRAP__"
-  cat "$BOOTSTRAP_FILE"
-  exit 0
-fi
-
 if [ -f "$ACTIVE_CONFIG" ]; then
   echo "__CONFIG__"
   cat "$ACTIVE_CONFIG"
+  exit 0
+fi
+
+if [ -f "$BOOTSTRAP_FILE" ]; then
+  echo "__BOOTSTRAP__"
+  cat "$BOOTSTRAP_FILE"
   exit 0
 fi
 
@@ -669,6 +867,11 @@ pub async fn deploy_server(
     .unwrap()?;
 
     if attach_result.is_some() {
+        crate::restart_tunnel_if_running(
+            &app,
+            "Tunnel config changed after attaching to the existing server. Restarting core to apply the updated client config.",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -695,15 +898,16 @@ pub async fn deploy_server(
         ),
     );
 
+    let deploy_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _ = app.emit(
+        let _ = deploy_app.emit(
             "tunnel-log",
             format!("--- [SSH] Connecting to {}:22 ---", host),
         );
 
-        let sess = connect_ssh_session(&app, &host, &user, &pass)?;
-        emit_ssh_stage(&app, "AUTH", "Authenticated successfully.");
-        emit_ssh_stage(&app, "PREFLIGHT", "Running remote pre-flight checks for deploy target...");
+        let sess = connect_ssh_session(&deploy_app, &host, &user, &pass)?;
+        emit_ssh_stage(&deploy_app, "AUTH", "Authenticated successfully.");
+        emit_ssh_stage(&deploy_app, "PREFLIGHT", "Running remote pre-flight checks for deploy target...");
 
         let deploy_target = select_remote_deploy_target(&sess, &short_id)?;
         let external_port = deploy_target.external_port;
@@ -721,9 +925,9 @@ pub async fn deploy_server(
                     container_name, external_port
                 )
             };
-            let _ = app.emit("tunnel-log", message);
+            let _ = deploy_app.emit("tunnel-log", message);
         } else if external_port == PRIMARY_EXTERNAL_PORT {
-            let _ = app.emit(
+            let _ = deploy_app.emit(
                 "tunnel-log",
                 format!(
                     "[SSH] Preferred external port {} is available on remote host.",
@@ -731,7 +935,7 @@ pub async fn deploy_server(
                 ),
             );
         } else {
-            let _ = app.emit(
+            let _ = deploy_app.emit(
                 "tunnel-log",
                 format!(
                     "[SSH WARN] Preferred external port {} is busy. Falling back to external port {}.",
@@ -740,7 +944,7 @@ pub async fn deploy_server(
             );
         }
 
-        let _ = app.emit(
+        let _ = deploy_app.emit(
             "tunnel-log",
             format!(
                 "[SSH] Selected pinned image {} and container name {}.",
@@ -750,7 +954,7 @@ pub async fn deploy_server(
 
         let deploy_script = include_str!("../scripts/deploy.sh");
         let cover_domain = crate::generator::select_cover_domain(&short_id);
-        let _ = app.emit(
+        let _ = deploy_app.emit(
             "tunnel-log",
             format!("[SSH] ShadowTLS cover domain: {}", cover_domain),
         );
@@ -761,13 +965,14 @@ pub async fn deploy_server(
         let bootstrap_cfg = json!({
             "external_port": external_port,
             "cover_domain": cover_domain,
+            "fallback_cover_domains": [],
             "shadow_pass": shadow_pass,
             "ss_password": ss_password
         })
         .to_string();
 
         emit_ssh_stage(
-            &app,
+            &deploy_app,
             "DEPLOY",
             format!("Deploying transport on external port {}...", external_port),
         );
@@ -790,16 +995,16 @@ BOOTSTRAPEOF
             PINNED_SING_BOX_IMAGE, container_name, server_cfg, bootstrap_cfg, deploy_script
         );
 
-        emit_ssh_stage(&app, "UPLOAD", "Uploading generated config and deploy script...");
+        emit_ssh_stage(&deploy_app, "UPLOAD", "Uploading generated config and deploy script...");
         let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
-        emit_ssh_stage(&app, "DEPLOY", "Executing remote fast-deploy script...");
+        emit_ssh_stage(&deploy_app, "DEPLOY", "Executing remote fast-deploy script...");
         channel.exec("bash -s 2>&1").map_err(|e| e.to_string())?;
 
         channel
             .write_all(injected_script.as_bytes())
             .map_err(|e| e.to_string())?;
         channel.send_eof().map_err(|e| e.to_string())?;
-        stream_remote_deploy_output(&app, &sess, &mut channel)?;
+        stream_remote_deploy_output(&deploy_app, &sess, &mut channel)?;
 
         channel
             .wait_close()
@@ -809,7 +1014,7 @@ BOOTSTRAPEOF
             .map_err(|e| format!("Failed to read remote deploy exit status: {}", e))?;
 
         if exit_status != 0 {
-            let _ = app.emit(
+            let _ = deploy_app.emit(
                 "tunnel-log",
                 format!("[SSH ERROR] Deployment failed with code: {}", exit_status),
             );
@@ -817,7 +1022,7 @@ BOOTSTRAPEOF
         }
 
         emit_ssh_stage(
-            &app,
+            &deploy_app,
             "VALIDATE",
             format!(
                 "Remote deploy finished. Validating container {} and ports...",
@@ -827,7 +1032,7 @@ BOOTSTRAPEOF
         validate_remote_runtime(&sess, &container_name, external_port)?;
 
         emit_ssh_stage(
-            &app,
+            &deploy_app,
             "VALIDATE",
             format!(
                 "Remote runtime looks healthy. Verifying external port {} from this client...",
@@ -837,7 +1042,7 @@ BOOTSTRAPEOF
         verify_external_port_reachable(&host, external_port)?;
 
         emit_ssh_stage(
-            &app,
+            &deploy_app,
             "VALIDATE",
             format!("External port {} is reachable from this client.", external_port),
         );
@@ -845,31 +1050,39 @@ BOOTSTRAPEOF
         std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
         let client_cfg_path = local_data.join("client_config.json");
         std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
-        save_server_profile(&app, &saved_profile)?;
-        crate::refresh_tray_toggle_item(&app);
+        save_server_profile(&deploy_app, &saved_profile)?;
+        crate::refresh_tray_toggle_item(&deploy_app);
 
-        let _ = app.emit(
+        let _ = deploy_app.emit(
             "tunnel-log",
             format!(
                 "[SYSTEM] Client config safely generated at: {:?}",
                 client_cfg_path
             ),
         );
-        let _ = app.emit(
+        let _ = deploy_app.emit(
             "tunnel-log",
             format!(
                 "[SSH] Deployment finished successfully! External port: {}",
                 external_port
             ),
         );
-        let _ = app.emit(
+        let _ = deploy_app.emit(
             "tunnel-log",
             "[SYSTEM] Server credentials saved locally for next launch.".to_string(),
         );
         Ok(())
     })
     .await
-    .unwrap()
+    .unwrap()?;
+
+    crate::restart_tunnel_if_running(
+        &app,
+        "Tunnel config changed after deploy. Restarting core to apply the updated client config.",
+    )
+    .await?;
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -885,6 +1098,15 @@ pub fn load_saved_server_profile(app: AppHandle) -> Result<Option<SavedServerPro
         .map_err(|e| format!("Failed to parse saved server profile: {}", e))?;
 
     Ok(Some(profile))
+}
+
+#[tauri::command]
+pub async fn get_transport_state_snapshot(
+    app: AppHandle,
+) -> Result<TransportStateSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || load_transport_state_snapshot_sync(&app))
+        .await
+        .unwrap()
 }
 
 #[tauri::command]
@@ -947,10 +1169,11 @@ fi
     .unwrap()
 }
 
-/// Rotate ShadowTLS cover domain: generates new credentials, re-deploys
-/// the server container with a fresh cover domain, and saves a new client config.
+/// Rotate only the active ShadowTLS cover domain while keeping transport
+/// credentials stable. Clients still need a refreshed config plus a tunnel
+/// restart to begin using the new SNI.
 #[tauri::command]
-pub async fn rotate_sni(app: AppHandle) -> Result<String, String> {
+pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result<String, String> {
     let profile = load_saved_server_profile(app.clone())?
         .ok_or_else(|| "Saved server profile not found. Deploy once first.".to_string())?;
 
@@ -959,56 +1182,108 @@ pub async fn rotate_sni(app: AppHandle) -> Result<String, String> {
         "[SYSTEM] Rotating ShadowTLS cover domain...".to_string(),
     );
 
-    let short_id = crate::generator::generate_short_id(&app)
-        .await
-        .map_err(|e| format!("Short ID generation error: {}", e))?;
-    let shadow_pass = crate::generator::generate_shadowtls_password(&app)
-        .await
-        .map_err(|e| format!("ShadowTLS password error: {}", e))?;
-    let ss_password = crate::generator::generate_ss_password(&app)
-        .await
-        .map_err(|e| format!("Shadowsocks password error: {}", e))?;
-
-    let cover_domain = crate::generator::select_cover_domain(&short_id);
-    let _ = app.emit(
-        "tunnel-log",
-        format!("[SYSTEM] New cover domain: {}", cover_domain),
-    );
-
     let local_data = app
         .path()
         .app_local_data_dir()
         .unwrap_or_else(|_| std::env::temp_dir());
 
-    let result_domain = cover_domain.to_string();
+    let rotate_app = app.clone();
+    let result_domain = tauri::async_runtime::spawn_blocking(move || {
+        let sess = connect_ssh_session(
+            &rotate_app,
+            &profile.host,
+            &profile.user,
+            &profile.password,
+        )?;
+        let remote_bootstrap = load_remote_transport_bootstrap(&sess)?.ok_or_else(|| {
+            "Remote transport bootstrap not found. Deploy the server first.".to_string()
+        })?;
+        let container_name = load_remote_container_name(&sess)?.ok_or_else(|| {
+            "Remote RKN container is not active. Deploy the server first.".to_string()
+        })?;
 
-    tauri::async_runtime::spawn_blocking(move || {
-        let sess = connect_ssh_session(&app, &profile.host, &profile.user, &profile.password)?;
+        let mut occupied_cover_domains = remote_bootstrap.fallback_cover_domains.clone();
+        occupied_cover_domains.push(remote_bootstrap.cover_domain.clone());
+        let cover_domain = if let Some(target_domain) = target_domain.as_deref() {
+            if !crate::generator::is_supported_cover_domain(target_domain) {
+                return Err(format!(
+                    "Unsupported cover domain selected for rotation: {}",
+                    target_domain
+                ));
+            }
 
-        let deploy_target = select_remote_deploy_target(&sess, &short_id)?;
-        let external_port = deploy_target.external_port;
-        let container_name = deploy_target.container_name;
+            if target_domain == remote_bootstrap.cover_domain {
+                let _ = rotate_app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SYSTEM] Selected cover domain {} is already active. Nothing to rotate.",
+                        target_domain
+                    ),
+                );
+                return Ok(target_domain.to_string());
+            }
+
+            target_domain
+        } else {
+            crate::generator::select_next_cover_domain(
+                &remote_bootstrap.cover_domain,
+                &occupied_cover_domains,
+            )
+        };
+        let fallback_cover_domains = build_rotated_cover_domain_history(
+            &remote_bootstrap.cover_domain,
+            &remote_bootstrap.fallback_cover_domains,
+            cover_domain,
+        );
+
+        let _ = rotate_app.emit(
+            "tunnel-log",
+            "[SYSTEM] Preserving existing transport passwords for multi-device compatibility."
+                .to_string(),
+        );
+        let _ = rotate_app.emit(
+            "tunnel-log",
+            format!(
+                "[SYSTEM] Current cover domain: {}",
+                remote_bootstrap.cover_domain
+            ),
+        );
+        let _ = rotate_app.emit(
+            "tunnel-log",
+            format!("[SYSTEM] New cover domain: {}", cover_domain),
+        );
+        if !fallback_cover_domains.is_empty() {
+            let _ = rotate_app.emit(
+                "tunnel-log",
+                format!(
+                    "[SYSTEM] Previous cover domains kept on the server for staged rollover: {}",
+                    fallback_cover_domains.join(", ")
+                ),
+            );
+        }
 
         let deploy_script = include_str!("../scripts/deploy.sh");
-        let server_cfg = crate::generator::build_server_config(
+        let server_cfg = crate::generator::build_server_config_with_fallbacks(
             &profile.host,
-            &shadow_pass,
-            &ss_password,
-            external_port,
+            &remote_bootstrap.shadow_pass,
+            &remote_bootstrap.ss_password,
+            remote_bootstrap.external_port,
             cover_domain,
+            &fallback_cover_domains,
         );
         let client_cfg = crate::generator::build_client_config(
             &profile.host,
-            &shadow_pass,
-            &ss_password,
-            external_port,
+            &remote_bootstrap.shadow_pass,
+            &remote_bootstrap.ss_password,
+            remote_bootstrap.external_port,
             cover_domain,
         );
         let bootstrap_cfg = json!({
-            "external_port": external_port,
+            "external_port": remote_bootstrap.external_port,
             "cover_domain": cover_domain,
-            "shadow_pass": shadow_pass,
-            "ss_password": ss_password
+            "fallback_cover_domains": fallback_cover_domains,
+            "shadow_pass": remote_bootstrap.shadow_pass,
+            "ss_password": remote_bootstrap.ss_password
         })
         .to_string();
 
@@ -1030,14 +1305,18 @@ BOOTSTRAPEOF
             PINNED_SING_BOX_IMAGE, container_name, server_cfg, bootstrap_cfg, deploy_script
         );
 
-        emit_ssh_stage(&app, "ROTATE", "Deploying new cover domain to server...");
+        emit_ssh_stage(
+            &rotate_app,
+            "ROTATE",
+            "Deploying new cover domain to server...",
+        );
         let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
         channel.exec("bash -s 2>&1").map_err(|e| e.to_string())?;
         channel
             .write_all(injected_script.as_bytes())
             .map_err(|e| e.to_string())?;
         channel.send_eof().map_err(|e| e.to_string())?;
-        stream_remote_deploy_output(&app, &sess, &mut channel)?;
+        stream_remote_deploy_output(&rotate_app, &sess, &mut channel)?;
 
         channel.wait_close().map_err(|e| e.to_string())?;
         let exit_status = channel.exit_status().map_err(|e| e.to_string())?;
@@ -1049,22 +1328,30 @@ BOOTSTRAPEOF
             ));
         }
 
-        validate_remote_runtime(&sess, &container_name, external_port)?;
+        validate_remote_runtime(&sess, &container_name, remote_bootstrap.external_port)?;
 
         std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
         let client_cfg_path = local_data.join("client_config.json");
         std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
 
-        let _ = app.emit(
+        let _ = rotate_app.emit(
             "tunnel-log",
             format!(
-                "[SYSTEM] SNI rotated to {}. Restart tunnel to apply.",
+                "[SYSTEM] SNI rotated to {}. This device will restart its tunnel automatically; other devices need Deploy/Attach once to refresh their local config.",
                 cover_domain
             ),
         );
 
-        Ok(result_domain)
+        Ok(cover_domain.to_string())
     })
     .await
-    .unwrap()
+    .unwrap()?;
+
+    crate::restart_tunnel_if_running(
+        &app,
+        "Tunnel config changed after SNI rotation. Restarting core to apply the updated client config.",
+    )
+    .await?;
+
+    Ok(result_domain)
 }

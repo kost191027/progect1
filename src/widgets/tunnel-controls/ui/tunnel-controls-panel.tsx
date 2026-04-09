@@ -4,6 +4,7 @@ import { Panel } from "../../../shared/ui/panel";
 type TunnelControlsPanelProps = {
   isRunning: boolean;
   isDeploying: boolean;
+  isStartBlockedByRedeploy: boolean;
   onStart: () => void;
   onStop: () => void;
 };
@@ -11,6 +12,7 @@ type TunnelControlsPanelProps = {
 export function TunnelControlsPanel({
   isRunning,
   isDeploying,
+  isStartBlockedByRedeploy,
   onStart,
   onStop,
 }: TunnelControlsPanelProps) {
@@ -25,10 +27,10 @@ export function TunnelControlsPanel({
           variant="primary"
           fullWidth
           className="py-4"
-          disabled={isRunning || isDeploying}
+          disabled={isRunning || isDeploying || isStartBlockedByRedeploy}
           onClick={onStart}
         >
-          Start Tunnel
+          {isStartBlockedByRedeploy ? "Deploy Required" : "Start Tunnel"}
         </Button>
 
         <Button

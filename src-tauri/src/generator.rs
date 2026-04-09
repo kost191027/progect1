@@ -1,4 +1,4 @@
-use serde_json::json;
+use serde_json::{json, Value};
 use tauri::AppHandle;
 use tauri_plugin_shell::ShellExt;
 
@@ -8,22 +8,95 @@ pub const INTERNAL_SS_PORT: u16 = 14433;
 
 /// ShadowTLS cover domains.
 ///
-/// We keep rotation, but only across a short allowlist of domains that are
-/// explicitly compatible with common ShadowTLS v3 practice. `www.amazon.com`
-/// and `www.microsoft.com` were removed after real-world pinning failures in
-/// production logs.
-const COVER_DOMAINS: &[&str] = &[
-    "captive.apple.com",
-    "publicassets.cdn-apple.com",
+/// Stable domains used for first deploys.
+///
+/// We avoid staying Apple-only here because some routes can start failing on
+/// `captive.apple.com` / `publicassets.cdn-apple.com` even when the generated
+/// client and server configs still match. The primary pool therefore mixes the
+/// upstream ShadowTLS TLS1.3-compatible domains with a smaller Apple subset.
+const PRIMARY_COVER_DOMAINS: &[&str] = &[
+    "feishu.cn",
+    "coding.net",
+    "cloud.tencent.com",
     "weather-data.apple.com",
+    "publicassets.cdn-apple.com",
 ];
+
+/// Additional ShadowTLS-friendly domains used only for SNI rotation.
+///
+/// `feishu.cn`, `coding.net`, `upyun.com`, `douyin.com`, `toutiao.com`,
+/// `publicassets.cdn-apple.com` and `weather-data.apple.com` come from the
+/// upstream ShadowTLS TLS 1.3 compatibility list. `cloud.tencent.com` and
+/// `captive.apple.com` are kept because they are used in the upstream
+/// ShadowTLS examples and have worked for us on some paths.
+const ROTATION_COVER_DOMAINS: &[&str] = &[
+    "feishu.cn",
+    "coding.net",
+    "cloud.tencent.com",
+    "weather-data.apple.com",
+    "publicassets.cdn-apple.com",
+    "upyun.com",
+    "douyin.com",
+    "toutiao.com",
+    "mp.weixin.qq.com",
+    "captive.apple.com",
+];
+
+pub fn available_cover_domains() -> Vec<String> {
+    let mut domains = Vec::new();
+
+    for domain in PRIMARY_COVER_DOMAINS
+        .iter()
+        .chain(ROTATION_COVER_DOMAINS.iter())
+        .copied()
+    {
+        if !domains.iter().any(|item| item == domain) {
+            domains.push(domain.to_string());
+        }
+    }
+
+    domains
+}
+
+pub fn is_supported_cover_domain(domain: &str) -> bool {
+    PRIMARY_COVER_DOMAINS.contains(&domain) || ROTATION_COVER_DOMAINS.contains(&domain)
+}
 
 pub fn select_cover_domain(short_id: &str) -> &'static str {
     let seed = short_id
         .get(0..2)
         .and_then(|h| u8::from_str_radix(h, 16).ok())
         .unwrap_or(0) as usize;
-    COVER_DOMAINS[seed % COVER_DOMAINS.len()]
+    PRIMARY_COVER_DOMAINS[seed % PRIMARY_COVER_DOMAINS.len()]
+}
+
+pub fn select_next_cover_domain(
+    current_cover_domain: &str,
+    occupied_cover_domains: &[String],
+) -> &'static str {
+    if let Some(candidate) = ROTATION_COVER_DOMAINS.iter().copied().find(|candidate| {
+        *candidate != current_cover_domain
+            && !occupied_cover_domains
+                .iter()
+                .any(|domain| domain == candidate)
+    }) {
+        return candidate;
+    }
+
+    let current_index = ROTATION_COVER_DOMAINS
+        .iter()
+        .position(|candidate| *candidate == current_cover_domain)
+        .unwrap_or(0);
+
+    for offset in 1..=ROTATION_COVER_DOMAINS.len() {
+        let candidate =
+            ROTATION_COVER_DOMAINS[(current_index + offset) % ROTATION_COVER_DOMAINS.len()];
+        if candidate != current_cover_domain {
+            return candidate;
+        }
+    }
+
+    ROTATION_COVER_DOMAINS[0]
 }
 
 async fn run_singbox_generate(app: &AppHandle, args: &[&str]) -> Result<String, String> {
@@ -95,9 +168,71 @@ pub fn build_server_config(
     external_port: u16,
     cover_domain: &str,
 ) -> String {
+    build_server_config_with_fallbacks(
+        _server_ip,
+        shadow_pass,
+        ss_password,
+        external_port,
+        cover_domain,
+        &[],
+    )
+}
+
+pub fn build_server_config_with_fallbacks(
+    _server_ip: &str,
+    shadow_pass: &str,
+    ss_password: &str,
+    external_port: u16,
+    cover_domain: &str,
+    fallback_cover_domains: &[String],
+) -> String {
     // Always bind to 0.0.0.0 — on NAT VPS the public IP is not assigned
     // to any local interface, so bind(public_ip) fails with EADDRNOTAVAIL.
     let listen_host = "0.0.0.0";
+
+    let mut shadowtls_inbound = json!({
+      "type": "shadowtls",
+      "tag": "in-stls",
+      "listen": listen_host,
+      "listen_port": external_port,
+      "version": 3,
+      "users": [
+        {
+          "name": "default",
+          "password": shadow_pass
+        }
+      ],
+      "handshake": {
+        "server": cover_domain,
+        "server_port": 443
+      },
+      "detour": "ss-in"
+    });
+
+    let mut handshake_for_server_name = serde_json::Map::new();
+    for domain in fallback_cover_domains {
+        if domain == cover_domain {
+            continue;
+        }
+
+        handshake_for_server_name.insert(
+            domain.clone(),
+            json!({
+                "server": domain,
+                "server_port": 443
+            }),
+        );
+    }
+
+    if !handshake_for_server_name.is_empty() {
+        shadowtls_inbound
+            .as_object_mut()
+            .expect("shadowtls inbound must be an object")
+            .insert(
+                "handshake_for_server_name".to_string(),
+                Value::Object(handshake_for_server_name),
+            );
+    }
 
     let config = json!({
       "log": {
@@ -106,24 +241,7 @@ pub fn build_server_config(
         "timestamp": true
       },
       "inbounds": [
-        {
-          "type": "shadowtls",
-          "tag": "in-stls",
-          "listen": listen_host,
-          "listen_port": external_port,
-          "version": 3,
-          "users": [
-            {
-              "name": "default",
-              "password": shadow_pass
-            }
-          ],
-          "handshake": {
-            "server": cover_domain,
-            "server_port": 443
-          },
-          "detour": "ss-in"
-        },
+        shadowtls_inbound,
         {
           "type": "shadowsocks",
           "tag": "ss-in",

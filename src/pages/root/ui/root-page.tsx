@@ -6,6 +6,7 @@ import { HomePage } from "../../home/ui/home-page";
 import { InfoScreen } from "../../info/ui/info-screen";
 import { PowerScreen } from "../../power/ui/power-screen";
 import { BottomNavigation, type ScreenId } from "../../../widgets/bottom-navigation/ui/bottom-navigation";
+import { BlockingModal } from "../../../shared/ui/blocking-modal";
 
 export function RootPage() {
   const controlCenter = useControlCenter();
@@ -46,7 +47,8 @@ export function RootPage() {
               isBusy={
                 controlCenter.isDeploying ||
                 controlCenter.isStarting ||
-                controlCenter.isStopping
+                controlCenter.isStopping ||
+                controlCenter.requiresRedeploy
               }
               guardState={controlCenter.guardState}
               statusSummary={controlCenter.statusSummary}
@@ -60,6 +62,20 @@ export function RootPage() {
 
         <BottomNavigation activeScreen={activeScreen} onChange={setActiveScreen} />
       </div>
+
+      {controlCenter.requiresRedeploy ? (
+        <BlockingModal
+          title="Configuration changed on another app"
+          description={
+            controlCenter.currentCoverDomain
+              ? `The active cover domain is now ${controlCenter.currentCoverDomain}. Refresh this app before the tunnel can start again.`
+              : "Another app rotated the active transport configuration. Refresh this app before the tunnel can start again."
+          }
+          actionLabel="Refresh Configuration"
+          isBusy={controlCenter.isDeploying}
+          onAction={controlCenter.refreshConfiguration}
+        />
+      ) : null}
     </main>
   );
 }

@@ -29,9 +29,19 @@ export type SavedServerProfile = {
   password: string;
 };
 
+export type AppRole = "master" | "subordinate";
+
+export type TransportStateSnapshot = {
+  current_cover_domain: string | null;
+  available_cover_domains: string[];
+  local_cover_domain: string | null;
+  requires_redeploy: boolean;
+};
+
 const MAX_LOG_BUFFER = 800;
 const HAS_COMPLETED_FIRST_START_KEY = "rkn.has-completed-first-start";
 const LAST_DEPLOYED_AT_KEY = "rkn.last-deployed-at";
+const APP_ROLE_KEY = "rkn.app-role";
 
 function profilesMatch(
   left: SavedServerProfile | null,
@@ -70,6 +80,7 @@ export function useControlCenter() {
   const [isDeploying, setIsDeploying] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
   const [isRotatingSni, setIsRotatingSni] = useState(false);
+  const [isResettingLocalData, setIsResettingLocalData] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [guardState, setGuardState] = useState<GuardState>("inactive");
@@ -77,6 +88,9 @@ export function useControlCenter() {
   const [user, setUser] = useState("root");
   const [password, setPassword] = useState("");
   const [savedProfile, setSavedProfile] = useState<SavedServerProfile | null>(null);
+  const [currentCoverDomain, setCurrentCoverDomain] = useState<string | null>(null);
+  const [availableCoverDomains, setAvailableCoverDomains] = useState<string[]>([]);
+  const [requiresRedeploy, setRequiresRedeploy] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [trimmedLogCount, setTrimmedLogCount] = useState(0);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -86,6 +100,11 @@ export function useControlCenter() {
   });
   const [lastDeployedAt, setLastDeployedAt] = useState<string | null>(() => {
     return window.localStorage.getItem(LAST_DEPLOYED_AT_KEY);
+  });
+  const [appRole, setAppRole] = useState<AppRole>(() => {
+    return window.localStorage.getItem(APP_ROLE_KEY) === "subordinate"
+      ? "subordinate"
+      : "master";
   });
 
   function appendLog(message: string) {
@@ -114,6 +133,28 @@ export function useControlCenter() {
     }
   }
 
+  async function refreshTransportState(silent = false) {
+    try {
+      const snapshot =
+        await invoke<TransportStateSnapshot>("get_transport_state_snapshot");
+
+      setCurrentCoverDomain(snapshot.current_cover_domain);
+      setAvailableCoverDomains(snapshot.available_cover_domains);
+      if (snapshot.requires_redeploy && !requiresRedeploy) {
+        const remoteDomain = snapshot.current_cover_domain ?? "unknown";
+        const message = `Remote cover domain changed to ${remoteDomain} on another client. Run Deploy/Update on this device before starting the tunnel.`;
+        appendLog(`[SYSTEM] ${message}`);
+        setLastUserMessage(message);
+      }
+
+      setRequiresRedeploy(snapshot.requires_redeploy);
+    } catch (error) {
+      if (!silent) {
+        appendLog(`[WARN] Failed to load remote transport state: ${error}`);
+      }
+    }
+  }
+
   useEffect(() => {
     const unlisten = listen<string>("tunnel-log", (event) => {
       appendLog(event.payload);
@@ -138,6 +179,8 @@ export function useControlCenter() {
         setUser(profile.user);
         setPassword(profile.password);
         setSavedProfile(profile);
+        setAppRole("master");
+        window.localStorage.setItem(APP_ROLE_KEY, "master");
         appendLog("[SYSTEM] Saved server profile loaded.");
       } catch (error) {
         if (!isMounted) {
@@ -154,6 +197,17 @@ export function useControlCenter() {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!savedProfile) {
+      setCurrentCoverDomain(null);
+      setAvailableCoverDomains([]);
+      setRequiresRedeploy(false);
+      return;
+    }
+
+    void refreshTransportState(true);
+  }, [savedProfile]);
 
   useEffect(() => {
     let isMounted = true;
@@ -229,6 +283,14 @@ export function useControlCenter() {
   }, []);
 
   async function startTunnel() {
+    if (requiresRedeploy) {
+      const message =
+        "Remote transport changed on another client. Run Deploy/Update on this device before starting the tunnel.";
+      setLastUserMessage(message);
+      appendLog(`[SYSTEM] ${message}`);
+      return;
+    }
+
     setIsStarting(true);
     setLastError(null);
     setLastUserMessage("Starting the local tunnel and requesting system permissions if needed.");
@@ -261,22 +323,66 @@ export function useControlCenter() {
       return;
     }
 
+    await deployWithProfile(
+      { host, user, password },
+      {
+        logHeader: "--- INITIATING REMOTE SERVER DEPLOYMENT ---",
+        userMessage: "Connecting to the server and applying the current transport configuration.",
+      },
+    );
+  }
+
+  async function deployWithProfile(
+    profile: SavedServerProfile,
+    options: {
+      logHeader: string;
+      userMessage: string;
+    },
+  ) {
     setIsDeploying(true);
     setLastError(null);
-    setLastUserMessage("Connecting to the server and applying the current transport configuration.");
-    appendLog("--- INITIATING REMOTE SERVER DEPLOYMENT ---");
+    setLastUserMessage(options.userMessage);
+    appendLog(options.logHeader);
 
     try {
-      await invoke("deploy_server", { host, user, pass: password });
-      setSavedProfile({ host, user, password });
+      await invoke("deploy_server", {
+        host: profile.host,
+        user: profile.user,
+        pass: profile.password,
+      });
+      setHost(profile.host);
+      setUser(profile.user);
+      setPassword(profile.password);
+      setSavedProfile(profile);
+      setAppRole("master");
+      window.localStorage.setItem(APP_ROLE_KEY, "master");
+      setRequiresRedeploy(false);
       const deployedAt = new Date().toISOString();
       setLastDeployedAt(deployedAt);
       window.localStorage.setItem(LAST_DEPLOYED_AT_KEY, deployedAt);
+      await refreshTransportState(true);
     } catch (error) {
       appendLog(`[MAIN ERROR] Deploy failed: ${error}`);
     } finally {
       setIsDeploying(false);
     }
+  }
+
+  async function refreshConfiguration() {
+    const profile = savedProfile ?? currentProfile;
+
+    if (!profile) {
+      appendLog(
+        "[MAIN ERROR] No saved server profile is available on this Mac. Re-enter the server details before refreshing the configuration.",
+      );
+      return;
+    }
+
+    await deployWithProfile(profile, {
+      logHeader: "--- REFRESHING LOCAL CONFIGURATION FROM SAVED SERVER PROFILE ---",
+      userMessage:
+        "Refreshing this app from the saved server profile so the local tunnel config matches the active remote transport.",
+    });
   }
 
   async function checkServerStatus() {
@@ -293,16 +399,24 @@ export function useControlCenter() {
     }
   }
 
-  async function rotateSni() {
+  async function rotateSni(targetDomain: string) {
+    if (!targetDomain || targetDomain === currentCoverDomain) {
+      return;
+    }
+
     setIsRotatingSni(true);
-    setLastUserMessage("Rotating the ShadowTLS cover domain and deploying fresh transport credentials.");
-    appendLog("--- ROTATING SHADOWTLS COVER DOMAIN ---");
+    setLastUserMessage(
+      `Rotating the ShadowTLS cover domain to ${targetDomain} and updating the local client config.`,
+    );
+    appendLog(`--- ROTATING SHADOWTLS COVER DOMAIN TO: ${targetDomain} ---`);
 
     try {
-      const domain = await invoke<string>("rotate_sni");
+      const domain = await invoke<string>("rotate_sni", { targetDomain });
       setLastError(null);
       setLastUserMessage(`New cover domain is active: ${domain}.`);
       appendLog(`--- SNI ROTATED TO: ${domain} ---`);
+      setRequiresRedeploy(false);
+      await refreshTransportState(true);
     } catch (error) {
       appendLog(`[MAIN ERROR] SNI rotation failed: ${error}`);
     } finally {
@@ -316,6 +430,45 @@ export function useControlCenter() {
       appendLog("[SYSTEM] Log stream copied to clipboard.");
     } catch (error) {
       appendLog(`[WARN] Failed to copy logs: ${error}`);
+    }
+  }
+
+  async function resetLocalData() {
+    const confirmed = window.confirm(
+      "Remove the saved server profile and the local client config from this Mac? The tunnel will be stopped first if it is running.",
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setIsResettingLocalData(true);
+    setLastError(null);
+    setLastUserMessage("Removing the saved local server profile and client config from this Mac.");
+
+    try {
+      await invoke("reset_local_data");
+      setHost("");
+      setUser("root");
+      setPassword("");
+      setSavedProfile(null);
+      setCurrentCoverDomain(null);
+      setAvailableCoverDomains([]);
+      setRequiresRedeploy(false);
+      setLastDeployedAt(null);
+      setHasCompletedFirstStart(false);
+      setAppRole("master");
+      window.localStorage.removeItem(APP_ROLE_KEY);
+      window.localStorage.removeItem(LAST_DEPLOYED_AT_KEY);
+      window.localStorage.removeItem(HAS_COMPLETED_FIRST_START_KEY);
+      appendLog("[SYSTEM] Local data reset completed.");
+      setLastUserMessage(
+        "Local server profile and client config were removed from this Mac. Enter server details again to deploy a fresh config.",
+      );
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Local data reset failed: ${error}`);
+    } finally {
+      setIsResettingLocalData(false);
     }
   }
 
@@ -353,6 +506,15 @@ export function useControlCenter() {
       };
     }
 
+    if (requiresRedeploy) {
+      return {
+        state: "error",
+        title: "Deploy required",
+        description:
+          "Another client changed the active cover domain. Run Deploy on this device before starting the tunnel again.",
+      };
+    }
+
     if (lastError && !isRunning) {
       return {
         state: "error",
@@ -366,7 +528,7 @@ export function useControlCenter() {
       title: "Tunnel inactive",
       description: lastUserMessage,
     };
-  }, [guardState, isDeploying, isRunning, isStarting, lastError, lastUserMessage]);
+  }, [guardState, isDeploying, isRunning, isStarting, lastError, lastUserMessage, requiresRedeploy]);
 
   const currentProfile = useMemo<SavedServerProfile | null>(() => {
     if (!host || !user || !password) {
@@ -399,6 +561,15 @@ export function useControlCenter() {
   }, [lastDeployedAt]);
 
   const serverStatusSummary = useMemo<ServerStatusSummary>(() => {
+    if (appRole === "subordinate") {
+      return {
+        title: "Managed by master app",
+        description:
+          "This installation is meant to receive and refresh its client config from a master app. Server deploy and SNI rotation stay disabled here.",
+        tone: requiresRedeploy ? "attention" : "ready",
+      };
+    }
+
     if (!host || !user || !password) {
       return {
         title: "Not configured",
@@ -423,12 +594,21 @@ export function useControlCenter() {
       };
     }
 
+    if (requiresRedeploy) {
+      return {
+        title: "Needs deploy",
+        description:
+          "Another client changed the active cover domain. Run Deploy on this Mac to refresh the local client config before starting the tunnel.",
+        tone: "attention",
+      };
+    }
+
     return {
       title: "Configured",
       description: "The current server profile matches the last successful deploy and is ready to use.",
       tone: "ready",
     };
-  }, [currentProfile, host, password, savedProfile, user]);
+  }, [appRole, currentProfile, host, password, requiresRedeploy, savedProfile, user]);
 
   const powerQuickStatus = useMemo(() => {
     if (isDeploying) {
@@ -436,6 +616,10 @@ export function useControlCenter() {
     }
 
     if (!savedProfile || !profilesMatch(savedProfile, currentProfile)) {
+      return "Needs deploy";
+    }
+
+    if (requiresRedeploy) {
       return "Needs deploy";
     }
 
@@ -452,13 +636,17 @@ export function useControlCenter() {
     }
 
     return "Ready to start";
-  }, [currentProfile, guardState, isDeploying, isRunning, isStarting, savedProfile]);
+  }, [currentProfile, guardState, isDeploying, isRunning, isStarting, requiresRedeploy, savedProfile]);
 
   return {
+    appRole,
     host,
     user,
     password,
     savedProfile,
+    currentCoverDomain,
+    availableCoverDomains,
+    requiresRedeploy,
     formattedLastDeployedAt,
     serverStatusSummary,
     powerQuickStatus,
@@ -472,6 +660,7 @@ export function useControlCenter() {
     isDeploying,
     isCheckingStatus,
     isRotatingSni,
+    isResettingLocalData,
     isStarting,
     isStopping,
     setHost,
@@ -482,6 +671,8 @@ export function useControlCenter() {
     deployServer,
     checkServerStatus,
     rotateSni,
+    refreshConfiguration,
+    resetLocalData,
     copyLogs,
   };
 }

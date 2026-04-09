@@ -297,34 +297,52 @@ fn classify_proxy_failure(line: &str) -> bool {
             || lower.contains("connection reset"))
 }
 
+fn current_singbox_target_triple() -> Result<&'static str, String> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
+        (os, arch) => Err(format!(
+            "Unsupported platform for sing-box sidecar resolution: {} / {}",
+            os, arch
+        )),
+    }
+}
+
 /// Находит абсолютный путь до sidecar-бинарника `sing-box`
 fn resolve_singbox_path() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-
     let dir = exe.parent().ok_or("Cannot resolve binary directory")?;
+    let target_triple = current_singbox_target_triple()?;
 
-    let arch_suffix = if cfg!(target_arch = "x86_64") {
-        "x86_64-apple-darwin"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64-apple-darwin"
-    } else {
-        return Err("Unsupported architecture".to_string());
-    };
+    let mut candidates = vec![
+        format!("sing-box-{}", target_triple),
+        "sing-box".to_string(),
+    ];
 
-    // Tauri v2 dev build: sing-box-<arch> (from bins/)
-    let sidecar_with_arch = dir.join(format!("sing-box-{}", arch_suffix));
-    if sidecar_with_arch.exists() {
-        return Ok(sidecar_with_arch.to_string_lossy().to_string());
+    if cfg!(target_os = "windows") {
+        candidates = vec![
+            format!("sing-box-{}.exe", target_triple),
+            "sing-box.exe".to_string(),
+            format!("sing-box-{}", target_triple),
+            "sing-box".to_string(),
+        ];
     }
 
-    // Tauri v2 bundle / debug copy: sing-box (arch suffix stripped by Tauri)
-    let sidecar_plain = dir.join("sing-box");
-    if sidecar_plain.exists() {
-        return Ok(sidecar_plain.to_string_lossy().to_string());
+    for candidate in candidates {
+        let sidecar_path = dir.join(&candidate);
+        if sidecar_path.exists() {
+            return Ok(sidecar_path.to_string_lossy().to_string());
+        }
     }
 
     // Fallback: system PATH
-    Ok("sing-box".to_string())
+    if cfg!(target_os = "windows") {
+        Ok("sing-box.exe".to_string())
+    } else {
+        Ok("sing-box".to_string())
+    }
 }
 
 async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result<u32, String> {
@@ -563,6 +581,8 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         }
     }
 
+    ssh::ensure_local_transport_is_current(&app).await?;
+
     let _ = app.emit("tunnel-log", "[SYSTEM] Resolving core binary path...");
     let pid = launch_tunnel_process(&app, true).await?;
 
@@ -637,6 +657,69 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+#[tauri::command]
+async fn reset_local_data(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let is_running = state.singbox_pid.lock().unwrap().is_some();
+
+    if is_running {
+        stop_tunnel_inner(app.clone()).await?;
+    }
+
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let files_to_remove = [
+        local_data.join("client_config.json"),
+        local_data.join("server_profile.json"),
+        local_data.join("active_tunnel_pid"),
+    ];
+
+    for path in files_to_remove {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to remove local file {}: {}",
+                    path.display(),
+                    error
+                ));
+            }
+        }
+    }
+
+    let _ = fs::remove_file("/tmp/rkn-tun.log");
+    set_network_fingerprint(&state, None);
+    finish_recovery(&state);
+    reset_guard_state(&state);
+    emit_tunnel_state(&app, false);
+    emit_guard_state(&app, "inactive");
+    refresh_tray_toggle_item(&app);
+    let _ = app.emit(
+        "tunnel-log",
+        "[SYSTEM] Local server profile and client config were removed from this Mac.".to_string(),
+    );
+
+    Ok(())
+}
+
+pub(crate) async fn restart_tunnel_if_running(
+    app: &AppHandle,
+    reason: &str,
+) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+    let is_running = state.singbox_pid.lock().unwrap().is_some();
+    if !is_running {
+        return Ok(false);
+    }
+
+    let _ = app.emit("tunnel-log", format!("[SYSTEM] {}", reason));
+    stop_tunnel_inner(app.clone()).await?;
+    sleep(Duration::from_millis(500)).await;
+    start_tunnel_inner(app.clone()).await?;
+
+    Ok(true)
 }
 
 #[tauri::command]
@@ -794,8 +877,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_tunnel,
             stop_tunnel,
+            reset_local_data,
             restore_tunnel_session,
             ssh::deploy_server,
+            ssh::get_transport_state_snapshot,
             ssh::load_saved_server_profile,
             ssh::check_server_status,
             ssh::rotate_sni
