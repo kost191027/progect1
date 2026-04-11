@@ -38,6 +38,18 @@ export type TransportStateSnapshot = {
   requires_redeploy: boolean;
 };
 
+export type IssuedInviteLink = {
+  id: string;
+  link: string;
+  host: string;
+  cover_domain: string;
+  generated_at: number;
+};
+
+type GeneratedInviteLinkResult = {
+  link: string;
+};
+
 type LocalInstallationState = {
   has_saved_server_profile: boolean;
   has_client_config: boolean;
@@ -111,6 +123,7 @@ export function useControlCenter() {
   const [isResettingLocalData, setIsResettingLocalData] = useState(false);
   const [isGeneratingInvite, setIsGeneratingInvite] = useState(false);
   const [isImportingInvite, setIsImportingInvite] = useState(false);
+  const [deletingInviteId, setDeletingInviteId] = useState<string | null>(null);
   const [isStarting, setIsStarting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [guardState, setGuardState] = useState<GuardState>("inactive");
@@ -131,7 +144,9 @@ export function useControlCenter() {
   const [inviteLinkError, setInviteLinkError] = useState<string | null>(null);
   const [inviteCopySuccessMessage, setInviteCopySuccessMessage] = useState<string | null>(null);
   const [inviteImportSuccessMessage, setInviteImportSuccessMessage] = useState<string | null>(null);
+  const [inviteManagementMessage, setInviteManagementMessage] = useState<string | null>(null);
   const [generatedInviteLink, setGeneratedInviteLink] = useState<string | null>(null);
+  const [issuedInviteLinks, setIssuedInviteLinks] = useState<IssuedInviteLink[]>([]);
   const [localDataResetMessage, setLocalDataResetMessage] = useState<string | null>(null);
   const [lastAutoImportedInvite, setLastAutoImportedInvite] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
@@ -268,6 +283,38 @@ export function useControlCenter() {
   useEffect(() => {
     let isMounted = true;
 
+    async function loadIssuedInvites() {
+      if (appRole !== "master") {
+        setIssuedInviteLinks([]);
+        return;
+      }
+
+      try {
+        const invites = await invoke<IssuedInviteLink[]>("list_issued_invite_links");
+        if (!isMounted) {
+          return;
+        }
+
+        setIssuedInviteLinks(invites);
+      } catch (error) {
+        if (!isMounted) {
+          return;
+        }
+
+        appendLog(`[WARN] Failed to load issued invite links: ${error}`);
+      }
+    }
+
+    void loadIssuedInvites();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [appRole, savedProfile?.host]);
+
+  useEffect(() => {
+    let isMounted = true;
+
     async function restoreTunnelSession() {
       try {
         const pid = await invoke<number | null>("restore_tunnel_session");
@@ -305,7 +352,7 @@ export function useControlCenter() {
     ) {
       setRequiresInviteRefresh(true);
       setLastUserMessage(
-        "This subordinate app is no longer in sync with the master app. Paste a fresh invite link before starting the tunnel again.",
+        "This subordinate app is no longer accepted by the master app. The invite link may have been removed or the transport configuration may have changed.",
       );
     }
   }, [appRole, logs, requiresInviteRefresh]);
@@ -386,7 +433,7 @@ export function useControlCenter() {
 
     if (appRole === "subordinate" && requiresInviteRefresh) {
       const message =
-        "The master app changed the transport configuration. Paste a fresh invite link on this device before starting the tunnel.";
+        "This invite link is no longer accepted by the master app. Ask the administrator for a fresh invite link, or unlink this app and configure it as a master app again.";
       setLastUserMessage(message);
       appendLog(`[SYSTEM] ${message}`);
       return;
@@ -495,12 +542,16 @@ export function useControlCenter() {
     setIsGeneratingInvite(true);
     setLastError(null);
     setInviteCopySuccessMessage(null);
+    setInviteManagementMessage(null);
     setGeneratedInviteLink(null);
     setLastUserMessage("Preparing a shareable invite link from the active remote transport.");
 
     try {
-      const inviteLink = await invoke<string>("generate_invite_link");
+      const result = await invoke<GeneratedInviteLinkResult>("generate_invite_link");
+      const inviteLink = result.link;
       setGeneratedInviteLink(inviteLink);
+      const invites = await invoke<IssuedInviteLink[]>("list_issued_invite_links");
+      setIssuedInviteLinks(invites);
 
       try {
         await copyTextToClipboard(inviteLink);
@@ -526,6 +577,22 @@ export function useControlCenter() {
       appendLog(`[MAIN ERROR] Invite link generation failed: ${error}`);
     } finally {
       setIsGeneratingInvite(false);
+    }
+  }
+
+  async function copyExistingInvite(inviteLink: string) {
+    setInviteCopySuccessMessage(null);
+    setInviteManagementMessage(null);
+
+    try {
+      await copyTextToClipboard(inviteLink);
+      setInviteManagementMessage("Invite link copied from the master list.");
+      appendLog("[SYSTEM] Invite link copied from the master list.");
+      setLastUserMessage(
+        "Invite link copied from the master list. You can now send it to another device.",
+      );
+    } catch (error) {
+      appendLog(`[WARN] Failed to copy invite link from the master list: ${error}`);
     }
   }
 
@@ -602,6 +669,7 @@ export function useControlCenter() {
     setIsImportingInvite(true);
     setInviteLinkError(null);
     setInviteImportSuccessMessage(null);
+    setInviteManagementMessage(null);
     setLocalDataResetMessage(null);
     setLastError(null);
     setLastUserMessage(
@@ -619,6 +687,7 @@ export function useControlCenter() {
       window.localStorage.setItem(SUBORDINATE_HOST_KEY, result.host);
       window.localStorage.setItem(SUBORDINATE_COVER_DOMAIN_KEY, result.cover_domain);
       setSavedProfile(null);
+      setIssuedInviteLinks([]);
       setHost(result.host);
       setUser("root");
       setPassword("");
@@ -705,6 +774,7 @@ export function useControlCenter() {
     setLastError(null);
     setInviteCopySuccessMessage(null);
     setInviteImportSuccessMessage(null);
+    setInviteManagementMessage(null);
     setGeneratedInviteLink(null);
     setLocalDataResetMessage(null);
     setLastUserMessage("Removing the saved local server profile and client config from this Mac.");
@@ -727,6 +797,7 @@ export function useControlCenter() {
       setUser("root");
       setPassword("");
       setSavedProfile(null);
+      setIssuedInviteLinks([]);
       setCurrentCoverDomain(null);
       setAvailableCoverDomains([]);
       setRequiresRedeploy(false);
@@ -753,6 +824,30 @@ export function useControlCenter() {
       appendLog(`[MAIN ERROR] Local data reset failed: ${error}`);
     } finally {
       setIsResettingLocalData(false);
+    }
+  }
+
+  async function deleteIssuedInviteLink(inviteId: string) {
+    setDeletingInviteId(inviteId);
+    setInviteManagementMessage(null);
+    setLastError(null);
+
+    try {
+      await invoke("delete_issued_invite_link", { inviteId });
+      const invites = await invoke<IssuedInviteLink[]>("list_issued_invite_links");
+      setIssuedInviteLinks(invites);
+      setGeneratedInviteLink((current) =>
+        current && invites.some((invite) => invite.link === current) ? current : null,
+      );
+      setInviteManagementMessage("Invite link removed from the master list.");
+      appendLog("[SYSTEM] Invite link removed from the master list.");
+      setLastUserMessage(
+        "Invite link removed from the master app and revoked on the server. Any subordinate app using it will need a fresh invite link or must unlink itself.",
+      );
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Failed to delete invite link: ${error}`);
+    } finally {
+      setDeletingInviteId(null);
     }
   }
 
@@ -868,7 +963,7 @@ export function useControlCenter() {
       return {
         title: requiresInviteRefresh ? "Needs fresh invite link" : "Managed by master app",
         description: requiresInviteRefresh
-          ? "The master app rotated the transport configuration. Paste a fresh invite link on this device before starting the tunnel again."
+          ? "This invite link is no longer accepted by the master app. Ask for a fresh invite link, or unlink this app and configure it as a master app again."
           : "This installation is meant to receive and refresh its client config from a master app. Server deploy and SNI rotation stay disabled here.",
         tone: requiresInviteRefresh ? "attention" : "ready",
       };
@@ -987,7 +1082,9 @@ export function useControlCenter() {
     inviteLinkError,
     inviteCopySuccessMessage,
     inviteImportSuccessMessage,
+    inviteManagementMessage,
     generatedInviteLink,
+    issuedInviteLinks,
     localDataResetMessage,
     formattedLastDeployedAt,
     serverStatusSummary,
@@ -1005,6 +1102,7 @@ export function useControlCenter() {
     isResettingLocalData,
     isGeneratingInvite,
     isImportingInvite,
+    deletingInviteId,
     isStarting,
     isStopping,
     setHost: updateHost,
@@ -1016,12 +1114,14 @@ export function useControlCenter() {
     checkServerStatus,
     rotateSni,
     generateInviteLink,
+    copyExistingInvite,
     openInviteLinkModal,
     closeInviteLinkModal,
     setInviteLinkInput: updateInviteLinkInput,
     importInviteLink,
     refreshConfiguration,
     resetLocalData,
+    deleteIssuedInviteLink,
     copyLogs,
   };
 }

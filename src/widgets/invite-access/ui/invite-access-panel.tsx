@@ -1,4 +1,7 @@
-import type { AppRole } from "../../../features/control-center/model/use-control-center";
+import type {
+  AppRole,
+  IssuedInviteLink,
+} from "../../../features/control-center/model/use-control-center";
 import { Button } from "../../../shared/ui/button";
 import { Panel } from "../../../shared/ui/panel";
 
@@ -10,13 +13,18 @@ type InviteAccessPanelProps = {
   requiresInviteRefresh: boolean;
   isGeneratingInvite: boolean;
   isImportingInvite: boolean;
+  deletingInviteId: string | null;
   inviteCopySuccessMessage: string | null;
   inviteImportSuccessMessage: string | null;
+  inviteManagementMessage: string | null;
   generatedInviteLink: string | null;
+  issuedInviteLinks: IssuedInviteLink[];
   resetSuccessMessage: string | null;
   onGenerateInvite: () => void;
   onEnterInvite: () => void;
   onResetLocalData: () => void;
+  onCopyExistingInvite: (inviteLink: string) => void;
+  onDeleteInvite: (inviteId: string) => void;
 };
 
 export function InviteAccessPanel({
@@ -27,13 +35,18 @@ export function InviteAccessPanel({
   requiresInviteRefresh,
   isGeneratingInvite,
   isImportingInvite,
+  deletingInviteId,
   inviteCopySuccessMessage,
   inviteImportSuccessMessage,
+  inviteManagementMessage,
   generatedInviteLink,
+  issuedInviteLinks,
   resetSuccessMessage,
   onGenerateInvite,
   onEnterInvite,
   onResetLocalData,
+  onCopyExistingInvite,
+  onDeleteInvite,
 }: InviteAccessPanelProps) {
   const isMaster = appRole === "master";
   const subtitle = isMaster
@@ -120,6 +133,61 @@ export function InviteAccessPanel({
                 </p>
               </div>
             ) : null}
+            {inviteManagementMessage ? (
+              <div className="rounded-2xl border border-emerald-900/50 bg-emerald-950/20 px-4 py-3 text-sm leading-6 text-emerald-200">
+                {inviteManagementMessage}
+              </div>
+            ) : null}
+            <div className="rounded-2xl border border-zinc-800 bg-[#111212] px-4 py-4">
+              <div className="text-[11px] font-bold uppercase tracking-[0.22em] text-zinc-500">
+                Issued invite links
+              </div>
+              {issuedInviteLinks.length > 0 ? (
+                <div className="mt-3 flex flex-col gap-3">
+                  {issuedInviteLinks.map((invite) => (
+                    <div
+                      key={invite.id}
+                      className="rounded-2xl border border-zinc-800 bg-[#171818] px-4 py-4"
+                    >
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm font-semibold text-zinc-100">
+                            {invite.cover_domain}
+                          </div>
+                          <p className="mt-1 text-sm leading-6 text-zinc-400">
+                            {invite.host}
+                          </p>
+                          <p className="mt-2 break-all text-xs leading-5 text-zinc-500">
+                            {invite.link}
+                          </p>
+                        </div>
+                        <div className="flex gap-2 sm:pl-4">
+                          <Button
+                            variant="secondary"
+                            className="px-3 py-2 text-xs tracking-[0.16em]"
+                            onClick={() => onCopyExistingInvite(invite.link)}
+                          >
+                            Copy
+                          </Button>
+                          <Button
+                            variant="danger"
+                            className="px-3 py-2 text-xs tracking-[0.16em]"
+                            disabled={deletingInviteId === invite.id}
+                            onClick={() => onDeleteInvite(invite.id)}
+                          >
+                            {deletingInviteId === invite.id ? "Removing" : "Delete"}
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="mt-3 text-sm leading-6 text-zinc-400">
+                  No invite links have been issued yet on this master app.
+                </p>
+              )}
+            </div>
           </>
         ) : (
           <>

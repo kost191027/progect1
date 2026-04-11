@@ -15,10 +15,28 @@ CANDIDATE_BOOTSTRAP="$CONFIG_DIR/bootstrap.candidate.json"
 BACKUP_BOOTSTRAP="$CONFIG_DIR/bootstrap.previous.json"
 ACTIVE_CONTAINER_FILE="$CONFIG_DIR/container_name"
 LEGACY_CONTAINER_NAME="sys-network-helper"
+RKN_MANAGED_LABEL="com.freedom.rkn.managed=true"
 
 PREVIOUS_CONTAINER=""
 ROLLBACK_CONTAINER=""
 NEW_CONTAINER_CREATED=0
+
+cleanup_stale_managed_containers() {
+    local name
+
+    while IFS= read -r name; do
+        if [ -z "$name" ]; then
+            continue
+        fi
+
+        if [ "$name" = "$CONTAINER_NAME" ] || [ "$name" = "$PREVIOUS_CONTAINER" ] || [ "$name" = "$ROLLBACK_CONTAINER" ]; then
+            continue
+        fi
+
+        echo "[INFO] Removing stale managed container: $name"
+        docker rm -f "$name" >/dev/null 2>&1 || true
+    done < <(docker ps -a --filter "label=$RKN_MANAGED_LABEL" --format '{{.Names}}' 2>/dev/null || true)
+}
 
 rollback() {
     local exit_code=$?
@@ -117,6 +135,9 @@ if [ -n "$PREVIOUS_CONTAINER" ]; then
     docker rename "$PREVIOUS_CONTAINER" "$ROLLBACK_CONTAINER"
 fi
 
+echo "[INFO] Cleaning up stale managed RKN containers..."
+cleanup_stale_managed_containers
+
 # 3. Активация новой конфигурации
 mv "$CANDIDATE_CONFIG" "$ACTIVE_CONFIG"
 mv "$CANDIDATE_BOOTSTRAP" "$ACTIVE_BOOTSTRAP"
@@ -125,7 +146,9 @@ mv "$CANDIDATE_BOOTSTRAP" "$ACTIVE_BOOTSTRAP"
 echo "[INFO] Starting core container..."
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER_NAME" \
+    --label "$RKN_MANAGED_LABEL" \
     --network host \
+    --cap-add=NET_ADMIN \
     -v "$ACTIVE_CONFIG:/etc/sing-box/config.json" \
     --restart always \
     "$IMAGE" run -c /etc/sing-box/config.json

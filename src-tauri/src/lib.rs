@@ -81,6 +81,48 @@ fn client_config_exists(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
+fn local_client_config_requires_refresh(app: &AppHandle) -> Result<bool, String> {
+    let config_path = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("client_config.json");
+
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let contents = fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+    let config: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("Invalid client config JSON: {}", e))?;
+
+    let dns = config.get("dns").and_then(|value| value.as_object());
+    if let Some(dns) = dns {
+        if dns.contains_key("fakeip") {
+            return Ok(true);
+        }
+
+        let has_legacy_server_format = dns
+            .get("servers")
+            .and_then(|value| value.as_array())
+            .map(|servers| {
+                servers.iter().any(|server| {
+                    server
+                        .as_object()
+                        .map(|server| !server.contains_key("type"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if has_legacy_server_format {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 pub(crate) fn refresh_tray_toggle_item(app: &AppHandle) {
     let state = app.state::<AppState>();
     let maybe_item = state.tray_toggle_item.lock().unwrap().clone();
@@ -636,7 +678,19 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         }
     }
 
+    if local_client_config_requires_refresh(&app)? {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Local client config uses an outdated DNS/FakeIP format. Run Update/Deploy once to regenerate it for the current core.".to_string(),
+        );
+        return Err(
+            "Local client config is outdated. Run Update/Deploy before starting the tunnel."
+                .to_string(),
+        );
+    }
+
     ssh::ensure_local_transport_is_current(&app).await?;
+    crate::geodata::ensure_local_client_rule_sets(&app).await?;
 
     let _ = app.emit("tunnel-log", "[SYSTEM] Resolving core binary path...");
     let pid = launch_tunnel_process(&app, true).await?;
@@ -743,6 +797,8 @@ async fn reset_local_data(app: AppHandle) -> Result<(), String> {
             }
         }
     }
+
+    ssh::clear_issued_invites(&app)?;
 
     let _ = fs::remove_file("/tmp/rkn-tun.log");
     set_network_fingerprint(&state, None);
@@ -940,6 +996,8 @@ pub fn run() {
             ssh::generate_invite_link,
             ssh::import_invite_link,
             ssh::get_local_installation_state,
+            ssh::list_issued_invite_links,
+            ssh::delete_issued_invite_link,
             ssh::get_transport_state_snapshot,
             ssh::load_saved_server_profile,
             ssh::check_server_status,

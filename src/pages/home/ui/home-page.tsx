@@ -91,13 +91,18 @@ export function HomePage({ controlCenter }: HomePageProps) {
           requiresInviteRefresh={controlCenter.requiresInviteRefresh}
           isGeneratingInvite={controlCenter.isGeneratingInvite}
           isImportingInvite={controlCenter.isImportingInvite}
+          deletingInviteId={controlCenter.deletingInviteId}
           inviteCopySuccessMessage={controlCenter.inviteCopySuccessMessage}
           inviteImportSuccessMessage={controlCenter.inviteImportSuccessMessage}
+          inviteManagementMessage={controlCenter.inviteManagementMessage}
           generatedInviteLink={controlCenter.generatedInviteLink}
+          issuedInviteLinks={controlCenter.issuedInviteLinks}
           resetSuccessMessage={controlCenter.localDataResetMessage}
           onGenerateInvite={controlCenter.generateInviteLink}
           onEnterInvite={controlCenter.openInviteLinkModal}
           onResetLocalData={controlCenter.resetLocalData}
+          onCopyExistingInvite={controlCenter.copyExistingInvite}
+          onDeleteInvite={controlCenter.deleteIssuedInviteLink}
         />
 
         {controlCenter.appRole === "master" ? (
@@ -123,8 +128,8 @@ export function HomePage({ controlCenter }: HomePageProps) {
             className="bg-[#1a1a1a]"
           >
             <p className="text-sm leading-6 text-zinc-400">
-              The subordinate pairing flow will land on top of this mode. Until then, this screen
-              stays read-only and only the tunnel controls remain available.
+              This screen stays read-only by design. Use invite links from the master app to
+              refresh configuration, then start or stop the tunnel locally on this device.
             </p>
           </Panel>
         )}

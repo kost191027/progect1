@@ -6,6 +6,8 @@ type BlockingModalProps = {
   actionLabel: string;
   isBusy?: boolean;
   onAction: () => void;
+  secondaryActionLabel?: string;
+  onSecondaryAction?: () => void;
 };
 
 export function BlockingModal({
@@ -14,6 +16,8 @@ export function BlockingModal({
   actionLabel,
   isBusy = false,
   onAction,
+  secondaryActionLabel,
+  onSecondaryAction,
 }: BlockingModalProps) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 px-4 py-6 backdrop-blur-sm">
@@ -23,15 +27,28 @@ export function BlockingModal({
         </div>
         <h2 className="mt-3 text-xl font-semibold text-zinc-100">{title}</h2>
         <p className="mt-3 text-sm leading-6 text-zinc-400">{description}</p>
-        <Button
-          variant="primary"
-          fullWidth
-          className="mt-6 py-4"
-          disabled={isBusy}
-          onClick={onAction}
-        >
-          {isBusy ? "Refreshing..." : actionLabel}
-        </Button>
+        <div className="mt-6 flex flex-col gap-3">
+          <Button
+            variant="primary"
+            fullWidth
+            className="py-4"
+            disabled={isBusy}
+            onClick={onAction}
+          >
+            {isBusy ? "Refreshing..." : actionLabel}
+          </Button>
+          {secondaryActionLabel && onSecondaryAction ? (
+            <Button
+              variant="secondary"
+              fullWidth
+              className="py-4"
+              disabled={isBusy}
+              onClick={onSecondaryAction}
+            >
+              {secondaryActionLabel}
+            </Button>
+          ) : null}
+        </div>
       </div>
     </div>
   );

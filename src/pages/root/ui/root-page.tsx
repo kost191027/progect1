@@ -84,11 +84,13 @@ export function RootPage() {
       controlCenter.requiresInviteRefresh &&
       !controlCenter.isInviteModalOpen ? (
         <BlockingModal
-          title="Master app rotated the configuration"
-          description="The invite link on this device is stale. Ask the master app for a fresh invite link, then paste it here before starting the tunnel again."
+          title="This subordinate link is no longer accepted"
+          description="The master app either removed this invite link or replaced the transport configuration. Ask the administrator for a fresh invite link, or unlink this app to return to a clean master setup with no saved server data."
           actionLabel="Paste Fresh Invite Link"
-          isBusy={controlCenter.isImportingInvite}
+          secondaryActionLabel="Unlink This App"
+          isBusy={controlCenter.isImportingInvite || controlCenter.isResettingLocalData}
           onAction={controlCenter.openInviteLinkModal}
+          onSecondaryAction={controlCenter.resetLocalData}
         />
       ) : null}
 
