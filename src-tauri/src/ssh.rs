@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ssh2::Session;
@@ -8,14 +10,20 @@ use std::net::SocketAddr;
 use std::net::TcpStream;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tauri::{AppHandle, Emitter, Manager};
 
 const PRIMARY_EXTERNAL_PORT: u16 = 4433;
 const EXTERNAL_PORT_CANDIDATES: [u16; 5] = [4433, 443, 5443, 7443, 9443];
-const PINNED_SING_BOX_IMAGE: &str = "ghcr.io/sagernet/sing-box:v1.13.5";
+const INTERNAL_SS_PORT_CANDIDATES: [u16; 5] = [14433, 15433, 16433, 17433, 18433];
+const PINNED_SING_BOX_IMAGE: &str = "ghcr.io/sagernet/sing-box:v1.10.7";
+const WGCF_VERSION: &str = "2.2.29";
 const CONTAINER_PREFIXES: [&str; 5] = [
     "sys-networkd",
     "mdns-relay",
@@ -25,12 +33,21 @@ const CONTAINER_PREFIXES: [&str; 5] = [
 ];
 const LEGACY_CONTAINER_NAME: &str = "sys-network-helper";
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SSH_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOTE_DEPLOY_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOTE_DEPLOY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_FALLBACK_COVER_DOMAINS: usize = 4;
+const BUNDLED_WARP_PRIVATE_KEY: &str = "QJFlY7Xqqmpd110buQYhO3kPns9aj4ddLTTUHyXFRWc=";
+const BUNDLED_WARP_ADDRESS_V4: &str = "172.16.0.2/32";
+const BUNDLED_WARP_ADDRESS_V6: &str = "2606:4700:110:84d0:bc95:602b:71f:611e/128";
+const BUNDLED_WARP_ENDPOINT: &str = "162.159.192.1";
+const BUNDLED_WARP_ENDPOINT_PORT: u16 = 500;
+const BUNDLED_WARP_PEER_PUBLIC_KEY: &str = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=";
 
 #[derive(Debug)]
 struct RemoteDeployTarget {
     external_port: u16,
+    internal_ss_port: u16,
     container_name: String,
     reusing_existing_instance: bool,
     migrating_to_primary_port: bool,
@@ -46,9 +63,154 @@ pub struct SavedServerProfile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RemoteTransportBootstrap {
     external_port: u16,
+    #[serde(default = "default_internal_ss_port")]
+    internal_ss_port: u16,
+    cover_domain: String,
+    #[serde(default)]
+    fallback_cover_domains: Vec<String>,
+    shadow_pass: String,
+    ss_password: String,
+    #[serde(default)]
+    ss_server_password: String,
+    #[serde(default)]
+    issued_invites: Vec<RemoteInviteRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalClientTransportState {
     cover_domain: String,
     shadow_pass: String,
     ss_password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RemoteWarpConfig {
+    pub(crate) private_key: String,
+    pub(crate) address_v4: String,
+    pub(crate) address_v6: String,
+    pub(crate) endpoint: String,
+    pub(crate) endpoint_port: u16,
+    pub(crate) peer_public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalWarpProfileStatus {
+    has_profile: bool,
+    endpoint: Option<String>,
+    endpoint_port: Option<u16>,
+    address_v4: Option<String>,
+    address_v6: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RemoteInviteRecord {
+    pub(crate) id: String,
+    pub(crate) shadow_pass: String,
+    pub(crate) ss_user_password: String,
+    pub(crate) generated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransportStateSnapshot {
+    current_cover_domain: Option<String>,
+    available_cover_domains: Vec<String>,
+    local_cover_domain: Option<String>,
+    requires_redeploy: bool,
+}
+
+fn default_internal_ss_port() -> u16 {
+    crate::generator::INTERNAL_SS_PORT
+}
+
+fn remote_mutation_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn acquire_remote_mutation_lock() -> Result<MutexGuard<'static, ()>, String> {
+    remote_mutation_lock()
+        .lock()
+        .map_err(|_| "Remote operation lock is unavailable right now. Try again.".to_string())
+}
+
+fn invite_sync_revision() -> &'static AtomicU64 {
+    static REVISION: OnceLock<AtomicU64> = OnceLock::new();
+    REVISION.get_or_init(|| AtomicU64::new(0))
+}
+
+fn snapshot_for_cover_domain(cover_domain: impl Into<String>) -> TransportStateSnapshot {
+    let cover_domain = cover_domain.into();
+
+    TransportStateSnapshot {
+        current_cover_domain: Some(cover_domain.clone()),
+        available_cover_domains: crate::generator::available_cover_domains(),
+        local_cover_domain: Some(cover_domain),
+        requires_redeploy: false,
+    }
+}
+
+fn ensure_local_client_rule_sets_sync(
+    app: &AppHandle,
+) -> Result<Vec<crate::geodata::LocalRuleSetAsset>, String> {
+    tauri::async_runtime::block_on(crate::geodata::ensure_local_client_rule_sets(app))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InviteLinkPayload {
+    version: u8,
+    invite_id: String,
+    host: String,
+    external_port: u16,
+    cover_domain: String,
+    shadow_pass: String,
+    ss_password: String,
+    generated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredInviteLinkRecord {
+    id: String,
+    link: String,
+    host: String,
+    cover_domain: String,
+    generated_at: u64,
+    #[serde(default)]
+    shadow_pass: String,
+    #[serde(default)]
+    ss_user_password: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IssuedInviteLink {
+    id: String,
+    link: String,
+    host: String,
+    cover_domain: String,
+    generated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InviteRemoteSyncEvent {
+    invite_id: String,
+    status: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InviteImportResult {
+    host: String,
+    cover_domain: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GeneratedInviteLinkResult {
+    link: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalInstallationState {
+    has_saved_server_profile: bool,
+    has_client_config: bool,
 }
 
 fn emit_ssh_stage(app: &AppHandle, stage: &str, message: impl Into<String>) {
@@ -70,6 +232,190 @@ fn save_server_profile(app: &AppHandle, profile: &SavedServerProfile) -> Result<
 
     let profile_json = serde_json::to_vec_pretty(profile).map_err(|e| e.to_string())?;
     std::fs::write(profile_path, profile_json).map_err(|e| e.to_string())
+}
+
+fn remove_saved_server_profile(app: &AppHandle) -> Result<(), String> {
+    let profile_path = server_profile_path(app)?;
+
+    match std::fs::remove_file(profile_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn issued_invites_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+
+    Ok(local_data.join("issued_invites.json"))
+}
+
+fn local_warp_profile_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+
+    Ok(local_data.join("warp_profile.json"))
+}
+
+fn validate_warp_config(config: &RemoteWarpConfig) -> Result<(), String> {
+    if config.private_key.trim().is_empty()
+        || config.address_v4.trim().is_empty()
+        || config.endpoint.trim().is_empty()
+        || config.peer_public_key.trim().is_empty()
+        || config.endpoint_port == 0
+    {
+        return Err("WARP profile is incomplete.".to_string());
+    }
+
+    Ok(())
+}
+
+fn warp_status_from_config(config: Option<&RemoteWarpConfig>) -> LocalWarpProfileStatus {
+    LocalWarpProfileStatus {
+        has_profile: config.is_some(),
+        endpoint: config.map(|item| item.endpoint.clone()),
+        endpoint_port: config.map(|item| item.endpoint_port),
+        address_v4: config.map(|item| item.address_v4.clone()),
+        address_v6: config
+            .filter(|item| !item.address_v6.trim().is_empty())
+            .map(|item| item.address_v6.clone()),
+    }
+}
+
+fn bundled_fallback_warp_config() -> RemoteWarpConfig {
+    RemoteWarpConfig {
+        private_key: BUNDLED_WARP_PRIVATE_KEY.to_string(),
+        address_v4: BUNDLED_WARP_ADDRESS_V4.to_string(),
+        address_v6: BUNDLED_WARP_ADDRESS_V6.to_string(),
+        endpoint: BUNDLED_WARP_ENDPOINT.to_string(),
+        endpoint_port: BUNDLED_WARP_ENDPOINT_PORT,
+        peer_public_key: BUNDLED_WARP_PEER_PUBLIC_KEY.to_string(),
+    }
+}
+
+fn load_local_warp_config_sync(app: &AppHandle) -> Result<Option<RemoteWarpConfig>, String> {
+    let profile_path = local_warp_profile_path(app)?;
+    if !profile_path.exists() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(&profile_path).map_err(|e| e.to_string())?;
+    let config = serde_json::from_str::<RemoteWarpConfig>(&contents)
+        .map_err(|e| format!("Failed to parse local WARP profile: {}", e))?;
+    validate_warp_config(&config)?;
+
+    Ok(Some(config))
+}
+
+fn save_local_warp_config_sync(app: &AppHandle, config: &RemoteWarpConfig) -> Result<(), String> {
+    validate_warp_config(config)?;
+
+    let profile_path = local_warp_profile_path(app)?;
+    if let Some(parent) = profile_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let json = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
+    std::fs::write(profile_path, json).map_err(|e| e.to_string())
+}
+
+pub(crate) fn clear_local_warp_profile_sync(app: &AppHandle) -> Result<(), String> {
+    let profile_path = local_warp_profile_path(app)?;
+
+    match std::fs::remove_file(profile_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn load_issued_invite_records(app: &AppHandle) -> Result<Vec<StoredInviteLinkRecord>, String> {
+    let invites_path = issued_invites_path(app)?;
+
+    if !invites_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let contents = std::fs::read_to_string(&invites_path).map_err(|e| e.to_string())?;
+    serde_json::from_str::<Vec<StoredInviteLinkRecord>>(&contents)
+        .map_err(|e| format!("Failed to parse issued invites JSON: {}", e))
+}
+
+fn save_issued_invite_records(
+    app: &AppHandle,
+    invites: &[StoredInviteLinkRecord],
+) -> Result<(), String> {
+    let invites_path = issued_invites_path(app)?;
+
+    if let Some(parent) = invites_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let json = serde_json::to_vec_pretty(invites).map_err(|e| e.to_string())?;
+    std::fs::write(invites_path, json).map_err(|e| e.to_string())
+}
+
+pub(crate) fn clear_issued_invites(app: &AppHandle) -> Result<(), String> {
+    let invites_path = issued_invites_path(app)?;
+
+    match std::fs::remove_file(invites_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn issue_invite_id() -> Result<String, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+
+    Ok(format!("invite-{:x}", timestamp))
+}
+
+fn compose_multi_user_ss_password(server_password: &str, user_password: &str) -> String {
+    format!("{}:{}", server_password, user_password)
+}
+
+fn split_multi_user_ss_password(combined_password: &str) -> Option<(String, String)> {
+    let (server_password, user_password) = combined_password.split_once(':')?;
+    if server_password.is_empty() || user_password.is_empty() {
+        return None;
+    }
+
+    Some((server_password.to_string(), user_password.to_string()))
+}
+
+fn resolve_master_ss_transport(
+    app: &AppHandle,
+    remote_bootstrap: &RemoteTransportBootstrap,
+) -> Result<(String, String, String), String> {
+    if !remote_bootstrap.ss_server_password.is_empty() {
+        let (_, master_user_password) = split_multi_user_ss_password(&remote_bootstrap.ss_password)
+            .ok_or_else(|| {
+                "Remote bootstrap is missing the master multi-user Shadowsocks password."
+                    .to_string()
+            })?;
+
+        return Ok((
+            remote_bootstrap.ss_server_password.clone(),
+            master_user_password,
+            remote_bootstrap.ss_password.clone(),
+        ));
+    }
+
+    let ss_server_password =
+        tauri::async_runtime::block_on(crate::generator::generate_ss_password(app))?;
+    let master_ss_user_password =
+        tauri::async_runtime::block_on(crate::generator::generate_ss_password(app))?;
+    let master_combined_password =
+        compose_multi_user_ss_password(&ss_server_password, &master_ss_user_password);
+
+    Ok((
+        ss_server_password,
+        master_ss_user_password,
+        master_combined_password,
+    ))
 }
 
 fn parse_remote_bootstrap_from_server_config(
@@ -102,6 +448,11 @@ fn parse_remote_bootstrap_from_server_config(
         .and_then(Value::as_str)
         .ok_or_else(|| "Remote server config is missing ShadowTLS cover domain".to_string())?
         .to_string();
+    let fallback_cover_domains = shadowtls_inbound
+        .get("handshake_for_server_name")
+        .and_then(Value::as_object)
+        .map(|mappings| mappings.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
     let shadow_pass = shadowtls_inbound
         .get("users")
         .and_then(Value::as_array)
@@ -115,13 +466,454 @@ fn parse_remote_bootstrap_from_server_config(
         .and_then(Value::as_str)
         .ok_or_else(|| "Remote server config is missing Shadowsocks password".to_string())?
         .to_string();
+    let internal_ss_port = shadowsocks_inbound
+        .get("listen_port")
+        .and_then(Value::as_u64)
+        .map(|port| port as u16)
+        .unwrap_or_else(default_internal_ss_port);
 
     Ok(RemoteTransportBootstrap {
         external_port,
+        internal_ss_port,
+        cover_domain,
+        fallback_cover_domains,
+        shadow_pass,
+        ss_password,
+        ss_server_password: String::new(),
+        issued_invites: Vec::new(),
+    })
+}
+
+fn build_rotated_cover_domain_history(
+    current_cover_domain: &str,
+    existing_fallback_cover_domains: &[String],
+    new_cover_domain: &str,
+) -> Vec<String> {
+    let mut fallback_cover_domains = Vec::new();
+
+    let push_unique = |domains: &mut Vec<String>, domain: &str| {
+        if domain != new_cover_domain && !domains.iter().any(|item| item == domain) {
+            domains.push(domain.to_string());
+        }
+    };
+
+    push_unique(&mut fallback_cover_domains, current_cover_domain);
+    for domain in existing_fallback_cover_domains {
+        push_unique(&mut fallback_cover_domains, domain);
+    }
+
+    fallback_cover_domains.truncate(MAX_FALLBACK_COVER_DOMAINS);
+    fallback_cover_domains
+}
+
+fn local_client_config_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    Ok(local_data.join("client_config.json"))
+}
+
+fn load_local_client_transport_state(
+    app: &AppHandle,
+) -> Result<Option<LocalClientTransportState>, String> {
+    let client_config_path = local_client_config_path(app)?;
+
+    if !client_config_path.exists() {
+        return Ok(None);
+    }
+
+    let config_json = std::fs::read_to_string(&client_config_path).map_err(|e| e.to_string())?;
+    let parsed = serde_json::from_str::<Value>(&config_json)
+        .map_err(|e| format!("Failed to parse local client config JSON: {}", e))?;
+    let outbounds = parsed
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Local client config is missing outbounds array".to_string())?;
+
+    let shadowtls_outbound = outbounds
+        .iter()
+        .find(|outbound| outbound.get("type").and_then(Value::as_str) == Some("shadowtls"))
+        .ok_or_else(|| "Local client config is missing shadowtls outbound".to_string())?;
+    let shadowsocks_outbound = outbounds
+        .iter()
+        .find(|outbound| {
+            outbound.get("type").and_then(Value::as_str) == Some("shadowsocks")
+                && outbound.get("tag").and_then(Value::as_str) == Some("proxy")
+        })
+        .ok_or_else(|| "Local client config is missing proxy shadowsocks outbound".to_string())?;
+
+    let cover_domain = shadowtls_outbound
+        .get("tls")
+        .and_then(|tls| tls.get("server_name"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Local client config is missing ShadowTLS server_name".to_string())?
+        .to_string();
+    let shadow_pass = shadowtls_outbound
+        .get("password")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Local client config is missing ShadowTLS password".to_string())?
+        .to_string();
+    let ss_password = shadowsocks_outbound
+        .get("password")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Local client config is missing Shadowsocks password".to_string())?
+        .to_string();
+
+    Ok(Some(LocalClientTransportState {
         cover_domain,
         shadow_pass,
         ss_password,
+    }))
+}
+
+#[tauri::command]
+pub fn get_local_installation_state(app: AppHandle) -> Result<LocalInstallationState, String> {
+    let profile_path = server_profile_path(&app)?;
+    let client_config_path = local_client_config_path(&app)?;
+
+    Ok(LocalInstallationState {
+        has_saved_server_profile: profile_path.exists(),
+        has_client_config: client_config_path.exists(),
     })
+}
+
+#[tauri::command]
+pub fn list_issued_invite_links(app: AppHandle) -> Result<Vec<IssuedInviteLink>, String> {
+    let records = load_issued_invite_records(&app)?;
+
+    Ok(records
+        .into_iter()
+        .map(|record| IssuedInviteLink {
+            id: record.id,
+            link: record.link,
+            host: record.host,
+            cover_domain: record.cover_domain,
+            generated_at: record.generated_at,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn delete_issued_invite_link(app: AppHandle, invite_id: String) -> Result<(), String> {
+    let mut records = load_issued_invite_records(&app)?;
+    let original_len = records.len();
+    records.retain(|record| record.id != invite_id);
+
+    if records.len() == original_len {
+        return Err("Invite link not found in the local master list.".to_string());
+    }
+
+    if records.is_empty() {
+        clear_issued_invites(&app)?;
+    } else {
+        save_issued_invite_records(&app, &records)?;
+    }
+
+    schedule_invite_remote_sync(
+        &app,
+        "Please wait while the previous invite is removed from the server.",
+    );
+
+    Ok(())
+}
+
+fn build_remote_invites_from_records(
+    records: &[StoredInviteLinkRecord],
+    remote_bootstrap: &RemoteTransportBootstrap,
+) -> Result<Vec<RemoteInviteRecord>, String> {
+    records
+        .iter()
+        .map(|record| {
+            if !record.shadow_pass.trim().is_empty() && !record.ss_user_password.trim().is_empty() {
+                return Ok(RemoteInviteRecord {
+                    id: record.id.clone(),
+                    shadow_pass: record.shadow_pass.clone(),
+                    ss_user_password: record.ss_user_password.clone(),
+                    generated_at: record.generated_at,
+                });
+            }
+
+            if let Some(existing) = remote_bootstrap
+                .issued_invites
+                .iter()
+                .find(|invite| invite.id == record.id)
+            {
+                return Ok(existing.clone());
+            }
+
+            Err(format!(
+                "Invite {} is missing server-side secrets. Recreate this invite link before syncing again.",
+                record.id
+            ))
+        })
+        .collect()
+}
+
+fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String> {
+    let _mutation_guard = acquire_remote_mutation_lock()?;
+    let profile = load_saved_server_profile(app.clone())?
+        .ok_or_else(|| "Saved server profile not found. Deploy once first.".to_string())?;
+    let records = load_issued_invite_records(app)?;
+
+    let sess = connect_ssh_session(app, &profile.host, &profile.user, &profile.password)?;
+    let remote_bootstrap = load_remote_transport_bootstrap(&sess)?.ok_or_else(|| {
+        "Remote transport bootstrap not found. Deploy the server first.".to_string()
+    })?;
+    let container_name = load_remote_container_name(&sess)?.ok_or_else(|| {
+        "Remote RKN container is not active. Deploy the server first.".to_string()
+    })?;
+
+    let synced_invites = build_remote_invites_from_records(&records, &remote_bootstrap)?;
+    let (ss_server_password, master_ss_user_password, master_combined_password) =
+        resolve_master_ss_transport(app, &remote_bootstrap)?;
+    let warp_config = ensure_remote_warp_config(app, &sess)?;
+    let server_cfg =
+        crate::generator::build_server_config_with_invites(crate::generator::ServerConfigParams {
+            master_shadow_pass: &remote_bootstrap.shadow_pass,
+            ss_server_password: &ss_server_password,
+            master_ss_user_password: &master_ss_user_password,
+            external_port: remote_bootstrap.external_port,
+            internal_ss_port: remote_bootstrap.internal_ss_port,
+            cover_domain: &remote_bootstrap.cover_domain,
+            fallback_cover_domains: &remote_bootstrap.fallback_cover_domains,
+            issued_invites: &synced_invites,
+            warp: &warp_config,
+        });
+    let bootstrap_cfg = json!({
+        "external_port": remote_bootstrap.external_port,
+        "internal_ss_port": remote_bootstrap.internal_ss_port,
+        "cover_domain": remote_bootstrap.cover_domain,
+        "fallback_cover_domains": remote_bootstrap.fallback_cover_domains,
+        "shadow_pass": remote_bootstrap.shadow_pass,
+        "ss_password": master_combined_password,
+        "ss_server_password": ss_server_password,
+        "issued_invites": synced_invites
+    })
+    .to_string();
+    let deploy_script = include_str!("../scripts/deploy.sh");
+    let injected_script = format!(
+        r#"#!/bin/bash
+mkdir -p /opt/rkn
+export RKN_IMAGE='{}'
+export RKN_CONTAINER_NAME='{}'
+cat << 'CONFIGEOF' > /opt/rkn/config.candidate.json
+{}
+CONFIGEOF
+
+cat << 'BOOTSTRAPEOF' > /opt/rkn/bootstrap.candidate.json
+{}
+BOOTSTRAPEOF
+
+{}
+"#,
+        PINNED_SING_BOX_IMAGE, container_name, server_cfg, bootstrap_cfg, deploy_script
+    );
+
+    let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
+    channel.exec("bash -s 2>&1").map_err(|e| e.to_string())?;
+    channel
+        .write_all(injected_script.as_bytes())
+        .map_err(|e| e.to_string())?;
+    channel.send_eof().map_err(|e| e.to_string())?;
+    stream_remote_deploy_output(app, &sess, &mut channel)?;
+    channel.wait_close().map_err(|e| e.to_string())?;
+    let exit_status = channel.exit_status().map_err(|e| e.to_string())?;
+
+    if exit_status != 0 {
+        return Err(format!(
+            "Invite sync deploy failed with code {}",
+            exit_status
+        ));
+    }
+
+    validate_remote_runtime(
+        &sess,
+        &container_name,
+        remote_bootstrap.external_port,
+        remote_bootstrap.internal_ss_port,
+    )?;
+
+    Ok(())
+}
+
+fn schedule_invite_remote_sync(app: &AppHandle, message: &str) {
+    let revision = invite_sync_revision().fetch_add(1, Ordering::SeqCst) + 1;
+    let _ = app.emit(
+        "invite-remote-sync",
+        InviteRemoteSyncEvent {
+            invite_id: "invite-batch".to_string(),
+            status: "started".to_string(),
+            message: message.to_string(),
+        },
+    );
+
+    let sync_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let debounce_result = tauri::async_runtime::spawn_blocking(move || {
+            thread::sleep(Duration::from_millis(1200));
+            if invite_sync_revision().load(Ordering::SeqCst) != revision {
+                return Ok(false);
+            }
+            Ok(true)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+
+        let should_run = match debounce_result {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = sync_app.emit(
+                    "invite-remote-sync",
+                    InviteRemoteSyncEvent {
+                        invite_id: "invite-batch".to_string(),
+                        status: "failed".to_string(),
+                        message: format!(
+                            "Invite changes were saved locally, but the server sync scheduler failed: {}",
+                            error
+                        ),
+                    },
+                );
+                return;
+            }
+        };
+
+        if !should_run {
+            return;
+        }
+
+        match tauri::async_runtime::spawn_blocking({
+            let sync_app = sync_app.clone();
+            move || sync_invites_remote_from_local_records(&sync_app)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
+        {
+            Ok(()) => {
+                let _ = sync_app.emit(
+                    "invite-remote-sync",
+                    InviteRemoteSyncEvent {
+                        invite_id: "invite-batch".to_string(),
+                        status: "completed".to_string(),
+                        message: "Invite changes finished syncing on the server.".to_string(),
+                    },
+                );
+            }
+            Err(error) => {
+                let _ = sync_app.emit(
+                    "invite-remote-sync",
+                    InviteRemoteSyncEvent {
+                        invite_id: "invite-batch".to_string(),
+                        status: "failed".to_string(),
+                        message: format!(
+                            "Invite changes were saved locally, but the server sync still needs attention: {}",
+                            error
+                        ),
+                    },
+                );
+                let _ = sync_app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[WARN] Invite changes were saved locally, but the background server sync needs attention: {}",
+                        error
+                    ),
+                );
+            }
+        }
+    });
+}
+
+fn local_transport_requires_redeploy(
+    local_state: &LocalClientTransportState,
+    remote_bootstrap: &RemoteTransportBootstrap,
+) -> bool {
+    local_state.cover_domain != remote_bootstrap.cover_domain
+        || local_state.shadow_pass != remote_bootstrap.shadow_pass
+        || local_state.ss_password != remote_bootstrap.ss_password
+}
+
+fn load_transport_state_snapshot_sync(app: &AppHandle) -> Result<TransportStateSnapshot, String> {
+    let available_cover_domains = crate::generator::available_cover_domains();
+    let local_state = load_local_client_transport_state(app)?;
+
+    let Some(profile) = load_saved_server_profile(app.clone())? else {
+        return Ok(TransportStateSnapshot {
+            current_cover_domain: None,
+            available_cover_domains,
+            local_cover_domain: local_state.map(|state| state.cover_domain),
+            requires_redeploy: false,
+        });
+    };
+
+    let sess = connect_ssh_session(app, &profile.host, &profile.user, &profile.password)?;
+    let remote_bootstrap = load_remote_transport_bootstrap(&sess)?;
+
+    let Some(remote_bootstrap) = remote_bootstrap else {
+        return Ok(TransportStateSnapshot {
+            current_cover_domain: None,
+            available_cover_domains,
+            local_cover_domain: local_state.map(|state| state.cover_domain),
+            requires_redeploy: false,
+        });
+    };
+
+    let requires_redeploy = local_state
+        .as_ref()
+        .map(|state| local_transport_requires_redeploy(state, &remote_bootstrap))
+        .unwrap_or(false);
+
+    Ok(TransportStateSnapshot {
+        current_cover_domain: Some(remote_bootstrap.cover_domain),
+        available_cover_domains,
+        local_cover_domain: local_state.map(|state| state.cover_domain),
+        requires_redeploy,
+    })
+}
+
+pub(crate) async fn ensure_local_transport_is_current(app: &AppHandle) -> Result<(), String> {
+    let check_app = app.clone();
+    let snapshot_result = tauri::async_runtime::spawn_blocking(move || {
+        load_transport_state_snapshot_sync(&check_app)
+    })
+    .await
+    .unwrap();
+
+    let snapshot = match snapshot_result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[WARN] Unable to verify whether this device is in sync with the remote transport before starting the tunnel: {}",
+                    error
+                ),
+            );
+            return Ok(());
+        }
+    };
+
+    if !snapshot.requires_redeploy {
+        return Ok(());
+    }
+
+    let remote_cover_domain = snapshot
+        .current_cover_domain
+        .unwrap_or_else(|| "unknown".to_string());
+    let local_cover_domain = snapshot
+        .local_cover_domain
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let _ = app.emit(
+        "tunnel-log",
+        format!(
+            "[SYSTEM] Remote cover domain is {} but this device still has {}. Run Deploy/Update on this device before starting the tunnel.",
+            remote_cover_domain, local_cover_domain
+        ),
+    );
+
+    Err(
+        "Remote transport changed on another client. Run Deploy/Update on this device before starting the tunnel."
+            .to_string(),
+    )
 }
 
 fn load_remote_container_name(sess: &Session) -> Result<Option<String>, String> {
@@ -160,6 +952,518 @@ fi
     } else {
         Ok(Some(container_name.to_string()))
     }
+}
+
+fn load_remote_container_image(
+    sess: &Session,
+    container_name: &str,
+) -> Result<Option<String>, String> {
+    let command = format!(
+        r#"bash -lc '
+if docker inspect "{container_name}" >/dev/null 2>&1; then
+  docker inspect -f "{{{{.Config.Image}}}}" "{container_name}" 2>/dev/null || true
+fi
+'"#,
+        container_name = container_name
+    );
+
+    let (stdout, exit_status) = run_remote_command(sess, &command)?;
+    if exit_status != 0 {
+        return Err(format!(
+            "Failed to read remote container image for {}. Output: {}",
+            container_name,
+            stdout.trim()
+        ));
+    }
+
+    let image = stdout.trim();
+    if image.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(image.to_string()))
+    }
+}
+
+fn remote_runtime_uses_warp(sess: &Session) -> Result<bool, String> {
+    let command = r#"bash -lc '
+CONFIG_DIR="/opt/rkn"
+ACTIVE_CONFIG="$CONFIG_DIR/config.json"
+
+if [ ! -f "$ACTIVE_CONFIG" ]; then
+  echo "enabled=false"
+  exit 0
+fi
+
+if grep -q '"tag"[[:space:]]*:[[:space:]]*"warp"' "$ACTIVE_CONFIG" \
+  && { grep -q '"final"[[:space:]]*:[[:space:]]*"warp"' "$ACTIVE_CONFIG" \
+    || grep -q '"outbound"[[:space:]]*:[[:space:]]*"warp"' "$ACTIVE_CONFIG"; }; then
+  echo "enabled=true"
+else
+  echo "enabled=false"
+fi
+'"#;
+
+    let (stdout, exit_status) = run_remote_command(sess, command)?;
+    if exit_status != 0 {
+        return Err(format!(
+            "Failed to detect whether remote runtime already uses WARP. Output: {}",
+            stdout.trim()
+        ));
+    }
+
+    Ok(stdout.lines().any(|line| line.trim() == "enabled=true"))
+}
+
+fn monitored_port_pattern() -> String {
+    EXTERNAL_PORT_CANDIDATES
+        .iter()
+        .copied()
+        .chain(INTERNAL_SS_PORT_CANDIDATES.iter().copied())
+        .map(|port| port.to_string())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn json_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn json_u16(value: Option<&Value>) -> Option<u16> {
+    value
+        .and_then(|item| item.as_u64().or_else(|| item.as_str()?.parse::<u64>().ok()))
+        .and_then(|value| u16::try_from(value).ok())
+}
+
+fn parse_endpoint(endpoint_line: &str) -> Result<(String, u16), String> {
+    let trimmed = endpoint_line.trim();
+    let (host, port) = trimmed
+        .rsplit_once(':')
+        .ok_or_else(|| format!("Invalid WARP endpoint: {}", trimmed))?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|e| format!("Invalid WARP endpoint port '{}': {}", port, e))?;
+
+    Ok((host.trim().to_string(), port))
+}
+
+fn parse_compact_warp_json(value: &Value) -> Option<RemoteWarpConfig> {
+    Some(RemoteWarpConfig {
+        private_key: json_string(value.get("private_key"))?,
+        address_v4: json_string(value.get("address_v4"))?,
+        address_v6: json_string(value.get("address_v6")).unwrap_or_default(),
+        endpoint: json_string(value.get("endpoint"))?,
+        endpoint_port: json_u16(value.get("endpoint_port"))?,
+        peer_public_key: json_string(value.get("peer_public_key"))?,
+    })
+}
+
+fn parse_wireguard_outbound_json(value: &Value) -> Option<RemoteWarpConfig> {
+    let local_addresses = value.get("local_address")?.as_array()?;
+    let address_v4 = local_addresses
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|item| item.contains('.'))?
+        .trim()
+        .to_string();
+    let address_v6 = local_addresses
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|item| item.contains(':'))
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+
+    Some(RemoteWarpConfig {
+        private_key: json_string(value.get("private_key"))?,
+        address_v4,
+        address_v6,
+        endpoint: json_string(value.get("server"))?,
+        endpoint_port: json_u16(value.get("server_port"))?,
+        peer_public_key: json_string(value.get("peer_public_key"))?,
+    })
+}
+
+fn parse_outbound_from_singbox_config(value: &Value) -> Option<RemoteWarpConfig> {
+    let outbounds = value.get("outbounds")?.as_array()?;
+    let outbound = outbounds.iter().find(|item| {
+        item.get("type").and_then(Value::as_str) == Some("wireguard")
+            && item.get("tag").and_then(Value::as_str) == Some("warp")
+    })?;
+
+    parse_wireguard_outbound_json(outbound)
+}
+
+fn parse_wgcf_profile_text(profile_text: &str) -> Result<RemoteWarpConfig, String> {
+    let mut private_key = None;
+    let mut address_line = None;
+    let mut peer_public_key = None;
+    let mut endpoint_line = None;
+    let mut in_peer_section = false;
+
+    for line in profile_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("[peer]") {
+            in_peer_section = true;
+            continue;
+        }
+
+        if trimmed.starts_with('[') {
+            in_peer_section = false;
+            continue;
+        }
+
+        let Some((raw_key, raw_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        if value.is_empty() {
+            continue;
+        }
+
+        if !in_peer_section && key.eq_ignore_ascii_case("PrivateKey") {
+            private_key = Some(value.to_string());
+        } else if !in_peer_section && key.eq_ignore_ascii_case("Address") {
+            address_line = Some(value.to_string());
+        } else if in_peer_section && key.eq_ignore_ascii_case("PublicKey") {
+            peer_public_key = Some(value.to_string());
+        } else if in_peer_section && key.eq_ignore_ascii_case("Endpoint") {
+            endpoint_line = Some(value.to_string());
+        }
+    }
+
+    let address_line =
+        address_line.ok_or_else(|| "WARP profile is missing Address.".to_string())?;
+    let mut address_parts = address_line
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let address_v4 = address_parts
+        .find(|value| value.contains('.'))
+        .ok_or_else(|| "WARP profile is missing IPv4 Address.".to_string())?
+        .to_string();
+    let address_v6 = address_line
+        .split(',')
+        .map(str::trim)
+        .find(|value| value.contains(':'))
+        .unwrap_or_default()
+        .to_string();
+    let endpoint_line =
+        endpoint_line.ok_or_else(|| "WARP profile is missing Endpoint.".to_string())?;
+    let (endpoint, endpoint_port) = parse_endpoint(&endpoint_line)?;
+
+    Ok(RemoteWarpConfig {
+        private_key: private_key
+            .ok_or_else(|| "WARP profile is missing PrivateKey.".to_string())?,
+        address_v4,
+        address_v6,
+        endpoint,
+        endpoint_port,
+        peer_public_key: peer_public_key
+            .ok_or_else(|| "WARP profile is missing Peer PublicKey.".to_string())?,
+    })
+}
+
+fn parse_local_warp_profile(profile_text: &str) -> Result<RemoteWarpConfig, String> {
+    let trimmed = profile_text.trim();
+    if trimmed.is_empty() {
+        return Err("Paste a WARP profile first.".to_string());
+    }
+
+    if trimmed.starts_with('{') {
+        let value = serde_json::from_str::<Value>(trimmed)
+            .map_err(|e| format!("Failed to parse WARP profile JSON: {}", e))?;
+        let parsed = parse_compact_warp_json(&value)
+            .or_else(|| parse_wireguard_outbound_json(&value))
+            .or_else(|| parse_outbound_from_singbox_config(&value))
+            .ok_or_else(|| {
+                "WARP JSON is unsupported. Paste either the compact RKN warp.json, a wireguard outbound object, or a sing-box config with a warp outbound."
+                    .to_string()
+            })?;
+        validate_warp_config(&parsed)?;
+        return Ok(parsed);
+    }
+
+    let parsed = parse_wgcf_profile_text(trimmed)?;
+    validate_warp_config(&parsed)?;
+    Ok(parsed)
+}
+
+fn load_remote_warp_config(sess: &Session) -> Result<Option<RemoteWarpConfig>, String> {
+    let command = r#"bash -lc '
+WARP_JSON="/opt/rkn/warp.json"
+if [ -f "$WARP_JSON" ]; then
+  cat "$WARP_JSON"
+fi
+'"#;
+
+    let (stdout, exit_status) = run_remote_command(sess, command)?;
+    if exit_status != 0 {
+        return Err(format!(
+            "Failed to read remote WARP identity. Output: {}",
+            stdout.trim()
+        ));
+    }
+
+    if stdout.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let config = serde_json::from_str::<RemoteWarpConfig>(stdout.trim())
+        .map_err(|e| format!("Failed to parse remote WARP JSON: {}", e))?;
+    validate_warp_config(&config)?;
+
+    Ok(Some(config))
+}
+
+fn upload_remote_warp_config(
+    sess: &Session,
+    config: &RemoteWarpConfig,
+) -> Result<RemoteWarpConfig, String> {
+    validate_warp_config(config)?;
+    let config_json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    let command = format!(
+        r#"bash -lc '
+mkdir -p /opt/rkn
+cat <<'"'"'EOF'"'"' > /opt/rkn/warp.json
+{config_json}
+EOF
+cat /opt/rkn/warp.json
+'"#,
+        config_json = config_json
+    );
+    let (stdout, exit_status) = run_remote_command(sess, &command)?;
+    if exit_status != 0 {
+        return Err(format!(
+            "Failed to upload remote WARP profile. Output: {}",
+            stdout.trim()
+        ));
+    }
+
+    let uploaded = serde_json::from_str::<RemoteWarpConfig>(stdout.trim())
+        .map_err(|e| format!("Failed to parse uploaded WARP JSON: {}", e))?;
+    validate_warp_config(&uploaded)?;
+
+    Ok(uploaded)
+}
+
+fn ensure_remote_warp_config(app: &AppHandle, sess: &Session) -> Result<RemoteWarpConfig, String> {
+    let _ = app.emit(
+        "tunnel-log",
+        "[SSH:WARP] Ensuring remote Cloudflare WARP identity...".to_string(),
+    );
+
+    if let Some(local_import) = load_local_warp_config_sync(app)? {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SSH:WARP] Uploading the locally imported WARP profile to the remote server."
+                .to_string(),
+        );
+        let uploaded = upload_remote_warp_config(sess, &local_import)?;
+        let _ = app.emit(
+            "tunnel-log",
+            format!(
+                "[SSH:WARP] Using imported WARP endpoint {}:{}.",
+                uploaded.endpoint, uploaded.endpoint_port
+            ),
+        );
+        return Ok(uploaded);
+    }
+
+    if let Some(existing) = load_remote_warp_config(sess)? {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SSH:WARP] Reusing the existing remote WARP identity.".to_string(),
+        );
+        let _ = app.emit(
+            "tunnel-log",
+            format!(
+                "[SSH:WARP] Using Cloudflare endpoint {}:{}.",
+                existing.endpoint, existing.endpoint_port
+            ),
+        );
+        return Ok(existing);
+    }
+
+    let command = format!(
+        r#"bash -lc '
+set -e
+
+CONFIG_DIR="/opt/rkn"
+WARP_DIR="$CONFIG_DIR/warp"
+WARP_JSON="$CONFIG_DIR/warp.json"
+WGCF_BIN="/usr/local/bin/wgcf"
+WGCF_VERSION="{wgcf_version}"
+PRIMARY_ENDPOINT_HOST="162.159.192.1"
+PRIMARY_ENDPOINT_PORT="500"
+
+trap 'echo "__ERROR__ shell failed near line $LINENO"' ERR
+
+mkdir -p "$WARP_DIR"
+
+if [ -f "$WARP_JSON" ]; then
+  echo "__STATUS__ existing"
+  cat "$WARP_JSON"
+  exit 0
+fi
+
+run_with_timeout() {{
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$@"
+  else
+    shift
+    "$@"
+  fi
+}}
+
+if [ ! -x "$WGCF_BIN" ]; then
+  echo "__STEP__ download-wgcf"
+  ARCH="$(uname -m)"
+  case "$ARCH" in
+    x86_64|amd64) WGCF_ARCH="amd64" ;;
+    aarch64|arm64) WGCF_ARCH="arm64" ;;
+    *)
+      echo "__ERROR__ unsupported architecture: $ARCH"
+      exit 1
+      ;;
+  esac
+
+  WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v$WGCF_VERSION/wgcf_${{WGCF_VERSION}}_linux_${{WGCF_ARCH}}"
+  run_with_timeout 45s curl --connect-timeout 10 --max-time 40 -fsSL "$WGCF_URL" -o "$WGCF_BIN"
+  chmod +x "$WGCF_BIN"
+fi
+
+cd "$WARP_DIR"
+rm -f wgcf-account.toml wgcf-profile.conf
+
+echo "__STEP__ register-wgcf"
+if ! run_with_timeout 45s "$WGCF_BIN" register --accept-tos >/dev/null 2>&1; then
+  printf "y\n" | run_with_timeout 45s "$WGCF_BIN" register >/dev/null 2>&1
+fi
+
+echo "__STEP__ generate-wgcf"
+run_with_timeout 45s "$WGCF_BIN" generate >/dev/null 2>&1
+
+echo "__STEP__ parse-wgcf"
+set +e
+
+if [ ! -f wgcf-profile.conf ]; then
+  echo "__ERROR__ missing wgcf-profile.conf"
+  echo "__DEBUG__"
+  ls -la "$WARP_DIR" 2>/dev/null || true
+  exit 1
+fi
+
+PRIVATE_KEY="$(awk -F'=' '/^PrivateKey[[:space:]]*=/{{
+  gsub(/[[:space:]\r]/, "", $2); print $2; exit
+}}' wgcf-profile.conf || true)"
+ADDRESS_LINE="$(awk -F'=' '/^Address[[:space:]]*=/{{
+  gsub(/[[:space:]\r]/, "", $2); print $2
+}}' wgcf-profile.conf | paste -sd',' - || true)"
+PEER_PUBLIC_KEY="$(awk -F'=' 'BEGIN{{peer=0}} /^\[Peer\]$/{{peer=1; next}} peer && /^PublicKey[[:space:]]*=/{{
+  gsub(/[[:space:]\r]/, "", $2); print $2; exit
+}}' wgcf-profile.conf || true)"
+ENDPOINT_LINE="$(awk -F'=' 'BEGIN{{peer=0}} /^\[Peer\]$/{{peer=1; next}} peer && /^Endpoint[[:space:]]*=/{{
+  gsub(/[[:space:]\r]/, "", $2); print $2; exit
+}}' wgcf-profile.conf || true)"
+
+IFS=',' read -r ADDRESS_V4 ADDRESS_V6 _ <<< "$ADDRESS_LINE" || true
+ADDRESS_V4="${{ADDRESS_V4:-}}"
+ADDRESS_V6="${{ADDRESS_V6:-}}"
+
+if [[ "$ENDPOINT_LINE" == *:* ]]; then
+  ENDPOINT_HOST="${{ENDPOINT_LINE%:*}}"
+  ENDPOINT_PORT="${{ENDPOINT_LINE##*:}}"
+else
+  ENDPOINT_HOST=""
+  ENDPOINT_PORT=""
+fi
+
+if [ -z "$ENDPOINT_HOST" ] || [ -z "$ENDPOINT_PORT" ] || [ "$ENDPOINT_HOST" = "$ENDPOINT_LINE" ]; then
+  ENDPOINT_HOST="$PRIMARY_ENDPOINT_HOST"
+  ENDPOINT_PORT="$PRIMARY_ENDPOINT_PORT"
+fi
+
+if [ -z "$PRIVATE_KEY" ] || [ -z "$ADDRESS_V4" ] || [ -z "$PEER_PUBLIC_KEY" ]; then
+  echo "__ERROR__ failed to parse wgcf-profile.conf"
+  echo "__DEBUG__"
+  sed -n '1,120p' wgcf-profile.conf 2>/dev/null || true
+  exit 1
+fi
+
+set -e
+
+cat > "$WARP_JSON" <<EOF
+{{
+  "private_key": "$PRIVATE_KEY",
+  "address_v4": "$ADDRESS_V4",
+  "address_v6": "$ADDRESS_V6",
+  "endpoint": "$ENDPOINT_HOST",
+  "endpoint_port": $ENDPOINT_PORT,
+  "peer_public_key": "$PEER_PUBLIC_KEY"
+}}
+EOF
+
+echo "__STATUS__ created"
+cat "$WARP_JSON"
+'"#,
+        wgcf_version = WGCF_VERSION
+    );
+
+    let (stdout, exit_status) = run_remote_command(sess, &command)?;
+    if exit_status != 0 {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SSH:WARP] Automatic remote WARP bootstrap failed. Falling back to the bundled validated WARP profile."
+                .to_string(),
+        );
+        let fallback = bundled_fallback_warp_config();
+        let uploaded = upload_remote_warp_config(sess, &fallback)?;
+        let _ = app.emit(
+            "tunnel-log",
+            format!(
+                "[SSH:WARP] Using bundled fallback WARP endpoint {}:{}.",
+                uploaded.endpoint, uploaded.endpoint_port
+            ),
+        );
+        return Ok(uploaded);
+    }
+
+    let mut lines = stdout.lines();
+    let status_line = lines.next().unwrap_or_default().trim().to_string();
+    let json_payload = lines.collect::<Vec<_>>().join("\n");
+    let warp = serde_json::from_str::<RemoteWarpConfig>(json_payload.trim()).map_err(|e| {
+        format!(
+            "Failed to parse remote WARP bootstrap JSON: {}. Output: {}",
+            e,
+            stdout.trim()
+        )
+    })?;
+
+    let human_status = if status_line == "__STATUS__ existing" {
+        "Reusing existing remote WARP identity."
+    } else {
+        "Created a fresh remote WARP identity."
+    };
+    let _ = app.emit("tunnel-log", format!("[SSH:WARP] {}", human_status));
+    let _ = app.emit(
+        "tunnel-log",
+        format!(
+            "[SSH:WARP] Using Cloudflare endpoint {}:{}.",
+            warp.endpoint, warp.endpoint_port
+        ),
+    );
+
+    Ok(warp)
 }
 
 fn load_remote_transport_bootstrap(
@@ -212,6 +1516,58 @@ exit 0
     Ok(None)
 }
 
+fn extract_invite_payload_segment(invite_link: &str) -> &str {
+    let trimmed = invite_link.trim();
+
+    if let Some(payload) = trimmed.strip_prefix("rkn://invite/") {
+        return payload.trim();
+    }
+
+    if let Some(payload) = trimmed.strip_prefix("rkn-invite:") {
+        return payload.trim();
+    }
+
+    if let Some(payload) = trimmed.strip_prefix("rkn://invite?data=") {
+        return payload.trim();
+    }
+
+    if let Some(index) = trimmed.find("data=") {
+        return trimmed[(index + 5)..].trim();
+    }
+
+    trimmed
+}
+
+fn parse_invite_link_payload(invite_link: &str) -> Result<InviteLinkPayload, String> {
+    let payload_segment = extract_invite_payload_segment(invite_link);
+    if payload_segment.is_empty() {
+        return Err("Invite link is empty.".to_string());
+    }
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(payload_segment)
+        .map_err(|e| format!("Failed to decode invite link payload: {}", e))?;
+    let payload = serde_json::from_slice::<InviteLinkPayload>(&payload_bytes)
+        .map_err(|e| format!("Failed to parse invite link payload JSON: {}", e))?;
+
+    if payload.version != 1 {
+        return Err(format!(
+            "Unsupported invite link version: {}",
+            payload.version
+        ));
+    }
+
+    if payload.host.trim().is_empty()
+        || payload.cover_domain.trim().is_empty()
+        || payload.shadow_pass.trim().is_empty()
+        || payload.ss_password.trim().is_empty()
+    {
+        return Err("Invite link payload is incomplete.".to_string());
+    }
+
+    Ok(payload)
+}
+
 fn verify_external_port_reachable(host: &str, external_port: u16) -> Result<(), String> {
     let address = format!("{}:{}", host, external_port);
     let mut resolved_addrs = address
@@ -261,6 +1617,8 @@ fn connect_tcp_with_timeout(addrs: &[SocketAddr]) -> Result<TcpStream, String> {
         match TcpStream::connect_timeout(addr, SSH_CONNECT_TIMEOUT) {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
+                let _ = stream.set_read_timeout(Some(SSH_SESSION_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(SSH_SESSION_TIMEOUT));
                 return Ok(stream);
             }
             Err(err) => {
@@ -298,6 +1656,7 @@ fn connect_ssh_session(
     emit_ssh_stage(app, "HANDSHAKE", "TCP connected. Starting SSH handshake...");
 
     let mut sess = Session::new().map_err(|e| e.to_string())?;
+    sess.set_timeout(SSH_SESSION_TIMEOUT.as_millis() as u32);
     sess.set_tcp_stream(tcp);
     sess.handshake()
         .map_err(|e| format!("SSH handshake failed: {}", e))?;
@@ -347,16 +1706,43 @@ fn validate_remote_runtime(
     sess: &Session,
     container_name: &str,
     external_port: u16,
+    internal_ss_port: u16,
 ) -> Result<(), String> {
     let command = format!(
         r#"bash -lc '
-docker inspect -f "{{{{.State.Running}}}}" "{container_name}" | grep -q true &&
-ss -ltn | grep -q ":{external_port} " &&
-ss -ltn | grep -q "127.0.0.1:{internal_ss_port} "
+set -e
+
+running="$(docker inspect -f "{{{{.State.Running}}}}" "{container_name}" 2>/dev/null || echo false)"
+if [ "$running" != "true" ]; then
+  echo "container_running=$running"
+  echo "[docker_inspect]"
+  docker inspect "{container_name}" 2>&1 || true
+  echo "[docker_logs]"
+  docker logs --tail 40 "{container_name}" 2>&1 || true
+  exit 1
+fi
+
+socket_dump="$(ss -ltnup 2>&1 || true)"
+echo "[ss]"
+echo "$socket_dump"
+
+echo "$socket_dump" | grep -Eq ":{external_port}\b" || {{
+  echo "[error] external port {external_port} is not listening"
+  echo "[docker_logs]"
+  docker logs --tail 40 "{container_name}" 2>&1 || true
+  exit 1
+}}
+
+echo "$socket_dump" | grep -Eq ":{internal_ss_port}\b" || {{
+  echo "[error] internal Shadowsocks port {internal_ss_port} is not listening"
+  echo "[docker_logs]"
+  docker logs --tail 40 "{container_name}" 2>&1 || true
+  exit 1
+}}
 '"#,
         container_name = container_name,
         external_port = external_port,
-        internal_ss_port = crate::generator::INTERNAL_SS_PORT
+        internal_ss_port = internal_ss_port
     );
 
     let (stdout, exit_status) = run_remote_command(sess, &command)?;
@@ -371,6 +1757,117 @@ ss -ltn | grep -q "127.0.0.1:{internal_ss_port} "
             stdout.trim()
         ))
     }
+}
+
+fn summarize_runtime_validation_error(error: &str) -> String {
+    if let Some(summary) = error.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[error]") || trimmed.starts_with("container_running=") {
+            Some(trimmed.to_string())
+        } else if trimmed.contains("bind: address already in use") {
+            Some("internal Shadowsocks port is already in use on the host".to_string())
+        } else {
+            None
+        }
+    }) {
+        return summary;
+    }
+
+    "remote runtime validation failed".to_string()
+}
+
+fn summarize_server_status_output(stdout: &str) -> Vec<String> {
+    let mut summary = Vec::new();
+    let running = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("running="))
+        .map(|line| line.contains("running=true"))
+        .unwrap_or(false);
+    let warp_enabled = stdout.contains(r#""tag": "warp""#)
+        && (stdout.contains(r#""final": "warp""#) || stdout.contains(r#""outbound": "warp""#));
+    let fatal_count = stdout.matches("FATAL").count();
+    let hmac_mismatch_count = stdout
+        .matches("client hello verify failed: hmac mismatch")
+        .count();
+    let unexpected_session_count = stdout
+        .matches("client hello verify failed: unexpected session id length")
+        .count();
+    let unexpected_eof_count = stdout
+        .matches("read client handshake: unexpected EOF")
+        .count();
+    let handshake_response_count = stdout.matches("received handshake response").count();
+    let wireguard_retry_count = stdout
+        .matches("retrying handshake because we stopped hearing back after 15 seconds")
+        .count();
+    let known_service_matches = [
+        ("docker sing-box", stdout.matches("sing-box").count()),
+        ("xray", stdout.matches("xray").count()),
+        ("nginx", stdout.matches("nginx").count()),
+        ("tailscaled", stdout.matches("tailscaled").count()),
+        ("hysteria", stdout.matches("hysteria").count()),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .map(|(name, _)| name)
+    .collect::<Vec<_>>();
+
+    if running {
+        summary.push("Runtime health: container is running.".to_string());
+    } else {
+        summary.push(
+            "Runtime health: container health could not be confirmed from this snapshot."
+                .to_string(),
+        );
+    }
+
+    if warp_enabled {
+        summary.push("WARP routing: enabled in the active server config.".to_string());
+    } else {
+        summary.push("WARP routing: not detected in the active server config.".to_string());
+    }
+
+    if handshake_response_count > 0 {
+        summary.push(format!(
+            "WARP peer health: received {} successful WireGuard handshake response(s) in the recent log window.",
+            handshake_response_count
+        ));
+    }
+
+    if wireguard_retry_count > 0 && handshake_response_count > 0 {
+        summary.push(
+            "WARP peer keepalive: retries are present, but the peer still answers. This is usually acceptable while traffic is flowing."
+                .to_string(),
+        );
+    }
+
+    if fatal_count > 0 {
+        summary.push(format!(
+            "Recent server log severity: {} fatal event(s) detected in the current status window.",
+            fatal_count
+        ));
+    }
+
+    let transport_noise_count =
+        hmac_mismatch_count + unexpected_session_count + unexpected_eof_count;
+    if transport_noise_count > 0 && fatal_count == 0 {
+        summary.push(format!(
+            "ShadowTLS noise: {} external handshake mismatch / scan event(s) seen recently. These warnings are usually background internet noise unless the client itself is failing.",
+            transport_noise_count
+        ));
+    }
+
+    if !known_service_matches.is_empty() {
+        summary.push(format!(
+            "Coexistence snapshot: detected other network services alongside RKN: {}.",
+            known_service_matches.join(", ")
+        ));
+    }
+
+    if summary.is_empty() {
+        summary.push("Server status summary is unavailable for this response.".to_string());
+    }
+
+    summary
 }
 
 fn stream_remote_deploy_output(
@@ -394,7 +1891,7 @@ fn stream_remote_deploy_output(
                     let _ = channel.close();
                     sess.set_blocking(true);
                     return Err(format!(
-                        "Remote deploy stalled: no output for more than {:?}",
+                        "Remote deploy stalled: no output for more than {:?}. The server may still be finishing container startup. Please try Update once more.",
                         REMOTE_DEPLOY_STALL_TIMEOUT
                     ));
                 }
@@ -415,7 +1912,7 @@ fn stream_remote_deploy_output(
                     let _ = channel.close();
                     sess.set_blocking(true);
                     return Err(format!(
-                        "Remote deploy stalled: no output for more than {:?}",
+                        "Remote deploy stalled: no output for more than {:?}. The server may still be finishing container startup. Please try Update once more.",
                         REMOTE_DEPLOY_STALL_TIMEOUT
                     ));
                 }
@@ -442,6 +1939,11 @@ fn select_remote_deploy_target(
         .map(u16::to_string)
         .collect::<Vec<_>>()
         .join(" ");
+    let internal_candidates = INTERNAL_SS_PORT_CANDIDATES
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
     let generated_container_name = build_container_name(short_id);
 
     let command = format!(
@@ -450,6 +1952,8 @@ CONFIG_DIR="/opt/rkn"
 ACTIVE_CONTAINER_FILE="$CONFIG_DIR/container_name"
 PREVIOUS_CONTAINER=""
 PRIMARY_PORT="{primary_port}"
+SELECTED_PORT=""
+INTERNAL_PORT=""
 
 if command -v docker >/dev/null 2>&1; then
   if [ -f "$ACTIVE_CONTAINER_FILE" ]; then
@@ -463,39 +1967,56 @@ if command -v docker >/dev/null 2>&1; then
   if [ -n "$PREVIOUS_CONTAINER" ] && docker inspect "$PREVIOUS_CONTAINER" >/dev/null 2>&1; then
     CURRENT_PORT="$(grep -m1 '"'"'"listen_port"'"'"' "$CONFIG_DIR/config.json" | sed -E '"'"'s/[^0-9]*([0-9]+).*/\1/'"'"' || true)"
     if [ "$CURRENT_PORT" != "$PRIMARY_PORT" ] && ! ss -Htanl "( sport = :$PRIMARY_PORT )" | grep -q .; then
+      SELECTED_PORT="$PRIMARY_PORT"
       echo "port=$PRIMARY_PORT"
       echo "container=$PREVIOUS_CONTAINER"
       echo "reuse=true"
       echo "migrate_primary=true"
-      exit 0
-    fi
-
-    for candidate in {candidates}; do
+    else
+      for candidate in {candidates}; do
       if [ "$candidate" = "$CURRENT_PORT" ]; then
+        SELECTED_PORT="$CURRENT_PORT"
         echo "port=$CURRENT_PORT"
         echo "container=$PREVIOUS_CONTAINER"
         echo "reuse=true"
         echo "migrate_primary=false"
-        exit 0
+        break
       fi
-    done
+      done
+    fi
   fi
 fi
 
-for port in {candidates}; do
+if [ -z "$SELECTED_PORT" ]; then
+  for port in {candidates}; do
+    if ! ss -Htanl "( sport = :$port )" | grep -q .; then
+      SELECTED_PORT="$port"
+      echo "port=$port"
+      echo "container={generated_container_name}"
+      echo "reuse=false"
+      echo "migrate_primary=false"
+      break
+    fi
+  done
+fi
+
+for port in {internal_candidates}; do
   if ! ss -Htanl "( sport = :$port )" | grep -q .; then
-    echo "port=$port"
-    echo "container={generated_container_name}"
-    echo "reuse=false"
-    echo "migrate_primary=false"
-    exit 0
+    INTERNAL_PORT="$port"
+    break
   fi
 done
 
-exit 1
+if [ -z "$SELECTED_PORT" ] || [ -z "$INTERNAL_PORT" ]; then
+  exit 1
+fi
+
+echo "internal_port=$INTERNAL_PORT"
+exit 0
 '"#,
         legacy_container_name = LEGACY_CONTAINER_NAME,
         candidates = candidates,
+        internal_candidates = internal_candidates,
         generated_container_name = generated_container_name,
         primary_port = PRIMARY_EXTERNAL_PORT
     );
@@ -510,6 +2031,7 @@ exit 1
     }
 
     let mut selected_port = None;
+    let mut selected_internal_port = None;
     let mut selected_container_name = None;
     let mut reusing_existing_instance = false;
     let mut migrating_to_primary_port = false;
@@ -517,6 +2039,8 @@ exit 1
     for line in stdout.lines() {
         if let Some(value) = line.trim().strip_prefix("port=") {
             selected_port = value.trim().parse::<u16>().ok();
+        } else if let Some(value) = line.trim().strip_prefix("internal_port=") {
+            selected_internal_port = value.trim().parse::<u16>().ok();
         } else if let Some(value) = line.trim().strip_prefix("container=") {
             if !value.trim().is_empty() {
                 selected_container_name = Some(value.trim().to_string());
@@ -534,10 +2058,17 @@ exit 1
             stdout
         )
     })?;
+    let internal_ss_port = selected_internal_port.ok_or_else(|| {
+        format!(
+            "Failed to parse remote selected internal SS port from output: {}",
+            stdout
+        )
+    })?;
     let container_name = selected_container_name.unwrap_or_else(|| build_container_name(short_id));
 
     Ok(RemoteDeployTarget {
         external_port,
+        internal_ss_port,
         container_name,
         reusing_existing_instance,
         migrating_to_primary_port,
@@ -550,7 +2081,7 @@ pub async fn deploy_server(
     host: String,
     user: String,
     pass: String,
-) -> Result<(), String> {
+) -> Result<TransportStateSnapshot, String> {
     let local_data = app
         .path()
         .app_local_data_dir()
@@ -570,6 +2101,7 @@ pub async fn deploy_server(
         let pass = pass.clone();
         let local_data = local_data.clone();
         move || -> Result<Option<RemoteTransportBootstrap>, String> {
+            let _mutation_guard = acquire_remote_mutation_lock()?;
             let _ = app.emit(
                 "tunnel-log",
                 format!("--- [SSH] Connecting to {}:22 ---", host),
@@ -626,15 +2158,66 @@ pub async fn deploy_server(
                 ),
             );
 
-            validate_remote_runtime(&sess, &container_name, remote_bootstrap.external_port)?;
-            verify_external_port_reachable(&host, remote_bootstrap.external_port)?;
+            if let Some(remote_image) = load_remote_container_image(&sess, &container_name)? {
+                if remote_image != PINNED_SING_BOX_IMAGE {
+                    let _ = app.emit(
+                        "tunnel-log",
+                        format!(
+                            "[SSH WARN] Existing RKN runtime uses server image {} but this build pins {}. Falling back to a fresh deploy to migrate the server runtime.",
+                            remote_image, PINNED_SING_BOX_IMAGE
+                        ),
+                    );
+                    return Ok(None);
+                }
+            }
 
+            if !remote_runtime_uses_warp(&sess)? {
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Existing RKN runtime still uses the previous server routing. Refreshing it now so this server matches the current WARP-backed transport.".to_string(),
+                );
+                return Ok(None);
+            }
+
+            if let Err(error) =
+                validate_remote_runtime(
+                    &sess,
+                    &container_name,
+                    remote_bootstrap.external_port,
+                    remote_bootstrap.internal_ss_port,
+                )
+            {
+                let summary = summarize_runtime_validation_error(&error);
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SSH WARN] Existing transport metadata was found, but the active runtime is unhealthy. Falling back to a fresh deploy. {}.",
+                        summary
+                    ),
+                );
+                return Ok(None);
+            }
+
+            if let Err(error) = verify_external_port_reachable(&host, remote_bootstrap.external_port)
+            {
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SSH WARN] Existing transport metadata was found, but the external port is not reachable from this client. Falling back to a fresh deploy. Details: {}",
+                        error
+                    ),
+                );
+                return Ok(None);
+            }
+
+            let local_rule_sets = ensure_local_client_rule_sets_sync(&app)?;
             let client_cfg = crate::generator::build_client_config(
                 &host,
                 &remote_bootstrap.shadow_pass,
                 &remote_bootstrap.ss_password,
                 remote_bootstrap.external_port,
                 &remote_bootstrap.cover_domain,
+                &local_rule_sets,
             );
 
             std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
@@ -668,8 +2251,13 @@ pub async fn deploy_server(
     .await
     .unwrap()?;
 
-    if attach_result.is_some() {
-        return Ok(());
+    if let Some(remote_bootstrap) = attach_result {
+        crate::restart_tunnel_if_running(
+            &app,
+            "Tunnel config changed after attaching to the existing server. Restarting core to apply the updated client config.",
+        )
+        .await?;
+        return Ok(snapshot_for_cover_domain(remote_bootstrap.cover_domain));
     }
 
     let _ = app.emit(
@@ -683,9 +2271,13 @@ pub async fn deploy_server(
     let shadow_pass = crate::generator::generate_shadowtls_password(&app)
         .await
         .map_err(|e| format!("ShadowTLS password error: {}", e))?;
-    let ss_password = crate::generator::generate_ss_password(&app)
+    let ss_server_password = crate::generator::generate_ss_password(&app)
         .await
-        .map_err(|e| format!("Shadowsocks password error: {}", e))?;
+        .map_err(|e| format!("Shadowsocks server password error: {}", e))?;
+    let ss_user_password = crate::generator::generate_ss_password(&app)
+        .await
+        .map_err(|e| format!("Shadowsocks user password error: {}", e))?;
+    let ss_password = compose_multi_user_ss_password(&ss_server_password, &ss_user_password);
 
     let _ = app.emit(
         "tunnel-log",
@@ -695,18 +2287,21 @@ pub async fn deploy_server(
         ),
     );
 
-    tauri::async_runtime::spawn_blocking(move || {
-        let _ = app.emit(
+    let deploy_app = app.clone();
+    let deploy_snapshot = tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = acquire_remote_mutation_lock()?;
+        let _ = deploy_app.emit(
             "tunnel-log",
             format!("--- [SSH] Connecting to {}:22 ---", host),
         );
 
-        let sess = connect_ssh_session(&app, &host, &user, &pass)?;
-        emit_ssh_stage(&app, "AUTH", "Authenticated successfully.");
-        emit_ssh_stage(&app, "PREFLIGHT", "Running remote pre-flight checks for deploy target...");
+        let sess = connect_ssh_session(&deploy_app, &host, &user, &pass)?;
+        emit_ssh_stage(&deploy_app, "AUTH", "Authenticated successfully.");
+        emit_ssh_stage(&deploy_app, "PREFLIGHT", "Running remote pre-flight checks for deploy target...");
 
         let deploy_target = select_remote_deploy_target(&sess, &short_id)?;
         let external_port = deploy_target.external_port;
+        let internal_ss_port = deploy_target.internal_ss_port;
         let container_name = deploy_target.container_name;
 
         if deploy_target.reusing_existing_instance {
@@ -721,9 +2316,9 @@ pub async fn deploy_server(
                     container_name, external_port
                 )
             };
-            let _ = app.emit("tunnel-log", message);
+            let _ = deploy_app.emit("tunnel-log", message);
         } else if external_port == PRIMARY_EXTERNAL_PORT {
-            let _ = app.emit(
+            let _ = deploy_app.emit(
                 "tunnel-log",
                 format!(
                     "[SSH] Preferred external port {} is available on remote host.",
@@ -731,7 +2326,7 @@ pub async fn deploy_server(
                 ),
             );
         } else {
-            let _ = app.emit(
+            let _ = deploy_app.emit(
                 "tunnel-log",
                 format!(
                     "[SSH WARN] Preferred external port {} is busy. Falling back to external port {}.",
@@ -740,7 +2335,7 @@ pub async fn deploy_server(
             );
         }
 
-        let _ = app.emit(
+        let _ = deploy_app.emit(
             "tunnel-log",
             format!(
                 "[SSH] Selected pinned image {} and container name {}.",
@@ -750,24 +2345,47 @@ pub async fn deploy_server(
 
         let deploy_script = include_str!("../scripts/deploy.sh");
         let cover_domain = crate::generator::select_cover_domain(&short_id);
-        let _ = app.emit(
+        let _ = deploy_app.emit(
             "tunnel-log",
             format!("[SSH] ShadowTLS cover domain: {}", cover_domain),
         );
-        let server_cfg =
-            crate::generator::build_server_config(&host, &shadow_pass, &ss_password, external_port, cover_domain);
-        let client_cfg =
-            crate::generator::build_client_config(&host, &shadow_pass, &ss_password, external_port, cover_domain);
+        let warp_config = ensure_remote_warp_config(&deploy_app, &sess)?;
+        let server_cfg = crate::generator::build_server_config_with_invites(
+            crate::generator::ServerConfigParams {
+                master_shadow_pass: &shadow_pass,
+                ss_server_password: &ss_server_password,
+                master_ss_user_password: &ss_user_password,
+                external_port,
+                internal_ss_port,
+                cover_domain,
+                fallback_cover_domains: &[],
+                issued_invites: &[],
+                warp: &warp_config,
+            },
+        );
+        let local_rule_sets = ensure_local_client_rule_sets_sync(&deploy_app)?;
+        let client_cfg = crate::generator::build_client_config(
+            &host,
+            &shadow_pass,
+            &ss_password,
+            external_port,
+            cover_domain,
+            &local_rule_sets,
+        );
         let bootstrap_cfg = json!({
             "external_port": external_port,
+            "internal_ss_port": internal_ss_port,
             "cover_domain": cover_domain,
+            "fallback_cover_domains": [],
             "shadow_pass": shadow_pass,
-            "ss_password": ss_password
+            "ss_password": ss_password,
+            "ss_server_password": ss_server_password,
+            "issued_invites": []
         })
         .to_string();
 
         emit_ssh_stage(
-            &app,
+            &deploy_app,
             "DEPLOY",
             format!("Deploying transport on external port {}...", external_port),
         );
@@ -790,16 +2408,16 @@ BOOTSTRAPEOF
             PINNED_SING_BOX_IMAGE, container_name, server_cfg, bootstrap_cfg, deploy_script
         );
 
-        emit_ssh_stage(&app, "UPLOAD", "Uploading generated config and deploy script...");
+        emit_ssh_stage(&deploy_app, "UPLOAD", "Uploading generated config and deploy script...");
         let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
-        emit_ssh_stage(&app, "DEPLOY", "Executing remote fast-deploy script...");
+        emit_ssh_stage(&deploy_app, "DEPLOY", "Executing remote fast-deploy script...");
         channel.exec("bash -s 2>&1").map_err(|e| e.to_string())?;
 
         channel
             .write_all(injected_script.as_bytes())
             .map_err(|e| e.to_string())?;
         channel.send_eof().map_err(|e| e.to_string())?;
-        stream_remote_deploy_output(&app, &sess, &mut channel)?;
+        stream_remote_deploy_output(&deploy_app, &sess, &mut channel)?;
 
         channel
             .wait_close()
@@ -809,7 +2427,7 @@ BOOTSTRAPEOF
             .map_err(|e| format!("Failed to read remote deploy exit status: {}", e))?;
 
         if exit_status != 0 {
-            let _ = app.emit(
+            let _ = deploy_app.emit(
                 "tunnel-log",
                 format!("[SSH ERROR] Deployment failed with code: {}", exit_status),
             );
@@ -817,17 +2435,17 @@ BOOTSTRAPEOF
         }
 
         emit_ssh_stage(
-            &app,
+            &deploy_app,
             "VALIDATE",
             format!(
                 "Remote deploy finished. Validating container {} and ports...",
                 container_name
             ),
         );
-        validate_remote_runtime(&sess, &container_name, external_port)?;
+        validate_remote_runtime(&sess, &container_name, external_port, internal_ss_port)?;
 
         emit_ssh_stage(
-            &app,
+            &deploy_app,
             "VALIDATE",
             format!(
                 "Remote runtime looks healthy. Verifying external port {} from this client...",
@@ -837,7 +2455,7 @@ BOOTSTRAPEOF
         verify_external_port_reachable(&host, external_port)?;
 
         emit_ssh_stage(
-            &app,
+            &deploy_app,
             "VALIDATE",
             format!("External port {} is reachable from this client.", external_port),
         );
@@ -845,31 +2463,39 @@ BOOTSTRAPEOF
         std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
         let client_cfg_path = local_data.join("client_config.json");
         std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
-        save_server_profile(&app, &saved_profile)?;
-        crate::refresh_tray_toggle_item(&app);
+        save_server_profile(&deploy_app, &saved_profile)?;
+        crate::refresh_tray_toggle_item(&deploy_app);
 
-        let _ = app.emit(
+        let _ = deploy_app.emit(
             "tunnel-log",
             format!(
                 "[SYSTEM] Client config safely generated at: {:?}",
                 client_cfg_path
             ),
         );
-        let _ = app.emit(
+        let _ = deploy_app.emit(
             "tunnel-log",
             format!(
                 "[SSH] Deployment finished successfully! External port: {}",
                 external_port
             ),
         );
-        let _ = app.emit(
+        let _ = deploy_app.emit(
             "tunnel-log",
             "[SYSTEM] Server credentials saved locally for next launch.".to_string(),
         );
-        Ok(())
+        Ok(snapshot_for_cover_domain(cover_domain))
     })
     .await
-    .unwrap()
+    .unwrap()?;
+
+    crate::restart_tunnel_if_running(
+        &app,
+        "Tunnel config changed after deploy. Restarting core to apply the updated client config.",
+    )
+    .await?;
+
+    Ok(deploy_snapshot)
 }
 
 #[tauri::command]
@@ -888,9 +2514,232 @@ pub fn load_saved_server_profile(app: AppHandle) -> Result<Option<SavedServerPro
 }
 
 #[tauri::command]
+pub fn get_local_warp_profile_status(app: AppHandle) -> Result<LocalWarpProfileStatus, String> {
+    let config = load_local_warp_config_sync(&app)?;
+    Ok(warp_status_from_config(config.as_ref()))
+}
+
+#[tauri::command]
+pub fn import_local_warp_profile(
+    app: AppHandle,
+    profile_text: String,
+) -> Result<LocalWarpProfileStatus, String> {
+    let config = parse_local_warp_profile(&profile_text)?;
+    save_local_warp_config_sync(&app, &config)?;
+    Ok(warp_status_from_config(Some(&config)))
+}
+
+#[tauri::command]
+pub fn bootstrap_local_warp_profile(app: AppHandle) -> Result<LocalWarpProfileStatus, String> {
+    let profile = load_saved_server_profile(app.clone())?.ok_or_else(|| {
+        "Saved server profile not found. Deploy or attach a server first.".to_string()
+    })?;
+
+    bootstrap_local_warp_profile_from_profile(app, profile)
+}
+
+#[tauri::command]
+pub fn bootstrap_local_warp_profile_from_credentials(
+    app: AppHandle,
+    host: String,
+    user: String,
+    password: String,
+) -> Result<LocalWarpProfileStatus, String> {
+    bootstrap_local_warp_profile_from_profile(
+        app,
+        SavedServerProfile {
+            host,
+            user,
+            password,
+        },
+    )
+}
+
+fn bootstrap_local_warp_profile_from_profile(
+    app: AppHandle,
+    profile: SavedServerProfile,
+) -> Result<LocalWarpProfileStatus, String> {
+    let warp = tauri::async_runtime::block_on(tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        move || -> Result<RemoteWarpConfig, String> {
+            let sess = connect_ssh_session(&app, &profile.host, &profile.user, &profile.password)?;
+            ensure_remote_warp_config(&app, &sess)
+        }
+    }))
+    .map_err(|error| error.to_string())??;
+
+    save_local_warp_config_sync(&app, &warp)?;
+
+    let _ = app.emit(
+        "tunnel-log",
+        format!(
+            "[SYSTEM] Local WARP profile created from the current server and saved on this Mac ({}:{}).",
+            warp.endpoint, warp.endpoint_port
+        ),
+    );
+
+    Ok(warp_status_from_config(Some(&warp)))
+}
+
+#[tauri::command]
+pub fn clear_local_warp_profile(app: AppHandle) -> Result<(), String> {
+    clear_local_warp_profile_sync(&app)
+}
+
+#[tauri::command]
+pub async fn get_transport_state_snapshot(
+    app: AppHandle,
+) -> Result<TransportStateSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || load_transport_state_snapshot_sync(&app))
+        .await
+        .unwrap()
+}
+
+#[tauri::command]
+pub async fn generate_invite_link(app: AppHandle) -> Result<GeneratedInviteLinkResult, String> {
+    let profile = load_saved_server_profile(app.clone())?
+        .ok_or_else(|| "Saved server profile not found. Deploy once first.".to_string())?;
+    let invite_app = app.clone();
+
+    let result = tauri::async_runtime::spawn_blocking(
+        move || -> Result<GeneratedInviteLinkResult, String> {
+            let sess =
+                connect_ssh_session(&invite_app, &profile.host, &profile.user, &profile.password)?;
+            let remote_bootstrap = load_remote_transport_bootstrap(&sess)?.ok_or_else(|| {
+                "Remote transport bootstrap not found. Deploy the server first.".to_string()
+            })?;
+            let generated_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs();
+            let invite_id = issue_invite_id()?;
+            let invite_shadow_pass = tauri::async_runtime::block_on(
+                crate::generator::generate_shadowtls_password(&invite_app),
+            )?;
+            let invite_ss_user_password = tauri::async_runtime::block_on(
+                crate::generator::generate_ss_password(&invite_app),
+            )?;
+            let (ss_server_password, _, _) =
+                resolve_master_ss_transport(&invite_app, &remote_bootstrap)?;
+            let invite_ss_password =
+                compose_multi_user_ss_password(&ss_server_password, &invite_ss_user_password);
+            let invite_host = profile.host.clone();
+            let invite_cover_domain = remote_bootstrap.cover_domain.clone();
+
+            let payload = InviteLinkPayload {
+                version: 1,
+                invite_id: invite_id.clone(),
+                host: invite_host.clone(),
+                external_port: remote_bootstrap.external_port,
+                cover_domain: invite_cover_domain.clone(),
+                shadow_pass: invite_shadow_pass.clone(),
+                ss_password: invite_ss_password,
+                generated_at,
+            };
+            let payload_json =
+                serde_json::to_vec(&payload).map_err(|e| format!("Invite payload error: {}", e))?;
+            let encoded = URL_SAFE_NO_PAD.encode(payload_json);
+            let link = format!("rkn://invite/{}", encoded);
+
+            let mut records = load_issued_invite_records(&invite_app)?;
+            records.insert(
+                0,
+                StoredInviteLinkRecord {
+                    id: invite_id,
+                    link: link.clone(),
+                    host: invite_host,
+                    cover_domain: invite_cover_domain,
+                    generated_at,
+                    shadow_pass: invite_shadow_pass,
+                    ss_user_password: invite_ss_user_password,
+                },
+            );
+            save_issued_invite_records(&invite_app, &records)?;
+
+            Ok(GeneratedInviteLinkResult { link })
+        },
+    )
+    .await
+    .unwrap()?;
+
+    schedule_invite_remote_sync(
+        &app,
+        "Applying the latest invite changes on the server in the background.",
+    );
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn import_invite_link(
+    app: AppHandle,
+    invite_link: String,
+) -> Result<InviteImportResult, String> {
+    if load_saved_server_profile(app.clone())?.is_some() {
+        return Err(
+            "This app already has master access for a server. Reset local data before importing an invite link here."
+                .to_string(),
+        );
+    }
+
+    let local_data = app
+        .path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+
+    let result = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        move || -> Result<InviteImportResult, String> {
+            let payload = parse_invite_link_payload(&invite_link)?;
+            let local_rule_sets = ensure_local_client_rule_sets_sync(&app)?;
+            let client_cfg = crate::generator::build_client_config(
+                &payload.host,
+                &payload.shadow_pass,
+                &payload.ss_password,
+                payload.external_port,
+                &payload.cover_domain,
+                &local_rule_sets,
+            );
+
+            std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
+            let client_cfg_path = local_data.join("client_config.json");
+            std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
+            remove_saved_server_profile(&app)?;
+            clear_issued_invites(&app)?;
+            clear_local_warp_profile_sync(&app)?;
+            crate::refresh_tray_toggle_item(&app);
+
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SYSTEM] Invite link imported successfully. Client config updated at: {:?}",
+                    client_cfg_path
+                ),
+            );
+
+            Ok(InviteImportResult {
+                host: payload.host,
+                cover_domain: payload.cover_domain,
+            })
+        }
+    })
+    .await
+    .unwrap()?;
+
+    crate::restart_tunnel_if_running(
+        &app,
+        "Tunnel config changed after importing an invite link. Restarting core to apply the updated client config.",
+    )
+    .await?;
+
+    Ok(result)
+}
+
+#[tauri::command]
 pub async fn check_server_status(app: AppHandle) -> Result<String, String> {
     let profile = load_saved_server_profile(app.clone())?
         .ok_or_else(|| "Saved server profile not found. Deploy once first.".to_string())?;
+    let monitored_ports = monitored_port_pattern();
 
     tauri::async_runtime::spawn_blocking(move || {
         let _ = app.emit(
@@ -901,21 +2750,24 @@ pub async fn check_server_status(app: AppHandle) -> Result<String, String> {
         let sess = connect_ssh_session(&app, &profile.host, &profile.user, &profile.password)?;
         emit_ssh_stage(&app, "STATUS", "Collecting docker runtime diagnostics...");
 
-        let command = r#"bash -lc '
+        let command = format!(
+            r#"bash -lc '
 CONFIG_DIR="/opt/rkn"
 ACTIVE_CONTAINER_FILE="$CONFIG_DIR/container_name"
 CONTAINER_NAME="$(cat "$ACTIVE_CONTAINER_FILE" 2>/dev/null || true)"
 
 echo "[STATUS] host=$(hostname)"
-echo "[STATUS] container_name=${CONTAINER_NAME:-<missing>}"
+echo "[STATUS] container_name=${{CONTAINER_NAME:-<missing>}}"
 echo "[STATUS] docker_ps"
 docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | sed -n "1,10p"
+echo "[STATUS] coexistence_processes"
+ps -eo comm= | grep -E "^(sing-box|xray|nginx|tailscaled|hysteria|wgcf)$" | sort | uniq || true
 
 if [ -n "$CONTAINER_NAME" ] && docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
   echo "[STATUS] docker_inspect"
   docker inspect -f "running={{.State.Running}} pid={{.State.Pid}} started={{.State.StartedAt}}" "$CONTAINER_NAME"
   echo "[STATUS] listening_sockets"
-  ss -ltnup | grep -E ":(443|4433|5443|7443|9443|14433)\b" || true
+  ss -ltnup | grep -E ":({monitored_ports})\b" || true
   echo "[STATUS] active_config"
   cat "$CONFIG_DIR/config.json"
   echo "[STATUS] docker_logs"
@@ -925,9 +2777,14 @@ else
   echo "[STATUS] active_config"
   cat "$CONFIG_DIR/config.json" 2>/dev/null || true
 fi
-'"#;
+'"#,
+            monitored_ports = monitored_ports
+        );
 
-        let (stdout, exit_status) = run_remote_command(&sess, command)?;
+        let (stdout, exit_status) = run_remote_command(&sess, &command)?;
+        for line in summarize_server_status_output(&stdout) {
+            let _ = app.emit("tunnel-log", format!("[SYSTEM] {}", line));
+        }
         for line in stdout.lines() {
             if !line.trim().is_empty() {
                 let _ = app.emit("tunnel-log", format!("[SERVER STATUS] {}", line));
@@ -947,10 +2804,11 @@ fi
     .unwrap()
 }
 
-/// Rotate ShadowTLS cover domain: generates new credentials, re-deploys
-/// the server container with a fresh cover domain, and saves a new client config.
+/// Rotate only the active ShadowTLS cover domain while keeping transport
+/// credentials stable. Clients still need a refreshed config plus a tunnel
+/// restart to begin using the new SNI.
 #[tauri::command]
-pub async fn rotate_sni(app: AppHandle) -> Result<String, String> {
+pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result<String, String> {
     let profile = load_saved_server_profile(app.clone())?
         .ok_or_else(|| "Saved server profile not found. Deploy once first.".to_string())?;
 
@@ -959,56 +2817,122 @@ pub async fn rotate_sni(app: AppHandle) -> Result<String, String> {
         "[SYSTEM] Rotating ShadowTLS cover domain...".to_string(),
     );
 
-    let short_id = crate::generator::generate_short_id(&app)
-        .await
-        .map_err(|e| format!("Short ID generation error: {}", e))?;
-    let shadow_pass = crate::generator::generate_shadowtls_password(&app)
-        .await
-        .map_err(|e| format!("ShadowTLS password error: {}", e))?;
-    let ss_password = crate::generator::generate_ss_password(&app)
-        .await
-        .map_err(|e| format!("Shadowsocks password error: {}", e))?;
-
-    let cover_domain = crate::generator::select_cover_domain(&short_id);
-    let _ = app.emit(
-        "tunnel-log",
-        format!("[SYSTEM] New cover domain: {}", cover_domain),
-    );
-
     let local_data = app
         .path()
         .app_local_data_dir()
         .unwrap_or_else(|_| std::env::temp_dir());
 
-    let result_domain = cover_domain.to_string();
+    let rotate_app = app.clone();
+    let result_domain = tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = acquire_remote_mutation_lock()?;
+        let sess = connect_ssh_session(
+            &rotate_app,
+            &profile.host,
+            &profile.user,
+            &profile.password,
+        )?;
+        let remote_bootstrap = load_remote_transport_bootstrap(&sess)?.ok_or_else(|| {
+            "Remote transport bootstrap not found. Deploy the server first.".to_string()
+        })?;
+        let container_name = load_remote_container_name(&sess)?.ok_or_else(|| {
+            "Remote RKN container is not active. Deploy the server first.".to_string()
+        })?;
 
-    tauri::async_runtime::spawn_blocking(move || {
-        let sess = connect_ssh_session(&app, &profile.host, &profile.user, &profile.password)?;
+        let mut occupied_cover_domains = remote_bootstrap.fallback_cover_domains.clone();
+        occupied_cover_domains.push(remote_bootstrap.cover_domain.clone());
+        let cover_domain = if let Some(target_domain) = target_domain.as_deref() {
+            if !crate::generator::is_supported_cover_domain(target_domain) {
+                return Err(format!(
+                    "Unsupported cover domain selected for rotation: {}",
+                    target_domain
+                ));
+            }
 
-        let deploy_target = select_remote_deploy_target(&sess, &short_id)?;
-        let external_port = deploy_target.external_port;
-        let container_name = deploy_target.container_name;
+            if target_domain == remote_bootstrap.cover_domain {
+                let _ = rotate_app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SYSTEM] Selected cover domain {} is already active. Nothing to rotate.",
+                        target_domain
+                    ),
+                );
+                return Ok(target_domain.to_string());
+            }
+
+            target_domain
+        } else {
+            crate::generator::select_next_cover_domain(
+                &remote_bootstrap.cover_domain,
+                &occupied_cover_domains,
+            )
+        };
+        let fallback_cover_domains = build_rotated_cover_domain_history(
+            &remote_bootstrap.cover_domain,
+            &remote_bootstrap.fallback_cover_domains,
+            cover_domain,
+        );
+
+        let _ = rotate_app.emit(
+            "tunnel-log",
+            "[SYSTEM] Preserving existing transport passwords for multi-device compatibility."
+                .to_string(),
+        );
+        let _ = rotate_app.emit(
+            "tunnel-log",
+            format!(
+                "[SYSTEM] Current cover domain: {}",
+                remote_bootstrap.cover_domain
+            ),
+        );
+        let _ = rotate_app.emit(
+            "tunnel-log",
+            format!("[SYSTEM] New cover domain: {}", cover_domain),
+        );
+        if !fallback_cover_domains.is_empty() {
+            let _ = rotate_app.emit(
+                "tunnel-log",
+                format!(
+                    "[SYSTEM] Previous cover domains kept on the server for staged rollover: {}",
+                    fallback_cover_domains.join(", ")
+                ),
+            );
+        }
 
         let deploy_script = include_str!("../scripts/deploy.sh");
-        let server_cfg = crate::generator::build_server_config(
-            &profile.host,
-            &shadow_pass,
-            &ss_password,
-            external_port,
-            cover_domain,
+        let (ss_server_password, master_ss_user_password, master_combined_password) =
+            resolve_master_ss_transport(&rotate_app, &remote_bootstrap)?;
+        let warp_config = ensure_remote_warp_config(&rotate_app, &sess)?;
+        let server_cfg = crate::generator::build_server_config_with_invites(
+            crate::generator::ServerConfigParams {
+                master_shadow_pass: &remote_bootstrap.shadow_pass,
+                ss_server_password: &ss_server_password,
+                master_ss_user_password: &master_ss_user_password,
+                external_port: remote_bootstrap.external_port,
+                internal_ss_port: remote_bootstrap.internal_ss_port,
+                cover_domain,
+                fallback_cover_domains: &fallback_cover_domains,
+                issued_invites: &remote_bootstrap.issued_invites,
+                warp: &warp_config,
+            },
         );
+        let local_rule_sets = ensure_local_client_rule_sets_sync(&rotate_app)?;
         let client_cfg = crate::generator::build_client_config(
             &profile.host,
-            &shadow_pass,
-            &ss_password,
-            external_port,
+            &remote_bootstrap.shadow_pass,
+            &master_combined_password,
+            remote_bootstrap.external_port,
             cover_domain,
+            &local_rule_sets,
         );
         let bootstrap_cfg = json!({
-            "external_port": external_port,
+            "external_port": remote_bootstrap.external_port,
+            "internal_ss_port": remote_bootstrap.internal_ss_port,
             "cover_domain": cover_domain,
-            "shadow_pass": shadow_pass,
-            "ss_password": ss_password
+            "fallback_cover_domains": fallback_cover_domains,
+            "shadow_pass": remote_bootstrap.shadow_pass,
+            "ss_password": master_combined_password,
+            "ss_server_password": ss_server_password,
+            "issued_invites": remote_bootstrap.issued_invites
         })
         .to_string();
 
@@ -1030,14 +2954,18 @@ BOOTSTRAPEOF
             PINNED_SING_BOX_IMAGE, container_name, server_cfg, bootstrap_cfg, deploy_script
         );
 
-        emit_ssh_stage(&app, "ROTATE", "Deploying new cover domain to server...");
+        emit_ssh_stage(
+            &rotate_app,
+            "ROTATE",
+            "Deploying new cover domain to server...",
+        );
         let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
         channel.exec("bash -s 2>&1").map_err(|e| e.to_string())?;
         channel
             .write_all(injected_script.as_bytes())
             .map_err(|e| e.to_string())?;
         channel.send_eof().map_err(|e| e.to_string())?;
-        stream_remote_deploy_output(&app, &sess, &mut channel)?;
+        stream_remote_deploy_output(&rotate_app, &sess, &mut channel)?;
 
         channel.wait_close().map_err(|e| e.to_string())?;
         let exit_status = channel.exit_status().map_err(|e| e.to_string())?;
@@ -1049,22 +2977,35 @@ BOOTSTRAPEOF
             ));
         }
 
-        validate_remote_runtime(&sess, &container_name, external_port)?;
+        validate_remote_runtime(
+            &sess,
+            &container_name,
+            remote_bootstrap.external_port,
+            remote_bootstrap.internal_ss_port,
+        )?;
 
         std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
         let client_cfg_path = local_data.join("client_config.json");
         std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
 
-        let _ = app.emit(
+        let _ = rotate_app.emit(
             "tunnel-log",
             format!(
-                "[SYSTEM] SNI rotated to {}. Restart tunnel to apply.",
+                "[SYSTEM] SNI rotated to {}. This device will restart its tunnel automatically; other devices need Deploy/Attach once to refresh their local config.",
                 cover_domain
             ),
         );
 
-        Ok(result_domain)
+        Ok(cover_domain.to_string())
     })
     .await
-    .unwrap()
+    .unwrap()?;
+
+    crate::restart_tunnel_if_running(
+        &app,
+        "Tunnel config changed after SNI rotation. Restarting core to apply the updated client config.",
+    )
+    .await?;
+
+    Ok(result_domain)
 }

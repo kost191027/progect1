@@ -208,6 +208,35 @@ Current MVP behavior:
 - those credentials are not uploaded to a third-party backend by the app
 - traffic is handled between the user’s device and the user’s own server
 
+## Working with multiple devices
+
+RKN can be used from multiple client devices against the same server, but `Rotate SNI` changes the active ShadowTLS cover domain on the server. That means each device must refresh its local client config after the rotation.
+
+Recommended flow:
+
+1. On device A, click `Rotate SNI`.
+2. If the tunnel was already running on device A, confirm that the logs contain:
+   - `[SYSTEM] SNI rotated to ...`
+   - `Tunnel config changed after SNI rotation. Restarting core to apply the updated client config.`
+3. On device B, click `Deploy`.
+4. Confirm that device B attaches to the existing server instead of redeploying it, and if the tunnel was already running there, confirm that the logs contain:
+   - `[SSH] Existing RKN transport detected on this server. Reusing it instead of rotating transport credentials.`
+   - `Tunnel config changed after attaching to the existing server. Restarting core to apply the updated client config.`
+
+Important notes:
+
+- `Rotate SNI` does not create a brand-new server stack. It rotates the active cover domain and updates the local `client_config.json` on the current device.
+- Other devices should use `Deploy` after the rotation so they can refresh their local config from the active remote transport.
+- If a device still runs an old tunnel state after the server-side SNI has changed, you may see client-side `traffic hijacked` errors and server-side `client hello verify failed: hmac mismatch` warnings.
+- Automatic restart is only expected if the local tunnel was already running at the moment the config changed.
+
+### Troubleshooting
+
+- If device A completed `Rotate SNI` but still cannot pass traffic, check whether the tunnel was running before the rotation. If it was not running, start it manually so the updated config is actually loaded.
+- If device B still fails after `Deploy`, make sure the logs show reuse of the existing transport rather than a fresh server redeploy. The expected reuse log is `[SSH] Existing RKN transport detected on this server. Reusing it instead of rotating transport credentials.`
+- If the client shows `traffic hijacked` while the server shows `client hello verify failed: hmac mismatch`, that usually means the device is still using an old live tunnel state. Run `Deploy` on that device again and confirm the automatic restart log appears.
+- If multiple devices are connected to the same server, avoid pressing `Rotate SNI` on several devices at once. Rotate on one device first, then refresh the others with `Deploy`.
+
 ## Release strategy
 
 The current platform priority is:

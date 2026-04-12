@@ -2,9 +2,11 @@ import type { ControlCenterModel } from "../../../features/control-center/model/
 import { ScreenHeader } from "../../../shared/ui/screen-header";
 import { ActivityLogSection } from "../../../widgets/activity-log-section/ui/activity-log-section";
 import { DiagnosticsActionsPanel } from "../../../widgets/diagnostics-actions/ui/diagnostics-actions-panel";
+import { InviteAccessPanel } from "../../../widgets/invite-access/ui/invite-access-panel";
 import { ServerSetupPanel } from "../../../widgets/server-setup/ui/server-setup-panel";
 import { SystemStatusPanel } from "../../../widgets/system-status/ui/system-status-panel";
 import { TunnelControlsPanel } from "../../../widgets/tunnel-controls/ui/tunnel-controls-panel";
+import { Panel } from "../../../shared/ui/panel";
 
 type HomePageProps = {
   controlCenter: ControlCenterModel;
@@ -16,7 +18,11 @@ export function HomePage({ controlCenter }: HomePageProps) {
       <ScreenHeader
         screenName="Settings"
         title="Quiet control over your tunnel"
-        description="Use this screen for setup, deploy, diagnostics, and the detailed activity log."
+        description={
+          controlCenter.appRole === "master"
+            ? "Use this screen for setup, deploy, sharing access, diagnostics, and the detailed activity log."
+            : "This installation follows a master app. Import invite links here, refresh configuration when asked, and inspect tunnel activity."
+        }
       />
 
       <div className="grid gap-3 sm:grid-cols-3">
@@ -48,8 +54,17 @@ export function HomePage({ controlCenter }: HomePageProps) {
             {controlCenter.host || "Not set"}
           </div>
           <p className="mt-2 text-sm leading-6 text-zinc-400">
-            {controlCenter.user ? `Login: ${controlCenter.user}` : "Add login details to prepare the node."}
+            {controlCenter.appRole === "master"
+              ? controlCenter.user
+                ? `Login: ${controlCenter.user}`
+                : "Add login details to prepare the node."
+              : controlCenter.currentCoverDomain
+                ? `Active cover domain: ${controlCenter.currentCoverDomain}`
+                : "This device is waiting for an invite link from the master app."}
           </p>
+          <div className="mt-3 text-[11px] font-bold uppercase tracking-[0.22em] text-zinc-500">
+            Mode: {controlCenter.appRole === "master" ? "Master app" : "Subordinate app"}
+          </div>
         </div>
 
         <div className="rounded-2xl border border-zinc-800 bg-[#171717] px-4 py-4">
@@ -60,24 +75,83 @@ export function HomePage({ controlCenter }: HomePageProps) {
             {controlCenter.formattedLastDeployedAt}
           </div>
           <p className="mt-2 text-sm leading-6 text-zinc-400">
-            The app remembers when the last successful configuration was applied on this Mac.
+            {controlCenter.appRole === "master"
+              ? "The app remembers when the last successful configuration was applied on this Mac."
+              : "The app remembers when the last invite link was imported or refreshed on this Mac."}
           </p>
         </div>
       </div>
 
       <div className="flex flex-col gap-4 lg:gap-5">
-        <ServerSetupPanel
+        <InviteAccessPanel
+          appRole={controlCenter.appRole}
           host={controlCenter.host}
-          user={controlCenter.user}
-          password={controlCenter.password}
-          isRunning={controlCenter.isRunning}
-          isDeploying={controlCenter.isDeploying}
-          deployActionLabel={controlCenter.deployActionLabel}
-          onHostChange={controlCenter.setHost}
-          onUserChange={controlCenter.setUser}
-          onPasswordChange={controlCenter.setPassword}
-          onDeploy={controlCenter.deployServer}
+          canPasteInviteLink={!controlCenter.savedProfile}
+          currentCoverDomain={controlCenter.currentCoverDomain}
+          requiresInviteRefresh={controlCenter.requiresInviteRefresh}
+          isGeneratingInvite={controlCenter.isGeneratingInvite}
+          isImportingInvite={controlCenter.isImportingInvite}
+          deletingInviteId={controlCenter.deletingInviteId}
+          inviteImportSuccessMessage={controlCenter.inviteImportSuccessMessage}
+          issuedInviteLinks={controlCenter.issuedInviteLinks}
+          primaryInviteCopied={controlCenter.primaryInviteCopied}
+          copiedInviteId={controlCenter.copiedInviteId}
+          isInviteServerSyncPending={controlCenter.isInviteServerSyncPending}
+          inviteSyncMessage={controlCenter.inviteSyncMessage}
+          inviteSyncTone={controlCenter.inviteSyncTone}
+          resetSuccessMessage={controlCenter.localDataResetMessage}
+          onGenerateInvite={controlCenter.generateInviteLink}
+          onEnterInvite={controlCenter.openInviteLinkModal}
+          onResetLocalData={controlCenter.resetLocalData}
+          onCopyExistingInvite={controlCenter.copyExistingInvite}
+          onDeleteInvite={controlCenter.deleteIssuedInviteLink}
         />
+
+        {controlCenter.appRole === "master" ? (
+          <ServerSetupPanel
+            host={controlCenter.host}
+            user={controlCenter.user}
+            password={controlCenter.password}
+            isRunning={controlCenter.isRunning}
+            isDeploying={controlCenter.isDeploying}
+            isResettingLocalData={controlCenter.isResettingLocalData}
+            isCreatingWarpProfile={controlCenter.isCreatingWarpProfile}
+            isImportingWarpProfile={controlCenter.isImportingWarpProfile}
+            isClearingWarpProfile={controlCenter.isClearingWarpProfile}
+            deployActionLabel={controlCenter.deployActionLabel}
+            hasLocalWarpProfile={controlCenter.localWarpProfileStatus.has_profile}
+            localWarpEndpoint={
+              controlCenter.localWarpProfileStatus.endpoint &&
+              controlCenter.localWarpProfileStatus.endpoint_port
+                ? `${controlCenter.localWarpProfileStatus.endpoint}:${controlCenter.localWarpProfileStatus.endpoint_port}`
+                : controlCenter.localWarpProfileStatus.endpoint
+            }
+            localWarpAddressV4={controlCenter.localWarpProfileStatus.address_v4}
+            warpProfileInput={controlCenter.warpProfileInput}
+            warpProfileMessage={controlCenter.warpProfileMessage}
+            resetSuccessMessage={controlCenter.localDataResetMessage}
+            onHostChange={controlCenter.setHost}
+            onUserChange={controlCenter.setUser}
+            onPasswordChange={controlCenter.setPassword}
+            onWarpProfileInputChange={controlCenter.setWarpProfileInput}
+            onDeploy={controlCenter.deployServer}
+            onResetLocalData={controlCenter.resetLocalData}
+            onCreateWarpProfile={controlCenter.createWarpProfile}
+            onImportWarpProfile={controlCenter.importWarpProfile}
+            onClearWarpProfile={controlCenter.clearWarpProfile}
+          />
+        ) : (
+          <Panel
+            title="Managed Access"
+            subtitle="This installation is meant to receive its client configuration from a master app. Server deployment and cover-domain rotation stay unavailable here."
+            className="bg-[#1a1a1a]"
+          >
+            <p className="text-sm leading-6 text-zinc-400">
+              This screen stays read-only by design. Use invite links from the master app to
+              refresh configuration, then start or stop the tunnel locally on this device.
+            </p>
+          </Panel>
+        )}
 
         <div className="grid gap-4 lg:gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
           <SystemStatusPanel
@@ -89,26 +163,34 @@ export function HomePage({ controlCenter }: HomePageProps) {
           <TunnelControlsPanel
             isRunning={controlCenter.isRunning}
             isDeploying={controlCenter.isDeploying}
+            isStarting={controlCenter.isStarting}
+            isStartBlockedByRedeploy={controlCenter.requiresRedeploy}
             onStart={controlCenter.startTunnel}
             onStop={controlCenter.stopTunnel}
           />
         </div>
 
-        <details className="rounded-2xl border border-zinc-800 bg-[#161616]">
-          <summary className="cursor-pointer list-none px-6 py-4 text-sm font-bold uppercase tracking-[0.2em] text-zinc-300">
-            Diagnostics
-          </summary>
-          <div className="px-4 pb-4">
-            <DiagnosticsActionsPanel
-              isDeploying={controlCenter.isDeploying}
-              isCheckingStatus={controlCenter.isCheckingStatus}
-              isRotatingSni={controlCenter.isRotatingSni}
-              isRunning={controlCenter.isRunning}
-              onCheckStatus={controlCenter.checkServerStatus}
-              onRotateSni={controlCenter.rotateSni}
-            />
-          </div>
-        </details>
+        {controlCenter.appRole === "master" ? (
+          <details className="rounded-2xl border border-zinc-800 bg-[#161616]">
+            <summary className="cursor-pointer list-none px-6 py-4 text-sm font-bold uppercase tracking-[0.2em] text-zinc-300">
+              Diagnostics
+            </summary>
+            <div className="px-4 pb-4">
+              <DiagnosticsActionsPanel
+                isDeploying={controlCenter.isDeploying}
+                isCheckingStatus={controlCenter.isCheckingStatus}
+                isRotatingSni={controlCenter.isRotatingSni}
+                diagnosticsTitle={controlCenter.diagnosticsSummary.title}
+                diagnosticsDescription={controlCenter.diagnosticsSummary.description}
+                diagnosticsTone={controlCenter.diagnosticsSummary.tone}
+                currentCoverDomain={controlCenter.currentCoverDomain}
+                availableCoverDomains={controlCenter.availableCoverDomains}
+                onCheckStatus={controlCenter.checkServerStatus}
+                onRotateSni={controlCenter.rotateSni}
+              />
+            </div>
+          </details>
+        ) : null}
 
         <ActivityLogSection
           logs={controlCenter.logs}

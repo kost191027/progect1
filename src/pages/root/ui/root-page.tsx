@@ -6,6 +6,8 @@ import { HomePage } from "../../home/ui/home-page";
 import { InfoScreen } from "../../info/ui/info-screen";
 import { PowerScreen } from "../../power/ui/power-screen";
 import { BottomNavigation, type ScreenId } from "../../../widgets/bottom-navigation/ui/bottom-navigation";
+import { BlockingModal } from "../../../shared/ui/blocking-modal";
+import { InviteLinkModal } from "../../../shared/ui/invite-link-modal";
 
 export function RootPage() {
   const controlCenter = useControlCenter();
@@ -45,8 +47,11 @@ export function RootPage() {
               isRunning={controlCenter.isRunning}
               isBusy={
                 controlCenter.isDeploying ||
+                controlCenter.isImportingInvite ||
                 controlCenter.isStarting ||
-                controlCenter.isStopping
+                controlCenter.isStopping ||
+                controlCenter.requiresRedeploy ||
+                controlCenter.requiresInviteRefresh
               }
               guardState={controlCenter.guardState}
               statusSummary={controlCenter.statusSummary}
@@ -60,6 +65,52 @@ export function RootPage() {
 
         <BottomNavigation activeScreen={activeScreen} onChange={setActiveScreen} />
       </div>
+
+      {controlCenter.appRole === "master" && controlCenter.requiresRedeploy ? (
+        <BlockingModal
+          title="Configuration changed on another app"
+          description={
+            controlCenter.currentCoverDomain
+              ? `The active cover domain is now ${controlCenter.currentCoverDomain}. Refresh this app before the tunnel can start again.`
+              : "Another app rotated the active transport configuration. Refresh this app before the tunnel can start again."
+          }
+          actionLabel="Refresh Configuration"
+          isBusy={controlCenter.isDeploying}
+          onAction={controlCenter.refreshConfiguration}
+        />
+      ) : null}
+
+      {controlCenter.appRole === "subordinate" &&
+      controlCenter.requiresInviteRefresh &&
+      !controlCenter.isInviteModalOpen ? (
+        <BlockingModal
+          title="This subordinate link is no longer accepted"
+          description="The master app either removed this invite link or replaced the transport configuration. Ask the administrator for a fresh invite link, or unlink this app to return to a clean master setup with no saved server data."
+          actionLabel="Paste Fresh Invite Link"
+          secondaryActionLabel="Unlink This App"
+          isBusy={controlCenter.isImportingInvite || controlCenter.isResettingLocalData}
+          onAction={controlCenter.openInviteLinkModal}
+          onSecondaryAction={controlCenter.resetLocalData}
+        />
+      ) : null}
+
+      {controlCenter.isInviteModalOpen ? (
+        <InviteLinkModal
+          title="Import invite link"
+          description="Paste the share link from the master app. This device will rebuild its local client config without using SSH credentials."
+          value={controlCenter.inviteLinkInput}
+          errorMessage={controlCenter.inviteLinkError}
+          statusMessage={
+            controlCenter.isImportingInvite
+              ? "Valid invite link detected. Importing automatically..."
+              : "The clipboard is checked when this window opens. A valid invite link imports automatically as soon as it appears here."
+          }
+          isBusy={controlCenter.isImportingInvite}
+          onChange={controlCenter.setInviteLinkInput}
+          onClose={controlCenter.closeInviteLinkModal}
+          onSubmit={controlCenter.importInviteLink}
+        />
+      ) : null}
     </main>
   );
 }

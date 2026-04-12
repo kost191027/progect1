@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::sync::Mutex;
 use std::{fs, path::PathBuf};
 use tauri::image::Image;
@@ -78,6 +79,48 @@ fn client_config_exists(app: &AppHandle) -> bool {
         .app_local_data_dir()
         .map(|path| path.join("client_config.json").exists())
         .unwrap_or(false)
+}
+
+fn local_client_config_requires_refresh(app: &AppHandle) -> Result<bool, String> {
+    let config_path = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("client_config.json");
+
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let contents = fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+    let config: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("Invalid client config JSON: {}", e))?;
+
+    let dns = config.get("dns").and_then(|value| value.as_object());
+    if let Some(dns) = dns {
+        if dns.contains_key("fakeip") {
+            return Ok(true);
+        }
+
+        let has_legacy_server_format = dns
+            .get("servers")
+            .and_then(|value| value.as_array())
+            .map(|servers| {
+                servers.iter().any(|server| {
+                    server
+                        .as_object()
+                        .map(|server| !server.contains_key("type"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if has_legacy_server_format {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 pub(crate) fn refresh_tray_toggle_item(app: &AppHandle) {
@@ -166,6 +209,60 @@ fn recent_log_tail(log_path: &str, max_lines: usize) -> String {
         .collect::<Vec<_>>();
     lines.reverse();
     lines.join("\n")
+}
+
+#[tauri::command]
+fn write_clipboard_text(text: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut child = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to launch pbcopy: {}", e))?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("Failed to write clipboard text: {}", e))?;
+        }
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("Failed to wait for pbcopy: {}", e))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err("pbcopy exited with a non-zero status".to_string())
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = text;
+        Err("Clipboard write is not implemented for this platform yet.".to_string())
+    }
+}
+
+#[tauri::command]
+fn read_clipboard_text() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("pbpaste")
+            .output()
+            .map_err(|e| format!("Failed to launch pbpaste: {}", e))?;
+
+        if !output.status.success() {
+            return Err("pbpaste exited with a non-zero status".to_string());
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Clipboard read is not implemented for this platform yet.".to_string())
+    }
 }
 
 fn current_network_fingerprint() -> Option<String> {
@@ -297,34 +394,52 @@ fn classify_proxy_failure(line: &str) -> bool {
             || lower.contains("connection reset"))
 }
 
+fn current_singbox_target_triple() -> Result<&'static str, String> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
+        (os, arch) => Err(format!(
+            "Unsupported platform for sing-box sidecar resolution: {} / {}",
+            os, arch
+        )),
+    }
+}
+
 /// Находит абсолютный путь до sidecar-бинарника `sing-box`
 fn resolve_singbox_path() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-
     let dir = exe.parent().ok_or("Cannot resolve binary directory")?;
+    let target_triple = current_singbox_target_triple()?;
 
-    let arch_suffix = if cfg!(target_arch = "x86_64") {
-        "x86_64-apple-darwin"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64-apple-darwin"
-    } else {
-        return Err("Unsupported architecture".to_string());
-    };
+    let mut candidates = vec![
+        format!("sing-box-{}", target_triple),
+        "sing-box".to_string(),
+    ];
 
-    // Tauri v2 dev build: sing-box-<arch> (from bins/)
-    let sidecar_with_arch = dir.join(format!("sing-box-{}", arch_suffix));
-    if sidecar_with_arch.exists() {
-        return Ok(sidecar_with_arch.to_string_lossy().to_string());
+    if cfg!(target_os = "windows") {
+        candidates = vec![
+            format!("sing-box-{}.exe", target_triple),
+            "sing-box.exe".to_string(),
+            format!("sing-box-{}", target_triple),
+            "sing-box".to_string(),
+        ];
     }
 
-    // Tauri v2 bundle / debug copy: sing-box (arch suffix stripped by Tauri)
-    let sidecar_plain = dir.join("sing-box");
-    if sidecar_plain.exists() {
-        return Ok(sidecar_plain.to_string_lossy().to_string());
+    for candidate in candidates {
+        let sidecar_path = dir.join(&candidate);
+        if sidecar_path.exists() {
+            return Ok(sidecar_path.to_string_lossy().to_string());
+        }
     }
 
     // Fallback: system PATH
-    Ok("sing-box".to_string())
+    if cfg!(target_os = "windows") {
+        Ok("sing-box.exe".to_string())
+    } else {
+        Ok("sing-box".to_string())
+    }
 }
 
 async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result<u32, String> {
@@ -350,6 +465,58 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
     let shell_cmd = format!(
         "'{}' run -c '{}' > {} 2>&1 & echo $!",
         singbox_path, config_str, log_path
+    );
+
+    let osascript_arg = format!(
+        "do shell script \"{}\" with administrator privileges",
+        escape_applescript(&shell_cmd)
+    );
+
+    let output = app
+        .shell()
+        .command("osascript")
+        .args(["-e", &osascript_arg])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to execute osascript: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") || stderr.contains("-128") {
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Administrator access was cancelled by user.",
+            );
+            return Err("User cancelled admin prompt".to_string());
+        }
+        return Err(format!("osascript error: {}", stderr));
+    }
+
+    let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    pid_str
+        .parse()
+        .map_err(|_| format!("Failed to parse PID from: '{}'", pid_str))
+}
+
+async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, String> {
+    let singbox_path = resolve_singbox_path()?;
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let config_path = local_data.join("client_config.json");
+
+    if !config_path.exists() {
+        return Err("Client config not found. Please deploy a server first.".to_string());
+    }
+
+    let config_str = config_path.to_string_lossy().to_string();
+    let log_path = "/tmp/rkn-tun.log";
+
+    let _ = app.emit(
+        "tunnel-log",
+        "[SYSTEM] Requesting administrator privileges to restart the tunnel...".to_string(),
+    );
+
+    let shell_cmd = format!(
+        "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n'{singbox_path}' run -c '{config_str}' > {log_path} 2>&1 & echo $!",
     );
 
     let osascript_arg = format!(
@@ -563,6 +730,20 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         }
     }
 
+    if local_client_config_requires_refresh(&app)? {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Local client config uses an outdated DNS/FakeIP format. Run Update/Deploy once to regenerate it for the current core.".to_string(),
+        );
+        return Err(
+            "Local client config is outdated. Run Update/Deploy before starting the tunnel."
+                .to_string(),
+        );
+    }
+
+    ssh::ensure_local_transport_is_current(&app).await?;
+    crate::geodata::ensure_local_client_rule_sets(&app).await?;
+
     let _ = app.emit("tunnel-log", "[SYSTEM] Resolving core binary path...");
     let pid = launch_tunnel_process(&app, true).await?;
 
@@ -637,6 +818,97 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+#[tauri::command]
+async fn reset_local_data(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let is_running = state.singbox_pid.lock().unwrap().is_some();
+
+    if is_running {
+        stop_tunnel_inner(app.clone()).await?;
+    }
+
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let files_to_remove = [
+        local_data.join("client_config.json"),
+        local_data.join("server_profile.json"),
+        local_data.join("active_tunnel_pid"),
+    ];
+
+    for path in files_to_remove {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to remove local file {}: {}",
+                    path.display(),
+                    error
+                ));
+            }
+        }
+    }
+
+    ssh::clear_issued_invites(&app)?;
+    ssh::clear_local_warp_profile_sync(&app)?;
+
+    let _ = fs::remove_file("/tmp/rkn-tun.log");
+    set_network_fingerprint(&state, None);
+    finish_recovery(&state);
+    reset_guard_state(&state);
+    emit_tunnel_state(&app, false);
+    emit_guard_state(&app, "inactive");
+    refresh_tray_toggle_item(&app);
+    let _ = app.emit(
+        "tunnel-log",
+        "[SYSTEM] Local server profile, client config, and imported WARP profile were removed from this Mac.".to_string(),
+    );
+
+    Ok(())
+}
+
+pub(crate) async fn restart_tunnel_if_running(
+    app: &AppHandle,
+    reason: &str,
+) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+    let old_pid = *state.singbox_pid.lock().unwrap();
+    let Some(old_pid) = old_pid else {
+        return Ok(false);
+    };
+
+    let _ = app.emit("tunnel-log", format!("[SYSTEM] {}", reason));
+    {
+        let mut guard = state.singbox_pid.lock().unwrap();
+        *guard = None;
+    }
+
+    let new_pid = match restart_tunnel_process(app, old_pid).await {
+        Ok(pid) => pid,
+        Err(error) => {
+            set_network_fingerprint(&state, None);
+            clear_saved_tunnel_pid(app);
+            finish_recovery(&state);
+            reset_guard_state(&state);
+            emit_tunnel_state(app, false);
+            emit_guard_state(app, "inactive");
+            refresh_tray_toggle_item(app);
+            return Err(error);
+        }
+    };
+
+    verify_tunnel_start(app, &state, new_pid, "/tmp/rkn-tun.log").await?;
+    spawn_log_reader(app.clone(), new_pid, "/tmp/rkn-tun.log");
+    spawn_process_exit_monitor(app.clone(), new_pid);
+    spawn_network_recovery_monitor(app.clone(), new_pid);
+    let _ = app.emit(
+        "tunnel-log",
+        "[SYSTEM] Tunnel restarted with the updated local configuration.".to_string(),
+    );
+    refresh_tray_toggle_item(app);
+
+    Ok(true)
 }
 
 #[tauri::command]
@@ -794,9 +1066,23 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_tunnel,
             stop_tunnel,
+            reset_local_data,
             restore_tunnel_session,
+            write_clipboard_text,
+            read_clipboard_text,
             ssh::deploy_server,
+            ssh::generate_invite_link,
+            ssh::import_invite_link,
+            ssh::get_local_installation_state,
+            ssh::list_issued_invite_links,
+            ssh::delete_issued_invite_link,
+            ssh::get_transport_state_snapshot,
             ssh::load_saved_server_profile,
+            ssh::get_local_warp_profile_status,
+            ssh::import_local_warp_profile,
+            ssh::bootstrap_local_warp_profile,
+            ssh::bootstrap_local_warp_profile_from_credentials,
+            ssh::clear_local_warp_profile,
             ssh::check_server_status,
             ssh::rotate_sni
         ])
