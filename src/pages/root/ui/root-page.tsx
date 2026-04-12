@@ -84,13 +84,11 @@ export function RootPage() {
       controlCenter.requiresInviteRefresh &&
       !controlCenter.isInviteModalOpen ? (
         <BlockingModal
-          title="This subordinate link is no longer accepted"
-          description="The master app either removed this invite link or replaced the transport configuration. Ask the administrator for a fresh invite link, or unlink this app to return to a clean master setup with no saved server data."
+          title="Configuration refresh required"
+          description="The master app changed or removed this subordinate configuration. Request a fresh invite link from the administrator, then refresh this device before starting the tunnel again."
           actionLabel="Paste Fresh Invite Link"
-          secondaryActionLabel="Unlink This App"
-          isBusy={controlCenter.isImportingInvite || controlCenter.isResettingLocalData}
+          isBusy={controlCenter.isImportingInvite}
           onAction={controlCenter.openInviteLinkModal}
-          onSecondaryAction={controlCenter.resetLocalData}
         />
       ) : null}
 
