@@ -6,8 +6,6 @@ use tauri::{AppHandle, Emitter, Manager};
 use super::{
     connect_ssh_session, run_remote_command, server_profile_path, validate_warp_config,
     warp_status_from_config, LocalWarpProfileStatus, RemoteWarpConfig, SavedServerProfile,
-    BUNDLED_WARP_ADDRESS_V4, BUNDLED_WARP_ADDRESS_V6, BUNDLED_WARP_ENDPOINT,
-    BUNDLED_WARP_ENDPOINT_PORT, BUNDLED_WARP_PEER_PUBLIC_KEY, BUNDLED_WARP_PRIVATE_KEY,
     WGCF_VERSION,
 };
 
@@ -15,17 +13,6 @@ fn local_warp_profile_path(app: &AppHandle) -> Result<PathBuf, String> {
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
 
     Ok(local_data.join("warp_profile.json"))
-}
-
-fn bundled_fallback_warp_config() -> RemoteWarpConfig {
-    RemoteWarpConfig {
-        private_key: BUNDLED_WARP_PRIVATE_KEY.to_string(),
-        address_v4: BUNDLED_WARP_ADDRESS_V4.to_string(),
-        address_v6: BUNDLED_WARP_ADDRESS_V6.to_string(),
-        endpoint: BUNDLED_WARP_ENDPOINT.to_string(),
-        endpoint_port: BUNDLED_WARP_ENDPOINT_PORT,
-        peer_public_key: BUNDLED_WARP_PEER_PUBLIC_KEY.to_string(),
-    }
 }
 
 fn load_local_warp_config_sync(app: &AppHandle) -> Result<Option<RemoteWarpConfig>, String> {
@@ -464,21 +451,10 @@ cat "$WARP_JSON"
 
     let (stdout, exit_status) = run_remote_command(sess, &command)?;
     if exit_status != 0 {
-        let _ = app.emit(
-            "tunnel-log",
-            "[SSH:WARP] Automatic remote WARP bootstrap failed. Falling back to the bundled validated WARP profile."
-                .to_string(),
-        );
-        let fallback = bundled_fallback_warp_config();
-        let uploaded = upload_remote_warp_config(sess, &fallback)?;
-        let _ = app.emit(
-            "tunnel-log",
-            format!(
-                "[SSH:WARP] Using bundled fallback WARP endpoint {}:{}.",
-                uploaded.endpoint, uploaded.endpoint_port
-            ),
-        );
-        return Ok(uploaded);
+        let message =
+            "Automatic remote WARP bootstrap failed. Import a personal WARP profile in Server Access and redeploy.";
+        let _ = app.emit("tunnel-log", format!("[SSH:WARP] {}", message));
+        return Err(format!("{} [Automatic remote WARP bootstrap failed. Import a personal WARP profile in Server Access and redeploy.]", message));
     }
 
     let mut lines = stdout.lines();

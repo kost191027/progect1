@@ -45,13 +45,6 @@ pub(crate) const SSH_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const REMOTE_DEPLOY_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const REMOTE_DEPLOY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const MAX_FALLBACK_COVER_DOMAINS: usize = 4;
-pub(crate) const BUNDLED_WARP_PRIVATE_KEY: &str = "QJFlY7Xqqmpd110buQYhO3kPns9aj4ddLTTUHyXFRWc=";
-pub(crate) const BUNDLED_WARP_ADDRESS_V4: &str = "172.16.0.2/32";
-pub(crate) const BUNDLED_WARP_ADDRESS_V6: &str = "2606:4700:110:84d0:bc95:602b:71f:611e/128";
-pub(crate) const BUNDLED_WARP_ENDPOINT: &str = "162.159.192.1";
-pub(crate) const BUNDLED_WARP_ENDPOINT_PORT: u16 = 500;
-pub(crate) const BUNDLED_WARP_PEER_PUBLIC_KEY: &str =
-    "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=";
 
 // ── Shared types ────────────────────────────────────────────────────────────
 
