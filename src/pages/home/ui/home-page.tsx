@@ -92,11 +92,13 @@ export function HomePage({ controlCenter }: HomePageProps) {
           isGeneratingInvite={controlCenter.isGeneratingInvite}
           isImportingInvite={controlCenter.isImportingInvite}
           deletingInviteId={controlCenter.deletingInviteId}
-          inviteCopySuccessMessage={controlCenter.inviteCopySuccessMessage}
           inviteImportSuccessMessage={controlCenter.inviteImportSuccessMessage}
-          inviteManagementMessage={controlCenter.inviteManagementMessage}
-          generatedInviteLink={controlCenter.generatedInviteLink}
           issuedInviteLinks={controlCenter.issuedInviteLinks}
+          primaryInviteCopied={controlCenter.primaryInviteCopied}
+          copiedInviteId={controlCenter.copiedInviteId}
+          isInviteServerSyncPending={controlCenter.isInviteServerSyncPending}
+          inviteSyncMessage={controlCenter.inviteSyncMessage}
+          inviteSyncTone={controlCenter.inviteSyncTone}
           resetSuccessMessage={controlCenter.localDataResetMessage}
           onGenerateInvite={controlCenter.generateInviteLink}
           onEnterInvite={controlCenter.openInviteLinkModal}
@@ -113,13 +115,30 @@ export function HomePage({ controlCenter }: HomePageProps) {
             isRunning={controlCenter.isRunning}
             isDeploying={controlCenter.isDeploying}
             isResettingLocalData={controlCenter.isResettingLocalData}
+            isCreatingWarpProfile={controlCenter.isCreatingWarpProfile}
+            isImportingWarpProfile={controlCenter.isImportingWarpProfile}
+            isClearingWarpProfile={controlCenter.isClearingWarpProfile}
             deployActionLabel={controlCenter.deployActionLabel}
+            hasLocalWarpProfile={controlCenter.localWarpProfileStatus.has_profile}
+            localWarpEndpoint={
+              controlCenter.localWarpProfileStatus.endpoint &&
+              controlCenter.localWarpProfileStatus.endpoint_port
+                ? `${controlCenter.localWarpProfileStatus.endpoint}:${controlCenter.localWarpProfileStatus.endpoint_port}`
+                : controlCenter.localWarpProfileStatus.endpoint
+            }
+            localWarpAddressV4={controlCenter.localWarpProfileStatus.address_v4}
+            warpProfileInput={controlCenter.warpProfileInput}
+            warpProfileMessage={controlCenter.warpProfileMessage}
             resetSuccessMessage={controlCenter.localDataResetMessage}
             onHostChange={controlCenter.setHost}
             onUserChange={controlCenter.setUser}
             onPasswordChange={controlCenter.setPassword}
+            onWarpProfileInputChange={controlCenter.setWarpProfileInput}
             onDeploy={controlCenter.deployServer}
             onResetLocalData={controlCenter.resetLocalData}
+            onCreateWarpProfile={controlCenter.createWarpProfile}
+            onImportWarpProfile={controlCenter.importWarpProfile}
+            onClearWarpProfile={controlCenter.clearWarpProfile}
           />
         ) : (
           <Panel
@@ -144,6 +163,7 @@ export function HomePage({ controlCenter }: HomePageProps) {
           <TunnelControlsPanel
             isRunning={controlCenter.isRunning}
             isDeploying={controlCenter.isDeploying}
+            isStarting={controlCenter.isStarting}
             isStartBlockedByRedeploy={controlCenter.requiresRedeploy}
             onStart={controlCenter.startTunnel}
             onStop={controlCenter.stopTunnel}
@@ -160,6 +180,9 @@ export function HomePage({ controlCenter }: HomePageProps) {
                 isDeploying={controlCenter.isDeploying}
                 isCheckingStatus={controlCenter.isCheckingStatus}
                 isRotatingSni={controlCenter.isRotatingSni}
+                diagnosticsTitle={controlCenter.diagnosticsSummary.title}
+                diagnosticsDescription={controlCenter.diagnosticsSummary.description}
+                diagnosticsTone={controlCenter.diagnosticsSummary.tone}
                 currentCoverDomain={controlCenter.currentCoverDomain}
                 availableCoverDomains={controlCenter.availableCoverDomains}
                 onCheckStatus={controlCenter.checkServerStatus}

@@ -7,6 +7,9 @@ type DiagnosticsActionsPanelProps = {
   isDeploying: boolean;
   isCheckingStatus: boolean;
   isRotatingSni: boolean;
+  diagnosticsTitle: string;
+  diagnosticsDescription: string;
+  diagnosticsTone: "neutral" | "ready" | "attention";
   currentCoverDomain: string | null;
   availableCoverDomains: string[];
   onCheckStatus: () => void;
@@ -17,6 +20,9 @@ export function DiagnosticsActionsPanel({
   isDeploying,
   isCheckingStatus,
   isRotatingSni,
+  diagnosticsTitle,
+  diagnosticsDescription,
+  diagnosticsTone,
   currentCoverDomain,
   availableCoverDomains,
   onCheckStatus,
@@ -70,6 +76,22 @@ export function DiagnosticsActionsPanel({
       className="bg-[#161616]"
     >
       <div className="flex flex-col gap-3">
+        <div
+          className={`rounded-2xl border px-4 py-4 ${
+            diagnosticsTone === "ready"
+              ? "border-emerald-900/50 bg-emerald-950/20"
+              : diagnosticsTone === "attention"
+                ? "border-amber-900/50 bg-amber-950/20"
+                : "border-zinc-800 bg-[#111212]"
+          }`}
+        >
+          <div className="text-[11px] font-bold uppercase tracking-[0.22em] text-zinc-500">
+            Latest verdict
+          </div>
+          <div className="mt-2 text-sm font-semibold text-zinc-100">{diagnosticsTitle}</div>
+          <p className="mt-2 text-sm leading-6 text-zinc-400">{diagnosticsDescription}</p>
+        </div>
+
         <Button
           variant="secondary"
           fullWidth

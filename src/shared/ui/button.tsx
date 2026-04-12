@@ -32,7 +32,7 @@ export function Button({
   return (
     <button
       className={cn(
-        "rounded-lg px-4 py-3 text-sm font-semibold uppercase tracking-[0.18em] transition-colors duration-100 active:translate-y-px",
+        "cursor-pointer rounded-lg px-4 py-3 text-sm font-semibold uppercase tracking-[0.18em] transition-colors duration-100 active:translate-y-px",
         fullWidth && "w-full",
         disabled
           ? "cursor-not-allowed border border-zinc-800 bg-[#171717] text-zinc-600"

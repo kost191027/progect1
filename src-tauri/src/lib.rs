@@ -498,6 +498,58 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
         .map_err(|_| format!("Failed to parse PID from: '{}'", pid_str))
 }
 
+async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, String> {
+    let singbox_path = resolve_singbox_path()?;
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let config_path = local_data.join("client_config.json");
+
+    if !config_path.exists() {
+        return Err("Client config not found. Please deploy a server first.".to_string());
+    }
+
+    let config_str = config_path.to_string_lossy().to_string();
+    let log_path = "/tmp/rkn-tun.log";
+
+    let _ = app.emit(
+        "tunnel-log",
+        "[SYSTEM] Requesting administrator privileges to restart the tunnel...".to_string(),
+    );
+
+    let shell_cmd = format!(
+        "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n'{singbox_path}' run -c '{config_str}' > {log_path} 2>&1 & echo $!",
+    );
+
+    let osascript_arg = format!(
+        "do shell script \"{}\" with administrator privileges",
+        escape_applescript(&shell_cmd)
+    );
+
+    let output = app
+        .shell()
+        .command("osascript")
+        .args(["-e", &osascript_arg])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to execute osascript: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") || stderr.contains("-128") {
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Administrator access was cancelled by user.",
+            );
+            return Err("User cancelled admin prompt".to_string());
+        }
+        return Err(format!("osascript error: {}", stderr));
+    }
+
+    let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    pid_str
+        .parse()
+        .map_err(|_| format!("Failed to parse PID from: '{}'", pid_str))
+}
+
 async fn verify_tunnel_start(
     app: &AppHandle,
     state: &AppState,
@@ -799,6 +851,7 @@ async fn reset_local_data(app: AppHandle) -> Result<(), String> {
     }
 
     ssh::clear_issued_invites(&app)?;
+    ssh::clear_local_warp_profile_sync(&app)?;
 
     let _ = fs::remove_file("/tmp/rkn-tun.log");
     set_network_fingerprint(&state, None);
@@ -809,7 +862,7 @@ async fn reset_local_data(app: AppHandle) -> Result<(), String> {
     refresh_tray_toggle_item(&app);
     let _ = app.emit(
         "tunnel-log",
-        "[SYSTEM] Local server profile and client config were removed from this Mac.".to_string(),
+        "[SYSTEM] Local server profile, client config, and imported WARP profile were removed from this Mac.".to_string(),
     );
 
     Ok(())
@@ -820,15 +873,40 @@ pub(crate) async fn restart_tunnel_if_running(
     reason: &str,
 ) -> Result<bool, String> {
     let state = app.state::<AppState>();
-    let is_running = state.singbox_pid.lock().unwrap().is_some();
-    if !is_running {
+    let old_pid = *state.singbox_pid.lock().unwrap();
+    let Some(old_pid) = old_pid else {
         return Ok(false);
-    }
+    };
 
     let _ = app.emit("tunnel-log", format!("[SYSTEM] {}", reason));
-    stop_tunnel_inner(app.clone()).await?;
-    sleep(Duration::from_millis(500)).await;
-    start_tunnel_inner(app.clone()).await?;
+    {
+        let mut guard = state.singbox_pid.lock().unwrap();
+        *guard = None;
+    }
+
+    let new_pid = match restart_tunnel_process(app, old_pid).await {
+        Ok(pid) => pid,
+        Err(error) => {
+            set_network_fingerprint(&state, None);
+            clear_saved_tunnel_pid(app);
+            finish_recovery(&state);
+            reset_guard_state(&state);
+            emit_tunnel_state(app, false);
+            emit_guard_state(app, "inactive");
+            refresh_tray_toggle_item(app);
+            return Err(error);
+        }
+    };
+
+    verify_tunnel_start(app, &state, new_pid, "/tmp/rkn-tun.log").await?;
+    spawn_log_reader(app.clone(), new_pid, "/tmp/rkn-tun.log");
+    spawn_process_exit_monitor(app.clone(), new_pid);
+    spawn_network_recovery_monitor(app.clone(), new_pid);
+    let _ = app.emit(
+        "tunnel-log",
+        "[SYSTEM] Tunnel restarted with the updated local configuration.".to_string(),
+    );
+    refresh_tray_toggle_item(app);
 
     Ok(true)
 }
@@ -1000,6 +1078,11 @@ pub fn run() {
             ssh::delete_issued_invite_link,
             ssh::get_transport_state_snapshot,
             ssh::load_saved_server_profile,
+            ssh::get_local_warp_profile_status,
+            ssh::import_local_warp_profile,
+            ssh::bootstrap_local_warp_profile,
+            ssh::bootstrap_local_warp_profile_from_credentials,
+            ssh::clear_local_warp_profile,
             ssh::check_server_status,
             ssh::rotate_sni
         ])

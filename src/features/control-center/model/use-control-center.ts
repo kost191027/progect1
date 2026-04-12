@@ -23,6 +23,12 @@ export type ServerStatusSummary = {
   tone: "neutral" | "ready" | "attention";
 };
 
+export type DiagnosticsSummary = {
+  title: string;
+  description: string;
+  tone: "neutral" | "ready" | "attention";
+};
+
 export type SavedServerProfile = {
   host: string;
   user: string;
@@ -60,12 +66,33 @@ type InviteImportResult = {
   cover_domain: string;
 };
 
+type LocalWarpProfileStatus = {
+  has_profile: boolean;
+  endpoint: string | null;
+  endpoint_port: number | null;
+  address_v4: string | null;
+  address_v6: string | null;
+};
+
+type InviteRemoteSyncEvent = {
+  invite_id: string;
+  status: "started" | "completed" | "failed";
+  message: string;
+};
+
 const MAX_LOG_BUFFER = 800;
 const HAS_COMPLETED_FIRST_START_KEY = "rkn.has-completed-first-start";
 const LAST_DEPLOYED_AT_KEY = "rkn.last-deployed-at";
 const APP_ROLE_KEY = "rkn.app-role";
 const SUBORDINATE_HOST_KEY = "rkn.subordinate-host";
 const SUBORDINATE_COVER_DOMAIN_KEY = "rkn.subordinate-cover-domain";
+const EMPTY_WARP_PROFILE_STATUS: LocalWarpProfileStatus = {
+  has_profile: false,
+  endpoint: null,
+  endpoint_port: null,
+  address_v4: null,
+  address_v6: null,
+};
 
 function normalizeInviteLink(value: string) {
   return value.trim();
@@ -115,6 +142,17 @@ function isErrorLog(message: string) {
   );
 }
 
+function latestLogMatching(logs: string[], marker: string) {
+  for (let index = logs.length - 1; index >= 0; index -= 1) {
+    const line = logs[index];
+    if (line?.includes(marker)) {
+      return stripLogPrefix(line);
+    }
+  }
+
+  return null;
+}
+
 export function useControlCenter() {
   const [isRunning, setIsRunning] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
@@ -142,13 +180,22 @@ export function useControlCenter() {
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [inviteLinkInput, setInviteLinkInput] = useState("");
   const [inviteLinkError, setInviteLinkError] = useState<string | null>(null);
-  const [inviteCopySuccessMessage, setInviteCopySuccessMessage] = useState<string | null>(null);
   const [inviteImportSuccessMessage, setInviteImportSuccessMessage] = useState<string | null>(null);
-  const [inviteManagementMessage, setInviteManagementMessage] = useState<string | null>(null);
-  const [generatedInviteLink, setGeneratedInviteLink] = useState<string | null>(null);
   const [issuedInviteLinks, setIssuedInviteLinks] = useState<IssuedInviteLink[]>([]);
+  const [primaryInviteCopied, setPrimaryInviteCopied] = useState(false);
+  const [copiedInviteId, setCopiedInviteId] = useState<string | null>(null);
+  const [isInviteServerSyncPending, setIsInviteServerSyncPending] = useState(false);
+  const [inviteSyncMessage, setInviteSyncMessage] = useState<string | null>(null);
+  const [inviteSyncTone, setInviteSyncTone] = useState<"pending" | "warning" | null>(null);
   const [localDataResetMessage, setLocalDataResetMessage] = useState<string | null>(null);
   const [lastAutoImportedInvite, setLastAutoImportedInvite] = useState<string | null>(null);
+  const [localWarpProfileStatus, setLocalWarpProfileStatus] =
+    useState<LocalWarpProfileStatus>(EMPTY_WARP_PROFILE_STATUS);
+  const [warpProfileInput, setWarpProfileInput] = useState("");
+  const [warpProfileMessage, setWarpProfileMessage] = useState<string | null>(null);
+  const [isCreatingWarpProfile, setIsCreatingWarpProfile] = useState(false);
+  const [isImportingWarpProfile, setIsImportingWarpProfile] = useState(false);
+  const [isClearingWarpProfile, setIsClearingWarpProfile] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [trimmedLogCount, setTrimmedLogCount] = useState(0);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -194,6 +241,34 @@ export function useControlCenter() {
   useEffect(() => {
     const unlisten = listen<string>("tunnel-log", (event) => {
       appendLog(event.payload);
+    });
+
+    return () => {
+      unlisten.then((cleanup) => cleanup());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<InviteRemoteSyncEvent>("invite-remote-sync", (event) => {
+      const payload = event.payload;
+
+      if (payload.status === "started") {
+        setIsInviteServerSyncPending(true);
+        setInviteSyncTone("pending");
+        setInviteSyncMessage(payload.message);
+        return;
+      }
+
+      setIsInviteServerSyncPending(false);
+
+      if (payload.status === "failed") {
+        setInviteSyncTone("warning");
+        setInviteSyncMessage(payload.message);
+        return;
+      }
+
+      setInviteSyncTone(null);
+      setInviteSyncMessage(null);
     });
 
     return () => {
@@ -306,6 +381,40 @@ export function useControlCenter() {
     }
 
     void loadIssuedInvites();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [appRole, savedProfile?.host]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadLocalWarpProfileStatus() {
+      if (appRole !== "master") {
+        setLocalWarpProfileStatus(EMPTY_WARP_PROFILE_STATUS);
+        setWarpProfileMessage(null);
+        setWarpProfileInput("");
+        return;
+      }
+
+      try {
+        const status = await invoke<LocalWarpProfileStatus>("get_local_warp_profile_status");
+        if (!isMounted) {
+          return;
+        }
+
+        setLocalWarpProfileStatus(status);
+      } catch (error) {
+        if (!isMounted) {
+          return;
+        }
+
+        appendLog(`[WARN] Failed to load local WARP profile status: ${error}`);
+      }
+    }
+
+    void loadLocalWarpProfileStatus();
 
     return () => {
       isMounted = false;
@@ -541,36 +650,28 @@ export function useControlCenter() {
   async function generateInviteLink() {
     setIsGeneratingInvite(true);
     setLastError(null);
-    setInviteCopySuccessMessage(null);
-    setInviteManagementMessage(null);
-    setGeneratedInviteLink(null);
+    setPrimaryInviteCopied(false);
+    setCopiedInviteId(null);
     setLastUserMessage("Preparing a shareable invite link from the active remote transport.");
 
     try {
       const result = await invoke<GeneratedInviteLinkResult>("generate_invite_link");
       const inviteLink = result.link;
-      setGeneratedInviteLink(inviteLink);
       const invites = await invoke<IssuedInviteLink[]>("list_issued_invite_links");
       setIssuedInviteLinks(invites);
 
       try {
         await copyTextToClipboard(inviteLink);
-        appendLog("[SYSTEM] Invite link copied to clipboard.");
-        setInviteCopySuccessMessage(
-          "Invite link copied. Paste it into the other app to link this server without SSH credentials.",
-        );
+        flashPrimaryInviteCopied();
         setLastUserMessage(
-          "Invite link copied to clipboard. Send it to the other device and import it there.",
+          "Invite link created and copied. You can now send it to another device.",
         );
       } catch (clipboardError) {
         appendLog(
           `[WARN] Invite link was generated, but clipboard copy failed: ${clipboardError}`,
         );
-        setInviteCopySuccessMessage(
-          "Invite link generated, but automatic clipboard copy was blocked. Copy it manually from the field below.",
-        );
         setLastUserMessage(
-          "Invite link generated successfully. Clipboard access was blocked, so copy the link manually from the field below.",
+          "Invite link created successfully. Clipboard access was blocked, so copy it from the invite list below.",
         );
       }
     } catch (error) {
@@ -580,14 +681,10 @@ export function useControlCenter() {
     }
   }
 
-  async function copyExistingInvite(inviteLink: string) {
-    setInviteCopySuccessMessage(null);
-    setInviteManagementMessage(null);
-
+  async function copyExistingInvite(inviteId: string, inviteLink: string) {
     try {
       await copyTextToClipboard(inviteLink);
-      setInviteManagementMessage("Invite link copied from the master list.");
-      appendLog("[SYSTEM] Invite link copied from the master list.");
+      flashIssuedInviteCopied(inviteId);
       setLastUserMessage(
         "Invite link copied from the master list. You can now send it to another device.",
       );
@@ -651,6 +748,125 @@ export function useControlCenter() {
     setPassword(value);
   }
 
+  function updateWarpProfileInput(value: string) {
+    setWarpProfileInput(value);
+    setWarpProfileMessage(null);
+  }
+
+  function flashPrimaryInviteCopied() {
+    setPrimaryInviteCopied(true);
+    window.setTimeout(() => {
+      setPrimaryInviteCopied(false);
+    }, 1800);
+  }
+
+  function flashIssuedInviteCopied(inviteId: string) {
+    setCopiedInviteId(inviteId);
+    window.setTimeout(() => {
+      setCopiedInviteId((current) => (current === inviteId ? null : current));
+    }, 1800);
+  }
+
+  async function importWarpProfile() {
+    if (!warpProfileInput.trim()) {
+      setWarpProfileMessage(
+        "Paste a WARP profile below, or use Create WARP Profile to let the app prepare one automatically from the current server.",
+      );
+      return;
+    }
+
+    setIsImportingWarpProfile(true);
+    setLastError(null);
+    setWarpProfileMessage(null);
+    setLocalDataResetMessage(null);
+    setLastUserMessage(
+      "Importing a local WARP profile so future deploys can use it for server-side egress.",
+    );
+
+    try {
+      const status = await invoke<LocalWarpProfileStatus>("import_local_warp_profile", {
+        profileText: warpProfileInput,
+      });
+      setLocalWarpProfileStatus(status);
+      setWarpProfileInput("");
+      setWarpProfileMessage(
+        "Local WARP profile imported. Future deploys will prefer it before trying automatic bootstrap on the server.",
+      );
+      appendLog(
+        "[SYSTEM] Local WARP profile imported. Future deploys will prefer it for server-side egress.",
+      );
+    } catch (error) {
+      appendLog(`[MAIN ERROR] WARP profile import failed: ${error}`);
+    } finally {
+      setIsImportingWarpProfile(false);
+    }
+  }
+
+  async function createWarpProfile() {
+    const profile = savedProfile ?? currentProfile;
+
+    if (!profile) {
+      setWarpProfileMessage(
+        "Enter the server address, login, and password first. Then the app can create a local WARP profile automatically.",
+      );
+      return;
+    }
+
+    setIsCreatingWarpProfile(true);
+    setLastError(null);
+    setWarpProfileMessage(null);
+    setLocalDataResetMessage(null);
+    setLastUserMessage(
+      "Creating a local WARP profile from the current server so future deploys can reuse it automatically.",
+    );
+
+    try {
+      const status = await invoke<LocalWarpProfileStatus>(
+        "bootstrap_local_warp_profile_from_credentials",
+        {
+          host: profile.host,
+          user: profile.user,
+          password: profile.password,
+        },
+      );
+      setLocalWarpProfileStatus(status);
+      setWarpProfileInput("");
+      setWarpProfileMessage(
+        "Local WARP profile created automatically from the current server. Future deploys on this Mac will reuse it first.",
+      );
+      appendLog(
+        "[SYSTEM] Local WARP profile created automatically from the current server.",
+      );
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Automatic WARP profile creation failed: ${error}`);
+    } finally {
+      setIsCreatingWarpProfile(false);
+    }
+  }
+
+  async function clearWarpProfile() {
+    setIsClearingWarpProfile(true);
+    setLastError(null);
+    setWarpProfileMessage(null);
+    setLastUserMessage(
+      "Removing the imported local WARP profile. Future deploys will rely on automatic bootstrap again.",
+    );
+
+    try {
+      await invoke("clear_local_warp_profile");
+      setLocalWarpProfileStatus(EMPTY_WARP_PROFILE_STATUS);
+      setWarpProfileInput("");
+      setWarpProfileMessage(
+        "Imported WARP profile removed from this Mac. Future deploys will use automatic bootstrap unless you import a profile again.",
+      );
+      appendLog("[SYSTEM] Imported local WARP profile removed from this Mac.");
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Failed to clear the local WARP profile: ${error}`);
+    } finally {
+      setIsClearingWarpProfile(false);
+    }
+  }
+
   async function importInviteLinkValue(inviteLink: string, isAutomatic = false) {
     const normalizedInviteLink = normalizeInviteLink(inviteLink);
 
@@ -669,7 +885,6 @@ export function useControlCenter() {
     setIsImportingInvite(true);
     setInviteLinkError(null);
     setInviteImportSuccessMessage(null);
-    setInviteManagementMessage(null);
     setLocalDataResetMessage(null);
     setLastError(null);
     setLastUserMessage(
@@ -687,7 +902,15 @@ export function useControlCenter() {
       window.localStorage.setItem(SUBORDINATE_HOST_KEY, result.host);
       window.localStorage.setItem(SUBORDINATE_COVER_DOMAIN_KEY, result.cover_domain);
       setSavedProfile(null);
+      setLocalWarpProfileStatus(EMPTY_WARP_PROFILE_STATUS);
+      setWarpProfileInput("");
+      setWarpProfileMessage(null);
       setIssuedInviteLinks([]);
+      setPrimaryInviteCopied(false);
+      setCopiedInviteId(null);
+      setIsInviteServerSyncPending(false);
+      setInviteSyncMessage(null);
+      setInviteSyncTone(null);
       setHost(result.host);
       setUser("root");
       setPassword("");
@@ -699,7 +922,6 @@ export function useControlCenter() {
       const importedAt = new Date().toISOString();
       setLastDeployedAt(importedAt);
       window.localStorage.setItem(LAST_DEPLOYED_AT_KEY, importedAt);
-      setGeneratedInviteLink(null);
       setInviteImportSuccessMessage(
         `Invite imported. This app now follows ${result.host} and is ready to start the tunnel.`,
       );
@@ -772,12 +994,14 @@ export function useControlCenter() {
   async function resetLocalData() {
     setIsResettingLocalData(true);
     setLastError(null);
-    setInviteCopySuccessMessage(null);
     setInviteImportSuccessMessage(null);
-    setInviteManagementMessage(null);
-    setGeneratedInviteLink(null);
+    setPrimaryInviteCopied(false);
+    setCopiedInviteId(null);
+    setWarpProfileMessage(null);
     setLocalDataResetMessage(null);
-    setLastUserMessage("Removing the saved local server profile and client config from this Mac.");
+    setLastUserMessage(
+      "Removing the saved local server profile, client config, and imported WARP profile from this Mac.",
+    );
     appendLog("--- RESETTING LOCAL APP DATA ---");
 
     try {
@@ -802,8 +1026,14 @@ export function useControlCenter() {
       setAvailableCoverDomains([]);
       setRequiresRedeploy(false);
       setRequiresInviteRefresh(false);
-      setInviteCopySuccessMessage(null);
+      setLocalWarpProfileStatus(EMPTY_WARP_PROFILE_STATUS);
+      setWarpProfileInput("");
       setInviteImportSuccessMessage(null);
+      setPrimaryInviteCopied(false);
+      setCopiedInviteId(null);
+      setIsInviteServerSyncPending(false);
+      setInviteSyncMessage(null);
+      setInviteSyncTone(null);
       setLastDeployedAt(null);
       setHasCompletedFirstStart(false);
       setAppRole("master");
@@ -818,7 +1048,7 @@ export function useControlCenter() {
       closeInviteLinkModal();
       appendLog("[SYSTEM] Local data reset completed.");
       setLastUserMessage(
-        "Local server profile and client config were removed from this Mac. Enter server details again to deploy a fresh config.",
+        "Local server profile, client config, and imported WARP profile were removed from this Mac. Enter server details again to deploy a fresh config.",
       );
     } catch (error) {
       appendLog(`[MAIN ERROR] Local data reset failed: ${error}`);
@@ -828,23 +1058,23 @@ export function useControlCenter() {
   }
 
   async function deleteIssuedInviteLink(inviteId: string) {
+    const previousInvites = issuedInviteLinks;
     setDeletingInviteId(inviteId);
-    setInviteManagementMessage(null);
     setLastError(null);
+    setIssuedInviteLinks((current) => current.filter((invite) => invite.id !== inviteId));
+    setCopiedInviteId((current) => (current === inviteId ? null : current));
+    setInviteSyncTone("pending");
+    setInviteSyncMessage("Please wait while the previous invite is removed from the server.");
 
     try {
       await invoke("delete_issued_invite_link", { inviteId });
-      const invites = await invoke<IssuedInviteLink[]>("list_issued_invite_links");
-      setIssuedInviteLinks(invites);
-      setGeneratedInviteLink((current) =>
-        current && invites.some((invite) => invite.link === current) ? current : null,
-      );
-      setInviteManagementMessage("Invite link removed from the master list.");
-      appendLog("[SYSTEM] Invite link removed from the master list.");
       setLastUserMessage(
-        "Invite link removed from the master app and revoked on the server. Any subordinate app using it will need a fresh invite link or must unlink itself.",
+        "Invite link removed from the master list. Remote revoke will finish in the background.",
       );
     } catch (error) {
+      setIssuedInviteLinks(previousInvites);
+      setInviteSyncTone("warning");
+      setInviteSyncMessage("Invite removal did not start cleanly. Try deleting it again.");
       appendLog(`[MAIN ERROR] Failed to delete invite link: ${error}`);
     } finally {
       setDeletingInviteId(null);
@@ -1009,6 +1239,50 @@ export function useControlCenter() {
     };
   }, [appRole, currentProfile, host, password, requiresRedeploy, savedProfile, user]);
 
+  const diagnosticsSummary = useMemo<DiagnosticsSummary>(() => {
+    const runtimeHealth = latestLogMatching(logs, "Runtime health:");
+    const warpRouting = latestLogMatching(logs, "WARP routing:");
+    const warpPeerHealth = latestLogMatching(logs, "WARP peer health:");
+    const warpKeepalive = latestLogMatching(logs, "WARP peer keepalive:");
+    const shadowTlsNoise = latestLogMatching(logs, "ShadowTLS noise:");
+    const coexistenceSnapshot = latestLogMatching(logs, "Coexistence snapshot:");
+
+    if (!runtimeHealth && !warpRouting && !shadowTlsNoise && !coexistenceSnapshot) {
+      return {
+        title: "Awaiting server diagnostics",
+        description:
+          "Run Check Server Status when you want a compact verdict about runtime health, WARP routing, and noisy-but-safe handshake warnings.",
+        tone: "neutral",
+      };
+    }
+
+    if (runtimeHealth?.includes("does not look healthy") || warpRouting?.includes("not detected")) {
+      return {
+        title: "Needs attention",
+        description:
+          [runtimeHealth, warpRouting, warpPeerHealth].filter(Boolean).join(" "),
+        tone: "attention",
+      };
+    }
+
+    if (shadowTlsNoise) {
+      return {
+        title: "Noisy but OK",
+        description: [runtimeHealth, warpRouting, shadowTlsNoise].filter(Boolean).join(" "),
+        tone: "ready",
+      };
+    }
+
+    return {
+      title: "Healthy",
+      description:
+        [runtimeHealth, warpRouting, warpPeerHealth, warpKeepalive, coexistenceSnapshot]
+          .filter(Boolean)
+          .join(" "),
+      tone: "ready",
+    };
+  }, [logs]);
+
   const powerQuickStatus = useMemo(() => {
     if (isDeploying) {
       return "Deploying server";
@@ -1080,14 +1354,20 @@ export function useControlCenter() {
     isInviteModalOpen,
     inviteLinkInput,
     inviteLinkError,
-    inviteCopySuccessMessage,
     inviteImportSuccessMessage,
-    inviteManagementMessage,
-    generatedInviteLink,
     issuedInviteLinks,
+    primaryInviteCopied,
+    copiedInviteId,
+    isInviteServerSyncPending,
+    inviteSyncMessage,
+    inviteSyncTone,
+    localWarpProfileStatus,
+    warpProfileInput,
+    warpProfileMessage,
     localDataResetMessage,
     formattedLastDeployedAt,
     serverStatusSummary,
+    diagnosticsSummary,
     powerQuickStatus,
     logs,
     trimmedLogCount,
@@ -1102,12 +1382,16 @@ export function useControlCenter() {
     isResettingLocalData,
     isGeneratingInvite,
     isImportingInvite,
+    isCreatingWarpProfile,
+    isImportingWarpProfile,
+    isClearingWarpProfile,
     deletingInviteId,
     isStarting,
     isStopping,
     setHost: updateHost,
     setUser: updateUser,
     setPassword: updatePassword,
+    setWarpProfileInput: updateWarpProfileInput,
     startTunnel,
     stopTunnel,
     deployServer,
@@ -1121,6 +1405,9 @@ export function useControlCenter() {
     importInviteLink,
     refreshConfiguration,
     resetLocalData,
+    createWarpProfile,
+    importWarpProfile,
+    clearWarpProfile,
     deleteIssuedInviteLink,
     copyLogs,
   };
