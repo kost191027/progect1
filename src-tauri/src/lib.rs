@@ -11,6 +11,7 @@ use tokio::time::{sleep, Duration};
 
 mod generator;
 mod geodata;
+#[path = "ssh/mod.rs"]
 mod ssh;
 
 const TRAY_ICON: Image<'_> = tauri::include_image!("./icons/tray-icon.png");
