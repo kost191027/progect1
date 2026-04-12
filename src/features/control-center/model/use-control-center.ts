@@ -453,18 +453,21 @@ export function useControlCenter() {
   }, []);
 
   useEffect(() => {
-    const latestLog = logs.length > 0 ? logs[logs.length - 1]?.toLowerCase() : undefined;
-    if (
-      appRole === "subordinate" &&
-      latestLog?.includes("traffic hijacked") &&
-      !requiresInviteRefresh
-    ) {
+    const unlisten = listen<string>("subordinate-config-outdated", () => {
+      if (appRole !== "subordinate") {
+        return;
+      }
+
       setRequiresInviteRefresh(true);
       setLastUserMessage(
         "This subordinate app is no longer accepted by the master app. The invite link may have been removed or the transport configuration may have changed.",
       );
-    }
-  }, [appRole, logs, requiresInviteRefresh]);
+    });
+
+    return () => {
+      unlisten.then((cleanup) => cleanup());
+    };
+  }, [appRole]);
 
   useEffect(() => {
     if (

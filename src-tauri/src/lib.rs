@@ -395,6 +395,10 @@ fn classify_proxy_failure(line: &str) -> bool {
             || lower.contains("connection reset"))
 }
 
+fn classify_outdated_subordinate_config(line: &str) -> bool {
+    line.to_lowercase().contains("traffic hijacked")
+}
+
 fn current_singbox_target_triple() -> Result<&'static str, String> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
@@ -628,6 +632,13 @@ fn spawn_log_reader(app: AppHandle, pid: u32, log_path: &'static str) {
                 Ok(Some(line)) => {
                     if !line.trim().is_empty() {
                         let _ = app.emit("tunnel-log", format!("[CORE] {}", line));
+                        if classify_outdated_subordinate_config(&line) {
+                            let _ = app.emit(
+                                "subordinate-config-outdated",
+                                "The subordinate tunnel config is outdated and must be refreshed."
+                                    .to_string(),
+                            );
+                        }
                         if classify_proxy_failure(&line) {
                             let state = app.state::<AppState>();
                             register_proxy_failure(&app, &state);
