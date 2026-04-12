@@ -2,7 +2,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -10,15 +9,15 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::deploy::validate_remote_runtime;
+use super::deploy::{execute_remote_deploy, RemoteDeployExecution};
 use super::warp::{
     clear_local_warp_profile_sync, ensure_remote_warp_config, load_saved_server_profile,
 };
 use super::{
     acquire_remote_mutation_lock, connect_ssh_session, ensure_local_client_rule_sets_sync,
     load_remote_container_name, load_remote_transport_bootstrap, local_client_config_path,
-    remove_saved_server_profile, stream_remote_deploy_output, LocalInstallationState,
-    RemoteInviteRecord, RemoteTransportBootstrap, PINNED_SING_BOX_IMAGE,
+    remove_saved_server_profile, LocalInstallationState, RemoteInviteRecord,
+    RemoteTransportBootstrap,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,48 +294,27 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
         "issued_invites": synced_invites
     })
     .to_string();
-    let deploy_script = include_str!("../../scripts/deploy.sh");
-    let injected_script = format!(
-        r#"#!/bin/bash
-mkdir -p /opt/rkn
-export RKN_IMAGE='{}'
-export RKN_CONTAINER_NAME='{}'
-cat << 'CONFIGEOF' > /opt/rkn/config.candidate.json
-{}
-CONFIGEOF
-
-cat << 'BOOTSTRAPEOF' > /opt/rkn/bootstrap.candidate.json
-{}
-BOOTSTRAPEOF
-
-{}
-"#,
-        PINNED_SING_BOX_IMAGE, container_name, server_cfg, bootstrap_cfg, deploy_script
-    );
-
-    let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
-    channel.exec("bash -s 2>&1").map_err(|e| e.to_string())?;
-    channel
-        .write_all(injected_script.as_bytes())
-        .map_err(|e| e.to_string())?;
-    channel.send_eof().map_err(|e| e.to_string())?;
-    stream_remote_deploy_output(app, &sess, &mut channel)?;
-    channel.wait_close().map_err(|e| e.to_string())?;
-    let exit_status = channel.exit_status().map_err(|e| e.to_string())?;
-
-    if exit_status != 0 {
-        return Err(format!(
-            "Invite sync deploy failed with code {}",
-            exit_status
-        ));
-    }
-
-    validate_remote_runtime(
+    execute_remote_deploy(
         &sess,
-        &container_name,
-        remote_bootstrap.external_port,
-        remote_bootstrap.internal_ss_port,
-    )?;
+        app,
+        &RemoteDeployExecution {
+            container_name: &container_name,
+            external_port: remote_bootstrap.external_port,
+            internal_ss_port: remote_bootstrap.internal_ss_port,
+            server_cfg: &server_cfg,
+            bootstrap_cfg: &bootstrap_cfg,
+        },
+    )
+    .map_err(|error| {
+        if let Some(code) = error
+            .strip_prefix("Deployment script exited with ")
+            .and_then(|value| value.trim().parse::<i32>().ok())
+        {
+            format!("Invite sync deploy failed with code {}", code)
+        } else {
+            error
+        }
+    })?;
 
     Ok(())
 }

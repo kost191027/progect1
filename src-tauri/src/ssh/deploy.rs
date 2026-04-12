@@ -18,6 +18,14 @@ fn compose_multi_user_ss_password(server_password: &str, user_password: &str) ->
     format!("{}:{}", server_password, user_password)
 }
 
+pub(crate) struct RemoteDeployExecution<'a> {
+    pub(crate) container_name: &'a str,
+    pub(crate) external_port: u16,
+    pub(crate) internal_ss_port: u16,
+    pub(crate) server_cfg: &'a str,
+    pub(crate) bootstrap_cfg: &'a str,
+}
+
 pub(crate) fn select_remote_deploy_target(
     sess: &Session,
     short_id: &str,
@@ -267,6 +275,82 @@ pub(crate) fn verify_external_port_reachable(host: &str, external_port: u16) -> 
     ))
 }
 
+pub(crate) fn execute_remote_deploy(
+    sess: &Session,
+    app: &AppHandle,
+    execution: &RemoteDeployExecution<'_>,
+) -> Result<(), String> {
+    let deploy_script = include_str!("../../scripts/deploy.sh");
+    let injected_script = format!(
+        r#"#!/bin/bash
+mkdir -p /opt/rkn
+export RKN_IMAGE='{}'
+export RKN_CONTAINER_NAME='{}'
+cat << 'CONFIGEOF' > /opt/rkn/config.candidate.json
+{}
+CONFIGEOF
+
+cat << 'BOOTSTRAPEOF' > /opt/rkn/bootstrap.candidate.json
+{}
+BOOTSTRAPEOF
+
+{}
+"#,
+        PINNED_SING_BOX_IMAGE,
+        execution.container_name,
+        execution.server_cfg,
+        execution.bootstrap_cfg,
+        deploy_script
+    );
+
+    emit_ssh_stage(
+        app,
+        "UPLOAD",
+        "Uploading generated config and deploy script...",
+    );
+    let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
+    emit_ssh_stage(app, "DEPLOY", "Executing remote fast-deploy script...");
+    channel.exec("bash -s 2>&1").map_err(|e| e.to_string())?;
+
+    channel
+        .write_all(injected_script.as_bytes())
+        .map_err(|e| e.to_string())?;
+    channel.send_eof().map_err(|e| e.to_string())?;
+    stream_remote_deploy_output(app, sess, &mut channel)?;
+
+    channel
+        .wait_close()
+        .map_err(|e| format!("Failed to wait for remote deploy close: {}", e))?;
+    let exit_status = channel
+        .exit_status()
+        .map_err(|e| format!("Failed to read remote deploy exit status: {}", e))?;
+
+    if exit_status != 0 {
+        let _ = app.emit(
+            "tunnel-log",
+            format!("[SSH ERROR] Deployment failed with code: {}", exit_status),
+        );
+        return Err(format!("Deployment script exited with {}", exit_status));
+    }
+
+    emit_ssh_stage(
+        app,
+        "VALIDATE",
+        format!(
+            "Remote deploy finished. Validating container {} and ports...",
+            execution.container_name
+        ),
+    );
+    validate_remote_runtime(
+        sess,
+        execution.container_name,
+        execution.external_port,
+        execution.internal_ss_port,
+    )?;
+
+    Ok(())
+}
+
 pub async fn deploy_server(
     app: AppHandle,
     host: String,
@@ -479,7 +563,7 @@ pub async fn deploy_server(
     );
 
     let deploy_app = app.clone();
-    let deploy_snapshot = tauri::async_runtime::spawn_blocking(move || {
+    let deploy_snapshot = tauri::async_runtime::spawn_blocking(move || -> Result<TransportStateSnapshot, String> {
         let _mutation_guard = acquire_remote_mutation_lock()?;
         let _ = deploy_app.emit(
             "tunnel-log",
@@ -534,7 +618,6 @@ pub async fn deploy_server(
             ),
         );
 
-        let deploy_script = include_str!("../../scripts/deploy.sh");
         let cover_domain = crate::generator::select_cover_domain(&short_id);
         let _ = deploy_app.emit(
             "tunnel-log",
@@ -580,60 +663,17 @@ pub async fn deploy_server(
             "DEPLOY",
             format!("Deploying transport on external port {}...", external_port),
         );
-
-        let injected_script = format!(
-            r#"#!/bin/bash
-mkdir -p /opt/rkn
-export RKN_IMAGE='{}'
-export RKN_CONTAINER_NAME='{}'
-cat << 'CONFIGEOF' > /opt/rkn/config.candidate.json
-{}
-CONFIGEOF
-
-cat << 'BOOTSTRAPEOF' > /opt/rkn/bootstrap.candidate.json
-{}
-BOOTSTRAPEOF
-
-{}
-"#,
-            PINNED_SING_BOX_IMAGE, container_name, server_cfg, bootstrap_cfg, deploy_script
-        );
-
-        emit_ssh_stage(&deploy_app, "UPLOAD", "Uploading generated config and deploy script...");
-        let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
-        emit_ssh_stage(&deploy_app, "DEPLOY", "Executing remote fast-deploy script...");
-        channel.exec("bash -s 2>&1").map_err(|e| e.to_string())?;
-
-        channel
-            .write_all(injected_script.as_bytes())
-            .map_err(|e| e.to_string())?;
-        channel.send_eof().map_err(|e| e.to_string())?;
-        stream_remote_deploy_output(&deploy_app, &sess, &mut channel)?;
-
-        channel
-            .wait_close()
-            .map_err(|e| format!("Failed to wait for remote deploy close: {}", e))?;
-        let exit_status = channel
-            .exit_status()
-            .map_err(|e| format!("Failed to read remote deploy exit status: {}", e))?;
-
-        if exit_status != 0 {
-            let _ = deploy_app.emit(
-                "tunnel-log",
-                format!("[SSH ERROR] Deployment failed with code: {}", exit_status),
-            );
-            return Err(format!("Deployment script exited with {}", exit_status));
-        }
-
-        emit_ssh_stage(
+        execute_remote_deploy(
+            &sess,
             &deploy_app,
-            "VALIDATE",
-            format!(
-                "Remote deploy finished. Validating container {} and ports...",
-                container_name
-            ),
-        );
-        validate_remote_runtime(&sess, &container_name, external_port, internal_ss_port)?;
+            &RemoteDeployExecution {
+                container_name: &container_name,
+                external_port,
+                internal_ss_port,
+                server_cfg: &server_cfg,
+                bootstrap_cfg: &bootstrap_cfg,
+            },
+        )?;
 
         emit_ssh_stage(
             &deploy_app,
