@@ -4,6 +4,8 @@ use std::{fs, path::PathBuf};
 use tauri::image::Image;
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
+#[cfg(target_os = "windows")]
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, Wry};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -24,6 +26,8 @@ struct AppState {
     proxy_failure_count: Mutex<u8>,
     kill_switch_engaged: Mutex<bool>,
     tray_toggle_item: Mutex<Option<MenuItem<Wry>>>,
+    #[cfg(target_os = "windows")]
+    windows_tray_notice_shown: Mutex<bool>,
 }
 
 fn tunnel_pid_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -156,14 +160,61 @@ fn show_main_window(app: &AppHandle, screen: Option<&str>) {
     }
 }
 
+fn quit_application(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Some(pid) = state.singbox_pid.lock().unwrap().take() {
+        let _ = terminate_root_process(pid);
+        let _ = std::fs::remove_file(tunnel_log_path());
+    }
+
+    clear_saved_tunnel_pid(app);
+    set_network_fingerprint(&state, None);
+    finish_recovery(&state);
+    reset_guard_state(&state);
+    emit_tunnel_state(app, false);
+    emit_guard_state(app, "inactive");
+    app.exit(0);
+}
+
+#[cfg(target_os = "windows")]
+fn maybe_announce_windows_tray_behavior(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mut shown = state.windows_tray_notice_shown.lock().unwrap();
+    if *shown {
+        return;
+    }
+
+    *shown = true;
+    let _ = app.emit(
+        "tunnel-log",
+        "[SYSTEM] Window hidden to the tray. RKN is still running in the background. Use the tray icon to reopen it or choose Quit there to exit completely.".to_string(),
+    );
+}
+
 fn process_exists(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "pid="])
-        .output()
-        .map(|output| {
-            output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
-        })
-        .unwrap_or(false)
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .output();
+        output
+            .map(|o| {
+                o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "pid="])
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+            })
+            .unwrap_or(false)
+    }
 }
 
 fn escape_applescript(value: &str) -> String {
@@ -186,29 +237,82 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 fn run_admin_command(script: &str) -> Result<std::process::Output, String> {
-    let osascript_arg = format!(
-        "do shell script \"{}\" with administrator privileges",
-        escape_applescript(script)
-    );
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, run_admin_command is only used for terminate_root_process.
+        // taskkill doesn't need elevation if the process was started by the same user session.
+        // For the rare case where it does, we use PowerShell -Verb RunAs synchronously.
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','{}'",
+                    script.replace('\'', "''")
+                ),
+            ])
+            .output()
+            .map_err(|e| format!("Failed to execute elevated PowerShell: {}", e))
+    }
 
-    std::process::Command::new("osascript")
-        .args(["-e", &osascript_arg])
-        .output()
-        .map_err(|e| format!("Failed to execute osascript: {}", e))
+    #[cfg(not(target_os = "windows"))]
+    {
+        let osascript_arg = format!(
+            "do shell script \"{}\" with administrator privileges",
+            escape_applescript(script)
+        );
+
+        std::process::Command::new("osascript")
+            .args(["-e", &osascript_arg])
+            .output()
+            .map_err(|e| format!("Failed to execute osascript: {}", e))
+    }
 }
 
 fn terminate_root_process(pid: u32) -> Result<(), String> {
-    let kill_cmd = format!(
-        "kill {} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {} >/dev/null 2>&1 || true",
-        pid, pid
-    );
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output()
+            .map_err(|e| format!("Failed to execute taskkill: {}", e))?;
 
-    let output = run_admin_command(&kill_cmd)?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    }
 
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let kill_cmd = format!(
+            "kill {} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {} >/dev/null 2>&1 || true",
+            pid, pid
+        );
+
+        let output = run_admin_command(&kill_cmd)?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    }
+}
+
+fn tunnel_log_path() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        // %TEMP%\rkn-tun.log — resolved at runtime, but for now we use a fixed path
+        // under the Windows temp directory. The actual path resolution happens via
+        // std::env::temp_dir() in the launch flow. This constant is the fallback.
+        "C:\\Windows\\Temp\\rkn-tun.log"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        "/tmp/rkn-tun.log"
     }
 }
 
@@ -282,8 +386,116 @@ fn read_clipboard_text() -> Result<String, String> {
 }
 
 fn current_network_fingerprint() -> Option<String> {
-    let output = std::process::Command::new("ifconfig")
-        .arg("-u")
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(fingerprint) = current_network_fingerprint_windows_powershell() {
+            return Some(fingerprint);
+        }
+
+        current_network_fingerprint_windows_ipconfig()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = std::process::Command::new("ifconfig")
+            .arg("-u")
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut blocks = Vec::new();
+        let mut current_header: Option<String> = None;
+        let mut current_status: Option<String> = None;
+        let mut current_ipv4: Option<String> = None;
+
+        let flush_block = |blocks: &mut Vec<String>,
+                           header: &mut Option<String>,
+                           status: &mut Option<String>,
+                           ipv4: &mut Option<String>| {
+            if let Some(iface) = header.take() {
+                if iface.starts_with("lo0") || iface.starts_with("utun") {
+                    *status = None;
+                    *ipv4 = None;
+                    return;
+                }
+
+                let status_value = status.take().unwrap_or_else(|| "unknown".to_string());
+                let ipv4_value = ipv4.take().unwrap_or_else(|| "no-ipv4".to_string());
+                blocks.push(format!("{}|{}|{}", iface, status_value, ipv4_value));
+            }
+        };
+
+        for line in stdout.lines() {
+            if !line.starts_with('\t') && line.contains(':') {
+                flush_block(
+                    &mut blocks,
+                    &mut current_header,
+                    &mut current_status,
+                    &mut current_ipv4,
+                );
+                current_header = line
+                    .split(':')
+                    .next()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                continue;
+            }
+
+            let trimmed = line.trim();
+            if let Some(value) = trimmed.strip_prefix("status:") {
+                current_status = Some(value.trim().to_string());
+            } else if let Some(value) = trimmed.strip_prefix("inet ") {
+                let ipv4 = value.split_whitespace().next().unwrap_or_default().trim();
+                if !ipv4.is_empty() {
+                    current_ipv4 = Some(ipv4.to_string());
+                }
+            }
+        }
+
+        flush_block(
+            &mut blocks,
+            &mut current_header,
+            &mut current_status,
+            &mut current_ipv4,
+        );
+
+        if blocks.is_empty() {
+            None
+        } else {
+            Some(blocks.join(";"))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn current_network_fingerprint_windows_powershell() -> Option<String> {
+    let script = r#"
+      $ErrorActionPreference = 'Stop'
+      $items = @(
+        Get-NetIPConfiguration |
+          Where-Object {
+            $_.NetAdapter -and
+            $_.NetAdapter.Status -eq 'Up' -and
+            $_.IPv4Address -and
+            $_.InterfaceAlias -notmatch 'Loopback|isatap|Teredo|Wintun|TAP|VPN|vEthernet|Bluetooth|Npcap|tun'
+          } |
+          Select-Object `
+            @{Name='alias';Expression={$_.InterfaceAlias}}, `
+            @{Name='index';Expression={$_.InterfaceIndex}}, `
+            @{Name='ipv4';Expression={($_.IPv4Address | Select-Object -ExpandProperty IPAddress -First 1)}}, `
+            @{Name='gateway';Expression={($_.IPv4DefaultGateway | Select-Object -ExpandProperty NextHop -First 1)}}, `
+            @{Name='dns';Expression={@(($_.DNSServer.ServerAddresses)) -join ','}} |
+          Sort-Object index, alias
+      )
+      $items | ConvertTo-Json -Compress
+    "#;
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
         .output()
         .ok()?;
 
@@ -291,62 +503,119 @@ fn current_network_fingerprint() -> Option<String> {
         return None;
     }
 
+    parse_windows_network_fingerprint_json(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "windows")]
+fn current_network_fingerprint_windows_ipconfig() -> Option<String> {
+    let output = std::process::Command::new("ipconfig").output().ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut blocks = Vec::new();
-    let mut current_header: Option<String> = None;
-    let mut current_status: Option<String> = None;
+    let mut current_adapter: Option<String> = None;
     let mut current_ipv4: Option<String> = None;
 
-    let flush_block = |blocks: &mut Vec<String>,
-                       header: &mut Option<String>,
-                       status: &mut Option<String>,
-                       ipv4: &mut Option<String>| {
-        if let Some(iface) = header.take() {
-            if iface.starts_with("lo0") || iface.starts_with("utun") {
-                *status = None;
-                *ipv4 = None;
-                return;
-            }
-
-            let status_value = status.take().unwrap_or_else(|| "unknown".to_string());
-            let ipv4_value = ipv4.take().unwrap_or_else(|| "no-ipv4".to_string());
-            blocks.push(format!("{}|{}|{}", iface, status_value, ipv4_value));
-        }
-    };
-
     for line in stdout.lines() {
-        if !line.starts_with('\t') && line.contains(':') {
-            flush_block(
-                &mut blocks,
-                &mut current_header,
-                &mut current_status,
-                &mut current_ipv4,
-            );
-            current_header = line
-                .split(':')
-                .next()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
             continue;
         }
 
-        let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix("status:") {
-            current_status = Some(value.trim().to_string());
-        } else if let Some(value) = trimmed.strip_prefix("inet ") {
-            let ipv4 = value.split_whitespace().next().unwrap_or_default().trim();
-            if !ipv4.is_empty() {
-                current_ipv4 = Some(ipv4.to_string());
+        if !line.starts_with(' ') && line.contains(':') {
+            if let Some(adapter) = current_adapter.take() {
+                if let Some(ip) = current_ipv4.take() {
+                    let lower = adapter.to_lowercase();
+                    if !lower.contains("loopback")
+                        && !lower.contains("isatap")
+                        && !lower.contains("teredo")
+                        && !lower.contains("wintun")
+                        && !lower.contains("vethernet")
+                    {
+                        blocks.push(format!("{}|{}", adapter, ip));
+                    }
+                }
+            }
+
+            current_adapter = line
+                .trim_end()
+                .strip_suffix(':')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            current_ipv4 = None;
+            continue;
+        }
+
+        if trimmed.contains("IPv4") && trimmed.contains(':') {
+            if let Some(ip) = trimmed.split(':').last() {
+                let ip = ip.trim();
+                if !ip.is_empty() {
+                    current_ipv4 = Some(ip.to_string());
+                }
             }
         }
     }
 
-    flush_block(
-        &mut blocks,
-        &mut current_header,
-        &mut current_status,
-        &mut current_ipv4,
-    );
+    if let Some(adapter) = current_adapter.take() {
+        if let Some(ip) = current_ipv4.take() {
+            let lower = adapter.to_lowercase();
+            if !lower.contains("loopback")
+                && !lower.contains("isatap")
+                && !lower.contains("teredo")
+                && !lower.contains("wintun")
+                && !lower.contains("vethernet")
+            {
+                blocks.push(format!("{}|{}", adapter, ip));
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks.join(";"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_network_fingerprint_json(stdout: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok()?;
+    let items = parsed.as_array()?;
+    let mut blocks = Vec::new();
+
+    for item in items {
+        let alias = item
+            .get("alias")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let index = item.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ipv4 = item
+            .get("ipv4")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let gateway = item
+            .get("gateway")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let dns = item
+            .get("dns")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+
+        if alias.is_empty() || ipv4.is_empty() {
+            continue;
+        }
+
+        blocks.push(format!("{index}|{alias}|{ipv4}|{gateway}|{dns}"));
+    }
 
     if blocks.is_empty() {
         None
@@ -367,6 +636,17 @@ fn get_network_fingerprint(state: &AppState) -> Option<String> {
 fn finish_recovery(state: &AppState) {
     let mut guard = state.recovery_in_progress.lock().unwrap();
     *guard = false;
+}
+
+#[cfg(target_os = "windows")]
+fn begin_recovery(state: &AppState) -> bool {
+    let mut guard = state.recovery_in_progress.lock().unwrap();
+    if *guard {
+        return false;
+    }
+
+    *guard = true;
+    true
 }
 
 fn reset_guard_state(state: &AppState) {
@@ -462,6 +742,148 @@ fn resolve_singbox_path() -> Result<String, String> {
     }
 }
 
+/// Windows: launches sing-box as an elevated process via PowerShell UAC prompt.
+///
+/// The flow:
+/// 1. Build a PowerShell inner command that starts sing-box, redirects output to
+///    the log file, and writes the PID to a temp file.
+/// 2. Launch that command with `Start-Process -Verb RunAs` which triggers the
+///    native Windows UAC dialog.
+/// 3. Poll for the PID file (the elevated process writes it asynchronously).
+#[cfg(target_os = "windows")]
+async fn launch_tunnel_process_windows(
+    app: &AppHandle,
+    singbox_path: &str,
+    config_str: &str,
+    log_path: &str,
+) -> Result<u32, String> {
+    // --- Pre-flight diagnostics ---
+
+    // 1. Check that wintun.dll is accessible (required for TUN mode)
+    let singbox_dir = std::path::Path::new(singbox_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let wintun_path = singbox_dir.join("wintun.dll");
+    if !wintun_path.exists() {
+        // Also check the resource directory (Tauri places bundled resources there)
+        let resource_wintun = app.path().resource_dir().ok().map(|d| d.join("wintun.dll"));
+        let found = resource_wintun.as_ref().map_or(false, |p| p.exists());
+        if !found {
+            let _ = app.emit(
+                "tunnel-log",
+                "[ERROR] wintun.dll not found. TUN mode requires the Wintun driver.",
+            );
+            return Err(
+                "wintun.dll not found next to sing-box. Reinstall the application.".to_string(),
+            );
+        }
+        // Copy wintun.dll from resource dir to sing-box directory so it can find it
+        if let Some(src) = resource_wintun {
+            let _ = std::fs::copy(&src, &wintun_path);
+        }
+    }
+
+    // 2. Check that sing-box binary exists and is not blocked
+    if !std::path::Path::new(singbox_path).exists() {
+        return Err(format!(
+            "sing-box binary not found at {}. Reinstall the application.",
+            singbox_path
+        ));
+    }
+
+    let local_data = app
+        .path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let pid_file = local_data.join("elevated_singbox.pid");
+    let _ = std::fs::remove_file(&pid_file);
+
+    let pid_file_str = pid_file.to_string_lossy().to_string();
+
+    // PowerShell script that runs inside the elevated process:
+    // - Start sing-box with output redirected to log file
+    // - Write PID to the pid file so the parent can read it
+    let inner_ps = format!(
+        r#"$ErrorActionPreference='Stop'; $p = Start-Process -FilePath '{singbox}' -ArgumentList 'run','-c','{config}' -PassThru -NoNewWindow -RedirectStandardOutput '{log}' -RedirectStandardError '{log}.err'; $p.Id | Out-File -FilePath '{pidfile}' -Encoding ASCII -NoNewline"#,
+        singbox = singbox_path.replace('\'', "''"),
+        config = config_str.replace('\'', "''"),
+        log = log_path.replace('\'', "''"),
+        pidfile = pid_file_str.replace('\'', "''"),
+    );
+
+    // Outer command: launch elevated PowerShell with the inner script
+    let output = app
+        .shell()
+        .command("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','{}'",
+                inner_ps.replace('\'', "''")
+            ),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to launch elevated PowerShell: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.contains("canceled")
+            || stderr.contains("cancelled")
+            || stderr.contains("0x80004005")
+        {
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Administrator access was cancelled by user.",
+            );
+            return Err("User cancelled admin prompt".to_string());
+        }
+        return Err(format!("PowerShell elevation error: {}", stderr));
+    }
+
+    // Poll for the PID file written by the elevated process
+    for _ in 0..20 {
+        sleep(Duration::from_millis(300)).await;
+        if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+            let trimmed = contents.trim();
+            if let Ok(pid) = trimmed.parse::<u32>() {
+                let _ = std::fs::remove_file(&pid_file);
+                return Ok(pid);
+            }
+        }
+    }
+
+    // Check for common failure reasons and emit diagnostics
+    let err_log = format!("{}.err", log_path);
+    let err_hint = std::fs::read_to_string(&err_log)
+        .ok()
+        .and_then(|s| {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .unwrap_or_default();
+
+    let diagnostic = if err_hint.contains("wintun") || err_hint.contains("Wintun") {
+        "Wintun driver failed to initialize. It may be blocked by antivirus software."
+    } else if err_hint.contains("Access is denied") || err_hint.contains("access denied") {
+        "Access denied — administrator privileges are required. Check UAC settings."
+    } else if err_hint.contains("antivirus") || err_hint.contains("blocked") {
+        "sing-box may be blocked by antivirus software. Add an exception and retry."
+    } else if !err_hint.is_empty() {
+        &err_hint
+    } else {
+        "Timed out waiting for elevated sing-box to start. Check UAC settings and antivirus."
+    };
+
+    let _ = app.emit("tunnel-log", format!("[ERROR] {}", diagnostic));
+    Err(diagnostic.to_string())
+}
+
 async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result<u32, String> {
     let singbox_path = resolve_singbox_path()?;
 
@@ -473,7 +895,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
     }
 
     let config_str = config_path.to_string_lossy().to_string();
-    let log_path = "/tmp/rkn-tun.log";
+    let log_path = tunnel_log_path();
 
     if announce_prompt {
         let _ = app.emit(
@@ -482,42 +904,50 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
         );
     }
 
-    let shell_cmd = format!(
-        "{} run -c {} > {} 2>&1 & echo $!",
-        shell_single_quote(&singbox_path),
-        shell_single_quote(&config_str),
-        shell_single_quote(log_path),
-    );
-
-    let osascript_arg = format!(
-        "do shell script \"{}\" with administrator privileges",
-        escape_applescript(&shell_cmd)
-    );
-
-    let output = app
-        .shell()
-        .command("osascript")
-        .args(["-e", &osascript_arg])
-        .output()
-        .await
-        .map_err(|e| format!("Failed to execute osascript: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("-128") {
-            let _ = app.emit(
-                "tunnel-log",
-                "[SYSTEM] Administrator access was cancelled by user.",
-            );
-            return Err("User cancelled admin prompt".to_string());
-        }
-        return Err(format!("osascript error: {}", stderr));
+    #[cfg(target_os = "windows")]
+    {
+        launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
     }
 
-    let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    pid_str
-        .parse()
-        .map_err(|_| format!("Failed to parse PID from: '{}'", pid_str))
+    #[cfg(not(target_os = "windows"))]
+    {
+        let shell_cmd = format!(
+            "{} run -c {} > {} 2>&1 & echo $!",
+            shell_single_quote(&singbox_path),
+            shell_single_quote(&config_str),
+            shell_single_quote(log_path),
+        );
+
+        let osascript_arg = format!(
+            "do shell script \"{}\" with administrator privileges",
+            escape_applescript(&shell_cmd)
+        );
+
+        let output = app
+            .shell()
+            .command("osascript")
+            .args(["-e", &osascript_arg])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute osascript: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("User canceled") || stderr.contains("-128") {
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Administrator access was cancelled by user.",
+                );
+                return Err("User cancelled admin prompt".to_string());
+            }
+            return Err(format!("osascript error: {}", stderr));
+        }
+
+        let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        pid_str
+            .parse()
+            .map_err(|_| format!("Failed to parse PID from: '{}'", pid_str))
+    }
 }
 
 async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, String> {
@@ -530,49 +960,59 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
     }
 
     let config_str = config_path.to_string_lossy().to_string();
-    let log_path = "/tmp/rkn-tun.log";
+    let log_path = tunnel_log_path();
 
     let _ = app.emit(
         "tunnel-log",
         "[SYSTEM] Requesting administrator privileges to restart the tunnel...".to_string(),
     );
 
-    let shell_cmd = format!(
-        "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n{} run -c {} > {} 2>&1 & echo $!",
-        shell_single_quote(&singbox_path),
-        shell_single_quote(&config_str),
-        shell_single_quote(log_path),
-    );
-
-    let osascript_arg = format!(
-        "do shell script \"{}\" with administrator privileges",
-        escape_applescript(&shell_cmd)
-    );
-
-    let output = app
-        .shell()
-        .command("osascript")
-        .args(["-e", &osascript_arg])
-        .output()
-        .await
-        .map_err(|e| format!("Failed to execute osascript: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("-128") {
-            let _ = app.emit(
-                "tunnel-log",
-                "[SYSTEM] Administrator access was cancelled by user.",
-            );
-            return Err("User cancelled admin prompt".to_string());
-        }
-        return Err(format!("osascript error: {}", stderr));
+    #[cfg(target_os = "windows")]
+    {
+        let _ = terminate_root_process(old_pid);
+        sleep(Duration::from_secs(1)).await;
+        launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
     }
 
-    let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    pid_str
-        .parse()
-        .map_err(|_| format!("Failed to parse PID from: '{}'", pid_str))
+    #[cfg(not(target_os = "windows"))]
+    {
+        let shell_cmd = format!(
+            "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n{} run -c {} > {} 2>&1 & echo $!",
+            shell_single_quote(&singbox_path),
+            shell_single_quote(&config_str),
+            shell_single_quote(log_path),
+        );
+
+        let osascript_arg = format!(
+            "do shell script \"{}\" with administrator privileges",
+            escape_applescript(&shell_cmd)
+        );
+
+        let output = app
+            .shell()
+            .command("osascript")
+            .args(["-e", &osascript_arg])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute osascript: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("User canceled") || stderr.contains("-128") {
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Administrator access was cancelled by user.",
+                );
+                return Err("User cancelled admin prompt".to_string());
+            }
+            return Err(format!("osascript error: {}", stderr));
+        }
+
+        let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        pid_str
+            .parse()
+            .map_err(|_| format!("Failed to parse PID from: '{}'", pid_str))
+    }
 }
 
 async fn verify_tunnel_start(
@@ -716,6 +1156,11 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
 
 fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
     tauri::async_runtime::spawn(async move {
+        #[cfg(target_os = "windows")]
+        let mut last_tick = std::time::Instant::now();
+        #[cfg(target_os = "windows")]
+        let mut adapter_missing = false;
+
         loop {
             sleep(Duration::from_secs(5)).await;
 
@@ -730,6 +1175,66 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
             }
 
             let current_fingerprint = current_network_fingerprint();
+
+            #[cfg(target_os = "windows")]
+            {
+                let elapsed = last_tick.elapsed();
+                last_tick = std::time::Instant::now();
+
+                if elapsed >= Duration::from_secs(20) {
+                    let state = app.state::<AppState>();
+                    if begin_recovery(&state) {
+                        if let Some(fingerprint) = current_fingerprint.clone() {
+                            set_network_fingerprint(&state, Some(fingerprint));
+                        } else {
+                            set_network_fingerprint(&state, None);
+                        }
+
+                        reset_guard_state(&state);
+                        emit_guard_state(&app, "active");
+                        let _ = app.emit(
+                            "tunnel-log",
+                            "[SYSTEM] Windows resume detected after sleep or suspend. Keeping the tunnel active and reinitializing the recovery state for the current network context.".to_string(),
+                        );
+                        finish_recovery(&state);
+                    }
+                }
+
+                if current_fingerprint.is_none() {
+                    if !adapter_missing {
+                        adapter_missing = true;
+                        let state = app.state::<AppState>();
+                        if begin_recovery(&state) {
+                            set_network_fingerprint(&state, None);
+                            let _ = app.emit(
+                                "tunnel-log",
+                                "[SYSTEM] Windows network adapter is temporarily unavailable. Waiting for the adapter to come back before refreshing the tunnel recovery state.".to_string(),
+                            );
+                            finish_recovery(&state);
+                        }
+                    }
+                    continue;
+                }
+
+                if adapter_missing {
+                    adapter_missing = false;
+                    let state = app.state::<AppState>();
+                    if begin_recovery(&state) {
+                        if let Some(fingerprint) = current_fingerprint.clone() {
+                            set_network_fingerprint(&state, Some(fingerprint));
+                        }
+                        reset_guard_state(&state);
+                        emit_guard_state(&app, "active");
+                        let _ = app.emit(
+                            "tunnel-log",
+                            "[SYSTEM] Windows network adapter reconnected. Keeping the tunnel active and refreshing the routing context for the restored adapter.".to_string(),
+                        );
+                        finish_recovery(&state);
+                    }
+                    continue;
+                }
+            }
+
             let fingerprint_changed = {
                 let state = app.state::<AppState>();
                 let previous = get_network_fingerprint(&state);
@@ -745,6 +1250,26 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                 set_network_fingerprint(&state, Some(fingerprint));
             }
 
+            #[cfg(target_os = "windows")]
+            {
+                if begin_recovery(&state) {
+                    let was_engaged = *state.kill_switch_engaged.lock().unwrap();
+                    let previous_failures = *state.proxy_failure_count.lock().unwrap();
+                    reset_guard_state(&state);
+
+                    if was_engaged || previous_failures > 0 {
+                        emit_guard_state(&app, "active");
+                    }
+
+                    let _ = app.emit(
+                        "tunnel-log",
+                        "[SYSTEM] Windows network change detected. Keeping the tunnel active and refreshing the recovery state for the new adapter.".to_string(),
+                    );
+                    finish_recovery(&state);
+                }
+                continue;
+            }
+
             let _ = app.emit(
                 "tunnel-log",
                 "[SYSTEM] Network change detected. Keeping tunnel active and updating the network context.".to_string(),
@@ -755,6 +1280,8 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use super::parse_windows_network_fingerprint_json;
     use super::{escape_applescript, shell_single_quote};
 
     #[test]
@@ -775,6 +1302,18 @@ mod tests {
         let quoted = shell_single_quote(input);
 
         assert_eq!(quoted, r#"'/tmp/test'"'"'s "path" $(whoami) `id`'"#);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parse_windows_network_fingerprint_json_builds_stable_fingerprint() {
+        let sample = r#"[{"alias":"Wi-Fi","index":17,"ipv4":"192.168.1.25","gateway":"192.168.1.1","dns":"1.1.1.1,8.8.8.8"},{"alias":"Ethernet","index":7,"ipv4":"10.0.0.14","gateway":"10.0.0.1","dns":"10.0.0.1"}]"#;
+        let parsed = parse_windows_network_fingerprint_json(sample);
+
+        assert_eq!(
+            parsed.as_deref(),
+            Some("17|Wi-Fi|192.168.1.25|192.168.1.1|1.1.1.1,8.8.8.8;7|Ethernet|10.0.0.14|10.0.0.1|10.0.0.1")
+        );
     }
 }
 
@@ -809,8 +1348,8 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         format!("[SYSTEM] Core process started with PID {} (root)", pid),
     );
 
-    verify_tunnel_start(&app, &state, pid, "/tmp/rkn-tun.log").await?;
-    spawn_log_reader(app.clone(), pid, "/tmp/rkn-tun.log");
+    verify_tunnel_start(&app, &state, pid, tunnel_log_path()).await?;
+    spawn_log_reader(app.clone(), pid, tunnel_log_path());
     spawn_process_exit_monitor(app.clone(), pid);
     spawn_network_recovery_monitor(app.clone(), pid);
 
@@ -849,7 +1388,7 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
                 );
             }
 
-            let _ = std::fs::remove_file("/tmp/rkn-tun.log");
+            let _ = std::fs::remove_file(tunnel_log_path());
             clear_saved_tunnel_pid(&app);
             set_network_fingerprint(&state, None);
             finish_recovery(&state);
@@ -912,7 +1451,7 @@ async fn reset_local_data(app: AppHandle) -> Result<(), String> {
     ssh::clear_cached_transport_bootstrap(&app)?;
     ssh::clear_backend_app_role(&app)?;
 
-    let _ = fs::remove_file("/tmp/rkn-tun.log");
+    let _ = fs::remove_file(tunnel_log_path());
     set_network_fingerprint(&state, None);
     finish_recovery(&state);
     reset_guard_state(&state);
@@ -957,8 +1496,8 @@ pub(crate) async fn restart_tunnel_if_running(
         }
     };
 
-    verify_tunnel_start(app, &state, new_pid, "/tmp/rkn-tun.log").await?;
-    spawn_log_reader(app.clone(), new_pid, "/tmp/rkn-tun.log");
+    verify_tunnel_start(app, &state, new_pid, tunnel_log_path()).await?;
+    spawn_log_reader(app.clone(), new_pid, tunnel_log_path());
     spawn_process_exit_monitor(app.clone(), new_pid);
     spawn_network_recovery_monitor(app.clone(), new_pid);
     let _ = app.emit(
@@ -1014,7 +1553,7 @@ async fn restore_tunnel_session(
     reset_guard_state(&state);
     emit_tunnel_state(&app, true);
     emit_guard_state(&app, "active");
-    spawn_log_reader(app.clone(), saved_pid, "/tmp/rkn-tun.log");
+    spawn_log_reader(app.clone(), saved_pid, tunnel_log_path());
     spawn_process_exit_monitor(app.clone(), saved_pid);
     spawn_network_recovery_monitor(app.clone(), saved_pid);
     refresh_tray_toggle_item(&app);
@@ -1034,6 +1573,8 @@ pub fn run() {
             proxy_failure_count: Mutex::new(0),
             kill_switch_engaged: Mutex::new(false),
             tray_toggle_item: Mutex::new(None),
+            #[cfg(target_os = "windows")]
+            windows_tray_notice_shown: Mutex::new(false),
         })
         .setup(|app| {
             // --- System Tray (живёт в менюбаре macOS) ---
@@ -1063,6 +1604,31 @@ pub fn run() {
                 .icon_as_template(false)
                 .tooltip("RKN — Recursive Kinetic Network")
                 .menu(&menu)
+                .on_tray_icon_event(|tray, event| {
+                    #[cfg(target_os = "windows")]
+                    {
+                        let app = tray.app_handle();
+                        match event {
+                            TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            }
+                            | TrayIconEvent::DoubleClick {
+                                button: MouseButton::Left,
+                                ..
+                            } => {
+                                show_main_window(&app, None);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        let _ = (tray, event);
+                    }
+                })
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "toggle_tunnel" => {
                         let app_handle = app.clone();
@@ -1094,17 +1660,7 @@ pub fn run() {
                         show_main_window(app, Some("info"));
                     }
                     "quit" => {
-                        // Убиваем sing-box процесс перед выходом
-                        let state = app.state::<AppState>();
-                        if let Some(pid) = state.singbox_pid.lock().unwrap().take() {
-                            let _ = terminate_root_process(pid);
-                            let _ = std::fs::remove_file("/tmp/rkn-tun.log");
-                        }
-                        clear_saved_tunnel_pid(app);
-                        reset_guard_state(&state);
-                        emit_tunnel_state(app, false);
-                        emit_guard_state(app, "inactive");
-                        app.exit(0);
+                        quit_application(app);
                     }
                     _ => {}
                 })
@@ -1117,8 +1673,9 @@ pub fn run() {
         // --- Закрытие окна → скрытие (туннель продолжает работать) ---
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                // Не закрываем, а прячем окно
                 let _ = window.hide();
+                #[cfg(target_os = "windows")]
+                maybe_announce_windows_tray_behavior(&window.app_handle());
                 api.prevent_close();
             }
         })

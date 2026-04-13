@@ -35,6 +35,10 @@ const faqItems = [
     body: "The app is designed for macOS first and uses the system WebView through Tauri. It needs administrator confirmation when the tunnel is started because the local TUN adapter requires elevated rights.",
   },
   {
+    title: "Does the app support Windows?",
+    body: "Yes. RKN now supports both macOS and Windows desktop builds. On Windows, the app uses the same deploy and tunnel flow, but the local tunnel start may require administrator confirmation and can be affected by Windows Firewall, antivirus checks, or Wintun driver policies on the current machine.",
+  },
+  {
     title: "What about distribution and licenses?",
     body: "This build is intended for a self-hosted workflow. Third-party components, including sing-box, keep their own upstream licenses and notices. If you redistribute packaged builds, preserve those notices and review the final licensing policy for the project build you ship.",
   },
