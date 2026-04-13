@@ -4,6 +4,8 @@ use std::{fs, path::PathBuf};
 use tauri::image::Image;
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
+#[cfg(target_os = "windows")]
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, Wry};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -24,6 +26,8 @@ struct AppState {
     proxy_failure_count: Mutex<u8>,
     kill_switch_engaged: Mutex<bool>,
     tray_toggle_item: Mutex<Option<MenuItem<Wry>>>,
+    #[cfg(target_os = "windows")]
+    windows_tray_notice_shown: Mutex<bool>,
 }
 
 fn tunnel_pid_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -154,6 +158,37 @@ fn show_main_window(app: &AppHandle, screen: Option<&str>) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+fn quit_application(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Some(pid) = state.singbox_pid.lock().unwrap().take() {
+        let _ = terminate_root_process(pid);
+        let _ = std::fs::remove_file(tunnel_log_path());
+    }
+
+    clear_saved_tunnel_pid(app);
+    set_network_fingerprint(&state, None);
+    finish_recovery(&state);
+    reset_guard_state(&state);
+    emit_tunnel_state(app, false);
+    emit_guard_state(app, "inactive");
+    app.exit(0);
+}
+
+#[cfg(target_os = "windows")]
+fn maybe_announce_windows_tray_behavior(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mut shown = state.windows_tray_notice_shown.lock().unwrap();
+    if *shown {
+        return;
+    }
+
+    *shown = true;
+    let _ = app.emit(
+        "tunnel-log",
+        "[SYSTEM] Window hidden to the tray. RKN is still running in the background. Use the tray icon to reopen it or choose Quit there to exit completely.".to_string(),
+    );
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -1538,6 +1573,8 @@ pub fn run() {
             proxy_failure_count: Mutex::new(0),
             kill_switch_engaged: Mutex::new(false),
             tray_toggle_item: Mutex::new(None),
+            #[cfg(target_os = "windows")]
+            windows_tray_notice_shown: Mutex::new(false),
         })
         .setup(|app| {
             // --- System Tray (живёт в менюбаре macOS) ---
@@ -1567,6 +1604,31 @@ pub fn run() {
                 .icon_as_template(false)
                 .tooltip("RKN — Recursive Kinetic Network")
                 .menu(&menu)
+                .on_tray_icon_event(|tray, event| {
+                    #[cfg(target_os = "windows")]
+                    {
+                        let app = tray.app_handle();
+                        match event {
+                            TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            }
+                            | TrayIconEvent::DoubleClick {
+                                button: MouseButton::Left,
+                                ..
+                            } => {
+                                show_main_window(&app, None);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        let _ = (tray, event);
+                    }
+                })
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "toggle_tunnel" => {
                         let app_handle = app.clone();
@@ -1598,17 +1660,7 @@ pub fn run() {
                         show_main_window(app, Some("info"));
                     }
                     "quit" => {
-                        // Убиваем sing-box процесс перед выходом
-                        let state = app.state::<AppState>();
-                        if let Some(pid) = state.singbox_pid.lock().unwrap().take() {
-                            let _ = terminate_root_process(pid);
-                            let _ = std::fs::remove_file(tunnel_log_path());
-                        }
-                        clear_saved_tunnel_pid(app);
-                        reset_guard_state(&state);
-                        emit_tunnel_state(app, false);
-                        emit_guard_state(app, "inactive");
-                        app.exit(0);
+                        quit_application(app);
                     }
                     _ => {}
                 })
@@ -1621,8 +1673,9 @@ pub fn run() {
         // --- Закрытие окна → скрытие (туннель продолжает работать) ---
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                // Не закрываем, а прячем окно
                 let _ = window.hide();
+                #[cfg(target_os = "windows")]
+                maybe_announce_windows_tray_behavior(&window.app_handle());
                 api.prevent_close();
             }
         })
