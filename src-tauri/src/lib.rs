@@ -863,15 +863,42 @@ async fn launch_tunnel_process_windows(
     let bootstrap_script_body = format!(
         r#"$ErrorActionPreference = 'Stop'
 try {{
-  $p = Start-Process -FilePath '{singbox}' -ArgumentList @('run','-c','{config}') -PassThru -WindowStyle Hidden
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = '{singbox}'
+  $psi.WorkingDirectory = '{workdir}'
+  $psi.Arguments = 'run -c "{config}"'
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+
+  $p = New-Object System.Diagnostics.Process
+  $p.StartInfo = $psi
+  [void]$p.Start()
   [System.IO.File]::WriteAllText('{pidfile}', $p.Id.ToString(), [System.Text.Encoding]::ASCII)
+
+  if ($p.WaitForExit(3000)) {{
+    $logTail = ''
+    if (Test-Path '{log_path}') {{
+      try {{
+        $logTail = (Get-Content -Path '{log_path}' -Tail 20 | Out-String)
+      }} catch {{}}
+    }}
+    $message = "sing-box exited during bootstrap with code $($p.ExitCode)."
+    if (-not [string]::IsNullOrWhiteSpace($logTail)) {{
+      $message = $message + [Environment]::NewLine + $logTail.Trim()
+    }}
+    [System.IO.File]::WriteAllText('{bootstrap_err}', $message, [System.Text.Encoding]::UTF8)
+    exit 1
+  }}
+
   exit 0
 }} catch {{
   [System.IO.File]::WriteAllText('{bootstrap_err}', ($_ | Out-String), [System.Text.Encoding]::UTF8)
   exit 1
 }}"#,
         singbox = singbox_path.replace('\'', "''"),
+        workdir = singbox_dir.to_string_lossy().replace('\'', "''"),
         config = config_str.replace('\'', "''"),
+        log_path = log_path.replace('\'', "''"),
         pidfile = pid_file_str.replace('\'', "''"),
         bootstrap_err = bootstrap_err_str.replace('\'', "''"),
     );
@@ -1181,7 +1208,27 @@ async fn verify_tunnel_start(
         emit_tunnel_state(app, false);
 
         let log_tail = recent_log_tail(log_path, 20);
-        let details = if log_tail.is_empty() {
+        #[cfg(target_os = "windows")]
+        let bootstrap_hint = app
+            .path()
+            .app_local_data_dir()
+            .ok()
+            .and_then(|dir| {
+                std::fs::read_to_string(dir.join("elevated_singbox_bootstrap.err")).ok()
+            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        #[cfg(not(target_os = "windows"))]
+        let bootstrap_hint: Option<String> = None;
+
+        let details = if let Some(hint) = bootstrap_hint {
+            if log_tail.is_empty() {
+                hint
+            } else {
+                format!("{}\nRecent logs:\n{}", hint, log_tail)
+            }
+        } else if log_tail.is_empty() {
             "No startup logs captured.".to_string()
         } else {
             format!("Recent logs:\n{}", log_tail)
