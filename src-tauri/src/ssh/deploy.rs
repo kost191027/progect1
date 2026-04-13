@@ -281,7 +281,9 @@ pub(crate) fn execute_remote_deploy(
     app: &AppHandle,
     execution: &RemoteDeployExecution<'_>,
 ) -> Result<(), String> {
-    let deploy_script = include_str!("../../scripts/deploy.sh");
+    let deploy_script = include_str!("../../scripts/deploy.sh")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     let injected_script = format!(
         r#"#!/bin/bash
 mkdir -p /opt/rkn
@@ -302,7 +304,9 @@ BOOTSTRAPEOF
         execution.server_cfg,
         execution.bootstrap_cfg,
         deploy_script
-    );
+    )
+    .replace("\r\n", "\n")
+    .replace('\r', "\n");
 
     emit_ssh_stage(
         app,

@@ -920,15 +920,21 @@ try {{
         return Err(format!("PowerShell elevation error: {}", stderr));
     }
 
-    // Poll for the PID file written by the elevated process
-    for _ in 0..20 {
-        sleep(Duration::from_millis(300)).await;
+    // Poll for the PID file written by the elevated process. On weaker Windows
+    // machines the elevated bootstrap can take noticeably longer after the UAC
+    // confirmation, so keep the wait budget generous.
+    for _ in 0..40 {
+        sleep(Duration::from_millis(500)).await;
         if let Ok(contents) = std::fs::read_to_string(&pid_file) {
             let trimmed = contents.trim();
             if let Ok(pid) = trimmed.parse::<u32>() {
                 let _ = std::fs::remove_file(&pid_file);
                 return Ok(pid);
             }
+        }
+
+        if bootstrap_err.exists() {
+            break;
         }
     }
 
