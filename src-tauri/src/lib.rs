@@ -204,8 +204,20 @@ fn shell_single_quote(value: &str) -> String {
 fn run_admin_command(script: &str) -> Result<std::process::Output, String> {
     #[cfg(target_os = "windows")]
     {
-        let _ = script;
-        Err("Elevation via run_admin_command is not implemented on Windows yet.".to_string())
+        // On Windows, run_admin_command is only used for terminate_root_process.
+        // taskkill doesn't need elevation if the process was started by the same user session.
+        // For the rare case where it does, we use PowerShell -Verb RunAs synchronously.
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','{}'",
+                    script.replace('\'', "''")
+                ),
+            ])
+            .output()
+            .map_err(|e| format!("Failed to execute elevated PowerShell: {}", e))
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -528,6 +540,148 @@ fn resolve_singbox_path() -> Result<String, String> {
     }
 }
 
+/// Windows: launches sing-box as an elevated process via PowerShell UAC prompt.
+///
+/// The flow:
+/// 1. Build a PowerShell inner command that starts sing-box, redirects output to
+///    the log file, and writes the PID to a temp file.
+/// 2. Launch that command with `Start-Process -Verb RunAs` which triggers the
+///    native Windows UAC dialog.
+/// 3. Poll for the PID file (the elevated process writes it asynchronously).
+#[cfg(target_os = "windows")]
+async fn launch_tunnel_process_windows(
+    app: &AppHandle,
+    singbox_path: &str,
+    config_str: &str,
+    log_path: &str,
+) -> Result<u32, String> {
+    // --- Pre-flight diagnostics ---
+
+    // 1. Check that wintun.dll is accessible (required for TUN mode)
+    let singbox_dir = std::path::Path::new(singbox_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let wintun_path = singbox_dir.join("wintun.dll");
+    if !wintun_path.exists() {
+        // Also check the resource directory (Tauri places bundled resources there)
+        let resource_wintun = app.path().resource_dir().ok().map(|d| d.join("wintun.dll"));
+        let found = resource_wintun.as_ref().map_or(false, |p| p.exists());
+        if !found {
+            let _ = app.emit(
+                "tunnel-log",
+                "[ERROR] wintun.dll not found. TUN mode requires the Wintun driver.",
+            );
+            return Err(
+                "wintun.dll not found next to sing-box. Reinstall the application.".to_string(),
+            );
+        }
+        // Copy wintun.dll from resource dir to sing-box directory so it can find it
+        if let Some(src) = resource_wintun {
+            let _ = std::fs::copy(&src, &wintun_path);
+        }
+    }
+
+    // 2. Check that sing-box binary exists and is not blocked
+    if !std::path::Path::new(singbox_path).exists() {
+        return Err(format!(
+            "sing-box binary not found at {}. Reinstall the application.",
+            singbox_path
+        ));
+    }
+
+    let local_data = app
+        .path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let pid_file = local_data.join("elevated_singbox.pid");
+    let _ = std::fs::remove_file(&pid_file);
+
+    let pid_file_str = pid_file.to_string_lossy().to_string();
+
+    // PowerShell script that runs inside the elevated process:
+    // - Start sing-box with output redirected to log file
+    // - Write PID to the pid file so the parent can read it
+    let inner_ps = format!(
+        r#"$ErrorActionPreference='Stop'; $p = Start-Process -FilePath '{singbox}' -ArgumentList 'run','-c','{config}' -PassThru -NoNewWindow -RedirectStandardOutput '{log}' -RedirectStandardError '{log}.err'; $p.Id | Out-File -FilePath '{pidfile}' -Encoding ASCII -NoNewline"#,
+        singbox = singbox_path.replace('\'', "''"),
+        config = config_str.replace('\'', "''"),
+        log = log_path.replace('\'', "''"),
+        pidfile = pid_file_str.replace('\'', "''"),
+    );
+
+    // Outer command: launch elevated PowerShell with the inner script
+    let output = app
+        .shell()
+        .command("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','{}'",
+                inner_ps.replace('\'', "''")
+            ),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to launch elevated PowerShell: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.contains("canceled")
+            || stderr.contains("cancelled")
+            || stderr.contains("0x80004005")
+        {
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Administrator access was cancelled by user.",
+            );
+            return Err("User cancelled admin prompt".to_string());
+        }
+        return Err(format!("PowerShell elevation error: {}", stderr));
+    }
+
+    // Poll for the PID file written by the elevated process
+    for _ in 0..20 {
+        sleep(Duration::from_millis(300)).await;
+        if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+            let trimmed = contents.trim();
+            if let Ok(pid) = trimmed.parse::<u32>() {
+                let _ = std::fs::remove_file(&pid_file);
+                return Ok(pid);
+            }
+        }
+    }
+
+    // Check for common failure reasons and emit diagnostics
+    let err_log = format!("{}.err", log_path);
+    let err_hint = std::fs::read_to_string(&err_log)
+        .ok()
+        .and_then(|s| {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .unwrap_or_default();
+
+    let diagnostic = if err_hint.contains("wintun") || err_hint.contains("Wintun") {
+        "Wintun driver failed to initialize. It may be blocked by antivirus software."
+    } else if err_hint.contains("Access is denied") || err_hint.contains("access denied") {
+        "Access denied — administrator privileges are required. Check UAC settings."
+    } else if err_hint.contains("antivirus") || err_hint.contains("blocked") {
+        "sing-box may be blocked by antivirus software. Add an exception and retry."
+    } else if !err_hint.is_empty() {
+        &err_hint
+    } else {
+        "Timed out waiting for elevated sing-box to start. Check UAC settings and antivirus."
+    };
+
+    let _ = app.emit("tunnel-log", format!("[ERROR] {}", diagnostic));
+    Err(diagnostic.to_string())
+}
+
 async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result<u32, String> {
     let singbox_path = resolve_singbox_path()?;
 
@@ -550,8 +704,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
 
     #[cfg(target_os = "windows")]
     {
-        let _ = (singbox_path, config_str, log_path);
-        Err("Windows tunnel elevation is not implemented yet (6.2).".to_string())
+        launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -614,8 +767,9 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
 
     #[cfg(target_os = "windows")]
     {
-        let _ = (singbox_path, config_str, log_path, old_pid);
-        Err("Windows tunnel elevation is not implemented yet (6.2).".to_string())
+        let _ = terminate_root_process(old_pid);
+        sleep(Duration::from_secs(1)).await;
+        launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
     }
 
     #[cfg(not(target_os = "windows"))]

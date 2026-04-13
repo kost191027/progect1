@@ -32,7 +32,8 @@
       "bins/sing-box"
     ],
     "resources": {
-      "bins/libcronet.dll": "libcronet.dll"
+      "bins/libcronet.dll": "libcronet.dll",
+      "bins/wintun.dll": "wintun.dll"
     },
     "icon": [
       "icons/32x32.png",
