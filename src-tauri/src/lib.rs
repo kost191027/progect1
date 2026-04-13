@@ -784,6 +784,60 @@ fn resolve_singbox_path() -> Result<String, String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn summarize_windows_command_failure(prefix: &str, output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !stderr.is_empty() && !stdout.is_empty() {
+        format!("{prefix}: {stderr} | {stdout}")
+    } else if !stderr.is_empty() {
+        format!("{prefix}: {stderr}")
+    } else if !stdout.is_empty() {
+        format!("{prefix}: {stdout}")
+    } else {
+        format!(
+            "{prefix}: process exited with code {:?}",
+            output.status.code()
+        )
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_singbox_preflight(singbox_path: &str, config_path: &str) -> Result<(), String> {
+    let singbox_dir = std::path::Path::new(singbox_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    let version_output = std::process::Command::new(singbox_path)
+        .current_dir(singbox_dir)
+        .arg("version")
+        .output()
+        .map_err(|e| format!("Failed to launch sing-box preflight: {}", e))?;
+
+    if !version_output.status.success() {
+        return Err(summarize_windows_command_failure(
+            "sing-box preflight failed before elevation",
+            &version_output,
+        ));
+    }
+
+    let check_output = std::process::Command::new(singbox_path)
+        .current_dir(singbox_dir)
+        .args(["check", "-c", config_path])
+        .output()
+        .map_err(|e| format!("Failed to run sing-box config preflight: {}", e))?;
+
+    if !check_output.status.success() {
+        return Err(summarize_windows_command_failure(
+            "sing-box config preflight failed",
+            &check_output,
+        ));
+    }
+
+    Ok(())
+}
+
 /// Windows: launches sing-box as an elevated process via PowerShell UAC prompt.
 ///
 /// The flow:
@@ -875,7 +929,7 @@ try {{
   [void]$p.Start()
   [System.IO.File]::WriteAllText('{pidfile}', $p.Id.ToString(), [System.Text.Encoding]::ASCII)
 
-  if ($p.WaitForExit(3000)) {{
+  if ($p.WaitForExit(8000)) {{
     $logTail = ''
     if (Test-Path '{log_path}') {{
       try {{
@@ -1030,15 +1084,13 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
     let config_str = config_path.to_string_lossy().to_string();
     let log_path = tunnel_log_path();
 
-    if announce_prompt {
-        let _ = app.emit(
-            "tunnel-log",
-            "[SYSTEM] Requesting administrator privileges...".to_string(),
-        );
-    }
-
     #[cfg(target_os = "windows")]
     {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Running local sing-box preflight...".to_string(),
+        );
+
         // On Windows we can't use shell stdout redirect (sing-box runs via Start-Process
         // -WindowStyle Hidden which is incompatible with -RedirectStandardOutput).
         // Instead, inject log.output into the config so sing-box writes logs itself.
@@ -1057,11 +1109,28 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
             },
             Err(_) => config_str,
         };
+
+        run_windows_singbox_preflight(&singbox_path, &config_str)?;
+
+        if announce_prompt {
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Requesting administrator privileges...".to_string(),
+            );
+        }
+
         launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        if announce_prompt {
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Requesting administrator privileges...".to_string(),
+            );
+        }
+
         let shell_cmd = format!(
             "{} run -c {} > {} 2>&1 & echo $!",
             shell_single_quote(&singbox_path),
