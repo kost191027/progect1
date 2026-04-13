@@ -1,6 +1,6 @@
 # RKN
 
-**Recursive Kinetic Network** is a self-managed stealth gateway client for macOS.
+**Recursive Kinetic Network** is a self-managed stealth gateway client for macOS and Windows.
 
 It combines a lightweight desktop shell, a high-performance native backend, and a flexible network core to give the user a simple flow:
 
@@ -12,6 +12,9 @@ It combines a lightweight desktop shell, a high-performance native backend, and 
   </a>
   <a href="https://github.com/kost191027/progect1/releases/latest/download/RKN-latest-arm64.dmg">
     <img alt="Download for Apple Silicon" src="https://img.shields.io/badge/Download%20for-Apple%20Silicon-111827?style=for-the-badge&logo=apple&logoColor=white">
+  </a>
+  <a href="https://github.com/kost191027/progect1/releases/latest/download/RKN-latest-x64-setup.exe">
+    <img alt="Download for Windows" src="https://img.shields.io/badge/Download%20for-Windows-0F172A?style=for-the-badge&logo=windows11&logoColor=white">
   </a>
 </p>
 
@@ -35,7 +38,7 @@ Then launch `RKN.app` again from `Applications`.
   <img alt="sing-box" src="https://img.shields.io/badge/sing--box-core-111111?style=flat-square">
   <img alt="ShadowTLS" src="https://img.shields.io/badge/ShadowTLS-stealth-2F855A?style=flat-square">
   <img alt="Shadowsocks 2022" src="https://img.shields.io/badge/Shadowsocks--2022-transport-1F6FEB?style=flat-square">
-  <img alt="macOS first" src="https://img.shields.io/badge/macOS-first-1D1D1F?style=flat-square&logo=apple&logoColor=white">
+  <img alt="macOS and Windows" src="https://img.shields.io/badge/macOS%20%2B%20Windows-supported-1D1D1F?style=flat-square&logo=windows11&logoColor=white">
 </p>
 
 ## Overview
@@ -121,12 +124,44 @@ The app currently ships with a minimal 3-screen desktop UX:
 ## Core features
 
 - One-flow deploy from the desktop client to a remote Linux VPS
-- Local tunnel start/stop with administrator prompt on macOS
+- Local tunnel start/stop with administrator prompt on macOS and Windows
 - Tray mode with background continuity
 - Remote diagnostics and server status checks
 - Split-routing oriented toward practical local/direct behavior
 - Runtime guard state for degraded proxy-path conditions
 - Lightweight packaging model built around a sidecar binary
+
+## Supported platforms and system requirements
+
+### Desktop OS
+
+- macOS:
+  - Apple Silicon or Intel
+  - modern Tauri-compatible macOS release
+  - administrator confirmation available for TUN startup
+- Windows:
+  - Windows 10 or Windows 11
+  - x64 is the primary release target
+  - administrator rights available for tunnel startup
+  - Windows Firewall and local security software must allow the app to start the bundled network core
+
+### Server requirements
+
+- Ubuntu or Debian VPS
+- public IPv4 address
+- SSH access
+- Docker installed or installable by the deploy flow
+- 1 vCPU / 1 GB RAM minimum for a personal node
+- 2 GB RAM recommended for heavier browsing or multiple devices
+
+## Firewall, antivirus, and driver notes
+
+- On macOS and Windows, RKN starts a local TUN-based networking core and may request administrator confirmation.
+- On Windows, the local tunnel depends on the system allowing the bundled `sing-box` sidecar and Wintun-based networking behavior.
+- If Windows Defender Firewall shows a prompt, allow the app or the bundled network core for the network types you actually use.
+- If third-party antivirus or endpoint protection blocks the app, the sidecar binary, or TUN creation, add an exception for the installed RKN app folder and retry the tunnel start.
+- If a corporate firewall, endpoint agent, or local filtering product interferes with Wintun/TUN traffic, test first on a clean personal machine before assuming the server is broken.
+- If the tunnel starts but traffic does not pass, check the in-app diagnostics first, then temporarily disable conflicting security software for a controlled test.
 
 ## Architecture
 
@@ -239,13 +274,16 @@ Important notes:
 
 ## Release strategy
 
-The current platform priority is:
+The current desktop release targets are:
 
 - **macOS x64**
 - **macOS arm64**
-- later: **macOS universal**
+- **Windows x64**
 
-Windows is planned as a separate platform track after the macOS release path is fully stabilized.
+Later candidates:
+
+- **macOS universal**
+- **Windows arm64** if packaging and QA demand it
 
 Android and iOS are future product tracks, not simple rebuild targets.
 
@@ -255,12 +293,19 @@ The project currently builds into:
 
 - `.app`
 - `.dmg`
+- `.exe`
+- `.msi` or NSIS installer, depending on the active Windows bundle target
 
 Typical macOS release artifacts:
 
 - `RKN-<version>-x64.dmg`
 - `RKN-<version>-arm64.dmg`
 - later: `RKN-<version>-universal.dmg`
+
+Typical Windows release artifacts:
+
+- `RKN-<version>-x64-setup.exe`
+- `RKN-<version>-x64.msi`
 
 The final size is driven mostly by the bundled `sing-box` sidecar.
 

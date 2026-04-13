@@ -144,3 +144,101 @@ jobs:
           files: |
             ${{ steps.package.outputs.dmg_path }}
             ${{ steps.package.outputs.dmg_alias_path }}
+
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+    env:
+      VITE_APP_BUILD: ${{ github.run_number }}
+      VITE_GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Verify version sync
+        run: npm run version:check
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+
+          if [[ "${REF_TYPE}" == "tag" ]]; then
+            tag_version="${REF_NAME#v}"
+            if [[ -n "${tag_version}" && "${tag_version}" != "${version}" ]]; then
+              echo "Tag version ${tag_version} does not match package.json version ${version}."
+              exit 1
+            fi
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "VITE_APP_VERSION=${version}" >> "$GITHUB_ENV"
+
+      - name: Build Tauri release
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc
+
+      - name: Normalize release asset names
+        id: package
+        shell: bash
+        run: |
+          version="${{ steps.meta.outputs.version }}"
+          release_dir="dist/release/windows-x64"
+          nsis_dir="src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+
+          mkdir -p "${release_dir}"
+
+          setup_src="$(find "${nsis_dir}" -maxdepth 1 -name '*.exe' | head -n 1)"
+
+          if [[ -z "${setup_src}" ]]; then
+            echo "Expected Windows NSIS .exe artifact was not produced."
+            exit 1
+          fi
+
+          setup_name="RKN-${version}-x64-setup.exe"
+          setup_alias_name="RKN-latest-x64-setup.exe"
+
+          cp "${setup_src}" "${release_dir}/${setup_name}"
+          cp "${setup_src}" "${release_dir}/${setup_alias_name}"
+
+          echo "setup_path=${release_dir}/${setup_name}" >> "$GITHUB_OUTPUT"
+          echo "setup_alias_path=${release_dir}/${setup_alias_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Windows bundle artifacts
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: RKN-${{ steps.meta.outputs.version }}-windows-x64
+          path: |
+            ${{ steps.package.outputs.setup_path }}
+            ${{ steps.package.outputs.setup_alias_path }}
+          retention-days: 14
+          compression-level: 0
+
+      - name: Publish release assets for Windows x64
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            ${{ steps.package.outputs.setup_path }}
+            ${{ steps.package.outputs.setup_alias_path }}
