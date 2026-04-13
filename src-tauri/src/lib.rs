@@ -1092,6 +1092,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
 
     let config_str = config_path.to_string_lossy().to_string();
     let log_path = tunnel_log_path();
+    let _ = std::fs::remove_file(log_path);
 
     #[cfg(target_os = "windows")]
     {
@@ -1190,6 +1191,7 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
 
     let config_str = config_path.to_string_lossy().to_string();
     let log_path = tunnel_log_path();
+    let _ = std::fs::remove_file(log_path);
 
     let _ = app.emit(
         "tunnel-log",
