@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::io::Write;
 use std::sync::Mutex;
 use std::{fs, path::PathBuf};
@@ -1267,13 +1268,15 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                     );
                     finish_recovery(&state);
                 }
-                continue;
             }
 
-            let _ = app.emit(
-                "tunnel-log",
-                "[SYSTEM] Network change detected. Keeping tunnel active and updating the network context.".to_string(),
-            );
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Network change detected. Keeping tunnel active and updating the network context.".to_string(),
+                );
+            }
         }
     });
 }
@@ -1705,8 +1708,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            #[cfg(target_os = "macos")]
             if let RunEvent::Reopen { .. } = event {
                 show_main_window(app, None);
             }
+
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
         });
 }
