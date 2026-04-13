@@ -876,12 +876,25 @@ try {{
         bootstrap_err = bootstrap_err_str.replace('\'', "''"),
     );
 
-    std::fs::write(&bootstrap_script, bootstrap_script_body)
+    // Write with UTF-8 BOM so PowerShell reads Cyrillic paths correctly
+    // on systems where the default codepage is not UTF-8.
+    let mut bom_content = Vec::with_capacity(3 + bootstrap_script_body.len());
+    bom_content.extend_from_slice(b"\xEF\xBB\xBF");
+    bom_content.extend_from_slice(bootstrap_script_body.as_bytes());
+    std::fs::write(&bootstrap_script, bom_content)
         .map_err(|e| format!("Failed to write Windows tunnel bootstrap script: {}", e))?;
 
     // Outer command: launch elevated PowerShell with the script file and wait for the
     // short bootstrap wrapper to finish. The wrapper starts sing-box, writes its PID,
     // then exits immediately.
+    //
+    // IMPORTANT: build the bootstrap path via $env:LOCALAPPDATA to avoid Cyrillic
+    // characters on the command line (Cyrillic usernames cause encoding issues in
+    // the non-Unicode PowerShell pipeline on older Windows systems).
+    let bootstrap_filename = bootstrap_script
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
     let output = app
         .shell()
         .command("powershell")
@@ -889,8 +902,8 @@ try {{
             "-NoProfile",
             "-Command",
             &format!(
-                "$p = Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','{}'); if ($p.ExitCode -ne 0) {{ exit 1 }} else {{ exit 0 }}",
-                bootstrap_script_str.replace('\'', "''")
+                "$bf = Join-Path $env:LOCALAPPDATA 'com.freedom.rkn\\{}'; $p = Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$bf); if ($p.ExitCode -ne 0) {{ exit 1 }} else {{ exit 0 }}",
+                bootstrap_filename
             ),
         ])
         .output()
