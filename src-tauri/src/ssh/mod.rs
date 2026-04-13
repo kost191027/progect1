@@ -64,6 +64,18 @@ pub struct SavedServerProfile {
     pub password: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackendAppRole {
+    Master,
+    Subordinate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedBackendAppRole {
+    role: BackendAppRole,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RemoteTransportBootstrap {
     pub(crate) external_port: u16,
@@ -315,6 +327,11 @@ pub(crate) fn server_profile_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(local_data.join("server_profile.json"))
 }
 
+fn backend_app_role_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    Ok(local_data.join("app_role.json"))
+}
+
 pub(crate) fn save_server_profile(
     app: &AppHandle,
     profile: &SavedServerProfile,
@@ -337,6 +354,53 @@ pub(crate) fn remove_saved_server_profile(app: &AppHandle) -> Result<(), String>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+pub(crate) fn load_backend_app_role(app: &AppHandle) -> Result<BackendAppRole, String> {
+    let role_path = backend_app_role_path(app)?;
+
+    if !role_path.exists() {
+        return Ok(BackendAppRole::Master);
+    }
+
+    let role_json = std::fs::read_to_string(role_path).map_err(|e| e.to_string())?;
+    let persisted = serde_json::from_str::<PersistedBackendAppRole>(&role_json)
+        .map_err(|e| format!("Failed to parse backend app role: {}", e))?;
+
+    Ok(persisted.role)
+}
+
+pub(crate) fn save_backend_app_role(app: &AppHandle, role: BackendAppRole) -> Result<(), String> {
+    let role_path = backend_app_role_path(app)?;
+
+    if let Some(parent) = role_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let role_json =
+        serde_json::to_vec_pretty(&PersistedBackendAppRole { role }).map_err(|e| e.to_string())?;
+    std::fs::write(role_path, role_json).map_err(|e| e.to_string())
+}
+
+pub(crate) fn clear_backend_app_role(app: &AppHandle) -> Result<(), String> {
+    let role_path = backend_app_role_path(app)?;
+
+    match std::fs::remove_file(role_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub(crate) fn ensure_master_role(app: &AppHandle, action: &str) -> Result<(), String> {
+    if load_backend_app_role(app)? == BackendAppRole::Subordinate {
+        return Err(format!(
+            "This app is currently linked as a subordinate installation. Reset local data or switch back to a master server profile before trying to {} here.",
+            action
+        ));
+    }
+
+    Ok(())
 }
 
 // ── Client config persistence ───────────────────────────────────────────────
@@ -634,6 +698,47 @@ pub(crate) fn snapshot_for_cover_domain(cover_domain: impl Into<String>) -> Tran
         available_cover_domains: crate::generator::available_cover_domains(),
         local_cover_domain: Some(cover_domain),
         requires_redeploy: false,
+    }
+}
+
+// ── Cached transport bootstrap (for instant invite generation) ─────────────
+
+fn cached_transport_bootstrap_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    Ok(local_data.join("cached_bootstrap.json"))
+}
+
+pub(crate) fn save_cached_transport_bootstrap(
+    app: &AppHandle,
+    bootstrap: &RemoteTransportBootstrap,
+) -> Result<(), String> {
+    let path = cached_transport_bootstrap_path(app)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_vec_pretty(bootstrap).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+pub(crate) fn load_cached_transport_bootstrap(
+    app: &AppHandle,
+) -> Result<Option<RemoteTransportBootstrap>, String> {
+    let path = cached_transport_bootstrap_path(app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let bootstrap = serde_json::from_str::<RemoteTransportBootstrap>(&contents)
+        .map_err(|e| format!("Failed to parse cached bootstrap: {}", e))?;
+    Ok(Some(bootstrap))
+}
+
+pub(crate) fn clear_cached_transport_bootstrap(app: &AppHandle) -> Result<(), String> {
+    let path = cached_transport_bootstrap_path(app)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
     }
 }
 

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -14,10 +14,11 @@ use super::warp::{
     clear_local_warp_profile_sync, ensure_remote_warp_config, load_saved_server_profile,
 };
 use super::{
-    acquire_remote_mutation_lock, connect_ssh_session, ensure_local_client_rule_sets_sync,
+    acquire_remote_mutation_lock, clear_cached_transport_bootstrap, connect_ssh_session,
+    ensure_local_client_rule_sets_sync, ensure_master_role, load_cached_transport_bootstrap,
     load_remote_container_name, load_remote_transport_bootstrap, local_client_config_path,
-    remove_saved_server_profile, LocalInstallationState, RemoteInviteRecord,
-    RemoteTransportBootstrap,
+    remove_saved_server_profile, save_backend_app_role, save_cached_transport_bootstrap,
+    BackendAppRole, LocalInstallationState, RemoteInviteRecord, RemoteTransportBootstrap,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +77,18 @@ fn invite_sync_revision() -> &'static AtomicU64 {
     static REVISION: OnceLock<AtomicU64> = OnceLock::new();
     REVISION.get_or_init(|| AtomicU64::new(0))
 }
+
+#[derive(Default)]
+struct InviteSyncCoordinator {
+    running: bool,
+}
+
+fn invite_sync_coordinator() -> &'static Mutex<InviteSyncCoordinator> {
+    static COORDINATOR: OnceLock<Mutex<InviteSyncCoordinator>> = OnceLock::new();
+    COORDINATOR.get_or_init(|| Mutex::new(InviteSyncCoordinator::default()))
+}
+
+const INVITE_REMOTE_SYNC_DEBOUNCE: Duration = Duration::from_secs(8);
 
 fn issued_invites_path(app: &AppHandle) -> Result<PathBuf, String> {
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
@@ -320,7 +333,7 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
 }
 
 fn schedule_invite_remote_sync(app: &AppHandle, message: &str) {
-    let revision = invite_sync_revision().fetch_add(1, Ordering::SeqCst) + 1;
+    invite_sync_revision().fetch_add(1, Ordering::SeqCst);
     let _ = app.emit(
         "invite-remote-sync",
         InviteRemoteSyncEvent {
@@ -330,78 +343,92 @@ fn schedule_invite_remote_sync(app: &AppHandle, message: &str) {
         },
     );
 
-    let sync_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let debounce_result = tauri::async_runtime::spawn_blocking(move || {
-            thread::sleep(Duration::from_millis(1200));
-            if invite_sync_revision().load(Ordering::SeqCst) != revision {
-                return Ok(false);
-            }
-            Ok(true)
-        })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result);
-
-        let should_run = match debounce_result {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = sync_app.emit(
-                    "invite-remote-sync",
-                    InviteRemoteSyncEvent {
-                        invite_id: "invite-batch".to_string(),
-                        status: "failed".to_string(),
-                        message: format!(
-                            "Invite changes were saved locally, but the server sync scheduler failed: {}",
-                            error
-                        ),
-                    },
-                );
-                return;
-            }
-        };
-
-        if !should_run {
+    let mut coordinator = match invite_sync_coordinator().lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let _ = app.emit(
+                "invite-remote-sync",
+                InviteRemoteSyncEvent {
+                    invite_id: "invite-batch".to_string(),
+                    status: "failed".to_string(),
+                    message:
+                        "Invite changes were saved locally, but the sync coordinator is unavailable right now."
+                            .to_string(),
+                },
+            );
             return;
         }
+    };
 
-        match tauri::async_runtime::spawn_blocking({
-            let sync_app = sync_app.clone();
-            move || sync_invites_remote_from_local_records(&sync_app)
-        })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result)
-        {
-            Ok(()) => {
-                let _ = sync_app.emit(
-                    "invite-remote-sync",
-                    InviteRemoteSyncEvent {
-                        invite_id: "invite-batch".to_string(),
-                        status: "completed".to_string(),
-                        message: "Invite changes finished syncing on the server.".to_string(),
-                    },
-                );
+    if coordinator.running {
+        return;
+    }
+
+    coordinator.running = true;
+    drop(coordinator);
+
+    let sync_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let stable_revision = invite_sync_revision().load(Ordering::SeqCst);
+            thread::sleep(INVITE_REMOTE_SYNC_DEBOUNCE);
+
+            if invite_sync_revision().load(Ordering::SeqCst) != stable_revision {
+                continue;
             }
-            Err(error) => {
-                let _ = sync_app.emit(
-                    "invite-remote-sync",
-                    InviteRemoteSyncEvent {
-                        invite_id: "invite-batch".to_string(),
-                        status: "failed".to_string(),
-                        message: format!(
-                            "Invite changes were saved locally, but the server sync still needs attention: {}",
+
+            match tauri::async_runtime::spawn_blocking({
+                let sync_app = sync_app.clone();
+                move || sync_invites_remote_from_local_records(&sync_app)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+            {
+                Ok(()) => {
+                    let _ = sync_app.emit(
+                        "invite-remote-sync",
+                        InviteRemoteSyncEvent {
+                            invite_id: "invite-batch".to_string(),
+                            status: "completed".to_string(),
+                            message: "Invite changes finished syncing on the server.".to_string(),
+                        },
+                    );
+                }
+                Err(error) => {
+                    let _ = sync_app.emit(
+                        "invite-remote-sync",
+                        InviteRemoteSyncEvent {
+                            invite_id: "invite-batch".to_string(),
+                            status: "failed".to_string(),
+                            message: format!(
+                                "Invite changes were saved locally, but the server sync still needs attention: {}",
+                                error
+                            ),
+                        },
+                    );
+                    let _ = sync_app.emit(
+                        "tunnel-log",
+                        format!(
+                            "[WARN] Invite changes were saved locally, but the background server sync needs attention: {}",
                             error
                         ),
-                    },
-                );
-                let _ = sync_app.emit(
-                    "tunnel-log",
-                    format!(
-                        "[WARN] Invite changes were saved locally, but the background server sync needs attention: {}",
-                        error
-                    ),
-                );
+                    );
+                }
+            }
+
+            if invite_sync_revision().load(Ordering::SeqCst) != stable_revision {
+                continue;
+            }
+
+            let mut coordinator = match invite_sync_coordinator().lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+
+            if invite_sync_revision().load(Ordering::SeqCst) == stable_revision {
+                coordinator.running = false;
+                break;
             }
         }
     });
@@ -459,42 +486,56 @@ fn parse_invite_link_payload(invite_link: &str) -> Result<InviteLinkPayload, Str
     Ok(payload)
 }
 
-pub async fn generate_invite_link(app: AppHandle) -> Result<GeneratedInviteLinkResult, String> {
+fn resolve_bootstrap_for_invite(
+    app: &AppHandle,
+) -> Result<(RemoteTransportBootstrap, String), String> {
     let profile = load_saved_server_profile(app.clone())?
         .ok_or_else(|| "Saved server profile not found. Deploy once first.".to_string())?;
-    let invite_app = app.clone();
 
+    if let Some(cached) = load_cached_transport_bootstrap(app)? {
+        if !cached.cover_domain.is_empty()
+            && !cached.ss_password.is_empty()
+            && !cached.shadow_pass.is_empty()
+            && cached.external_port > 0
+        {
+            return Ok((cached, profile.host));
+        }
+    }
+
+    let sess = connect_ssh_session(app, &profile.host, &profile.user, &profile.password)?;
+    let remote_bootstrap = load_remote_transport_bootstrap(&sess)?.ok_or_else(|| {
+        "Remote transport bootstrap not found. Deploy the server first.".to_string()
+    })?;
+    let _ = save_cached_transport_bootstrap(app, &remote_bootstrap);
+
+    Ok((remote_bootstrap, profile.host))
+}
+
+pub async fn generate_invite_link(app: AppHandle) -> Result<GeneratedInviteLinkResult, String> {
+    ensure_master_role(&app, "generate invite links")?;
+
+    let invite_shadow_pass = crate::generator::generate_shadowtls_password(&app).await?;
+    let invite_ss_user_password = crate::generator::generate_ss_password(&app).await?;
+
+    let invite_app = app.clone();
     let result = tauri::async_runtime::spawn_blocking(
         move || -> Result<GeneratedInviteLinkResult, String> {
-            let sess =
-                connect_ssh_session(&invite_app, &profile.host, &profile.user, &profile.password)?;
-            let remote_bootstrap = load_remote_transport_bootstrap(&sess)?.ok_or_else(|| {
-                "Remote transport bootstrap not found. Deploy the server first.".to_string()
-            })?;
+            let (bootstrap, host) = resolve_bootstrap_for_invite(&invite_app)?;
             let generated_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| e.to_string())?
                 .as_secs();
             let invite_id = issue_invite_id()?;
-            let invite_shadow_pass = tauri::async_runtime::block_on(
-                crate::generator::generate_shadowtls_password(&invite_app),
-            )?;
-            let invite_ss_user_password = tauri::async_runtime::block_on(
-                crate::generator::generate_ss_password(&invite_app),
-            )?;
-            let (ss_server_password, _, _) =
-                resolve_master_ss_transport(&invite_app, &remote_bootstrap)?;
+            let (ss_server_password, _, _) = resolve_master_ss_transport(&invite_app, &bootstrap)?;
             let invite_ss_password =
                 compose_multi_user_ss_password(&ss_server_password, &invite_ss_user_password);
-            let invite_host = profile.host.clone();
-            let invite_cover_domain = remote_bootstrap.cover_domain.clone();
 
             let payload = InviteLinkPayload {
                 version: 1,
                 invite_id: invite_id.clone(),
-                host: invite_host.clone(),
-                external_port: remote_bootstrap.external_port,
-                cover_domain: invite_cover_domain.clone(),
+                host: host.clone(),
+                external_port: bootstrap.external_port,
+                cover_domain: bootstrap.cover_domain.clone(),
                 shadow_pass: invite_shadow_pass.clone(),
                 ss_password: invite_ss_password,
                 generated_at,
@@ -510,8 +551,8 @@ pub async fn generate_invite_link(app: AppHandle) -> Result<GeneratedInviteLinkR
                 StoredInviteLinkRecord {
                     id: invite_id,
                     link: link.clone(),
-                    host: invite_host,
-                    cover_domain: invite_cover_domain,
+                    host,
+                    cover_domain: bootstrap.cover_domain.clone(),
                     generated_at,
                     shadow_pass: invite_shadow_pass,
                     ss_user_password: invite_ss_user_password,
@@ -569,6 +610,8 @@ pub async fn import_invite_link(
             remove_saved_server_profile(&app)?;
             clear_issued_invites(&app)?;
             clear_local_warp_profile_sync(&app)?;
+            clear_cached_transport_bootstrap(&app)?;
+            save_backend_app_role(&app, BackendAppRole::Subordinate)?;
             crate::refresh_tray_toggle_item(&app);
 
             let _ = app.emit(

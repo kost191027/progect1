@@ -6,12 +6,13 @@ use tauri::{AppHandle, Emitter, Manager};
 use super::warp::ensure_remote_warp_config;
 use super::{
     acquire_remote_mutation_lock, build_container_name, connect_ssh_session, emit_ssh_stage,
-    ensure_local_client_rule_sets_sync, load_remote_container_image, load_remote_container_name,
-    load_remote_transport_bootstrap, remote_runtime_uses_warp, run_remote_command,
-    save_server_profile, snapshot_for_cover_domain, stream_remote_deploy_output,
-    RemoteDeployTarget, SavedServerProfile, TransportStateSnapshot, EXTERNAL_PORT_CANDIDATES,
-    INTERNAL_SS_PORT_CANDIDATES, LEGACY_CONTAINER_NAME, PINNED_SING_BOX_IMAGE,
-    PRIMARY_EXTERNAL_PORT,
+    ensure_local_client_rule_sets_sync, ensure_master_role, load_remote_container_image,
+    load_remote_container_name, load_remote_transport_bootstrap, remote_runtime_uses_warp,
+    run_remote_command, save_backend_app_role, save_cached_transport_bootstrap,
+    save_server_profile, snapshot_for_cover_domain, stream_remote_deploy_output, BackendAppRole,
+    RemoteDeployTarget, RemoteTransportBootstrap, SavedServerProfile, TransportStateSnapshot,
+    EXTERNAL_PORT_CANDIDATES, INTERNAL_SS_PORT_CANDIDATES, LEGACY_CONTAINER_NAME,
+    PINNED_SING_BOX_IMAGE, PRIMARY_EXTERNAL_PORT,
 };
 
 fn compose_multi_user_ss_password(server_password: &str, user_password: &str) -> String {
@@ -357,6 +358,8 @@ pub async fn deploy_server(
     user: String,
     pass: String,
 ) -> Result<TransportStateSnapshot, String> {
+    ensure_master_role(&app, "deploy this server")?;
+
     let local_data = app
         .path()
         .app_local_data_dir()
@@ -433,6 +436,19 @@ pub async fn deploy_server(
                 ),
             );
 
+            if crate::generator::is_legacy_cover_domain_requiring_refresh(
+                &remote_bootstrap.cover_domain,
+            ) {
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SYSTEM] Existing RKN runtime still uses the legacy cover domain {}. Refreshing it now so this server moves to a currently supported transport domain.",
+                        remote_bootstrap.cover_domain
+                    ),
+                );
+                return Ok(None);
+            }
+
             if let Some(remote_image) = load_remote_container_image(&sess, &container_name)? {
                 if remote_image != PINNED_SING_BOX_IMAGE {
                     let _ = app.emit(
@@ -499,6 +515,8 @@ pub async fn deploy_server(
             let client_cfg_path = local_data.join("client_config.json");
             std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
             save_server_profile(&app, &attach_saved_profile)?;
+            save_backend_app_role(&app, BackendAppRole::Master)?;
+            let _ = save_cached_transport_bootstrap(&app, &remote_bootstrap);
             crate::refresh_tray_toggle_item(&app);
 
             let _ = app.emit(
@@ -695,6 +713,18 @@ pub async fn deploy_server(
         let client_cfg_path = local_data.join("client_config.json");
         std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
         save_server_profile(&deploy_app, &saved_profile)?;
+        save_backend_app_role(&deploy_app, BackendAppRole::Master)?;
+        let fresh_bootstrap = RemoteTransportBootstrap {
+            external_port,
+            internal_ss_port,
+            cover_domain: cover_domain.to_string(),
+            fallback_cover_domains: Vec::new(),
+            shadow_pass: shadow_pass.clone(),
+            ss_password: ss_password.clone(),
+            ss_server_password: ss_server_password.clone(),
+            issued_invites: Vec::new(),
+        };
+        let _ = save_cached_transport_bootstrap(&deploy_app, &fresh_bootstrap);
         crate::refresh_tray_toggle_item(&deploy_app);
 
         let _ = deploy_app.emit(

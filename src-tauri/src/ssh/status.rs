@@ -1,23 +1,26 @@
 use serde_json::json;
-use std::io::Write;
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::deploy::validate_remote_runtime;
+use super::deploy::{execute_remote_deploy, RemoteDeployExecution};
 use super::invite::resolve_master_ss_transport;
 use super::warp::{ensure_remote_warp_config, load_saved_server_profile};
 use super::{
     acquire_remote_mutation_lock, build_rotated_cover_domain_history, connect_ssh_session,
-    emit_ssh_stage, ensure_local_client_rule_sets_sync, load_local_client_transport_state,
-    load_remote_container_name, load_remote_transport_bootstrap, monitored_port_pattern,
-    run_remote_command, stream_remote_deploy_output, LocalClientTransportState,
-    RemoteTransportBootstrap, TransportStateSnapshot, PINNED_SING_BOX_IMAGE,
+    emit_ssh_stage, ensure_local_client_rule_sets_sync, ensure_master_role,
+    load_local_client_transport_state, load_remote_container_name, load_remote_transport_bootstrap,
+    monitored_port_pattern, run_remote_command, save_cached_transport_bootstrap,
+    LocalClientTransportState, RemoteTransportBootstrap, TransportStateSnapshot,
 };
 
 fn local_transport_requires_redeploy(
     local_state: &LocalClientTransportState,
     remote_bootstrap: &RemoteTransportBootstrap,
 ) -> bool {
-    local_state.cover_domain != remote_bootstrap.cover_domain
+    crate::generator::is_legacy_cover_domain_requiring_refresh(&local_state.cover_domain)
+        || crate::generator::is_legacy_cover_domain_requiring_refresh(
+            &remote_bootstrap.cover_domain,
+        )
+        || local_state.cover_domain != remote_bootstrap.cover_domain
         || local_state.shadow_pass != remote_bootstrap.shadow_pass
         || local_state.ss_password != remote_bootstrap.ss_password
 }
@@ -92,6 +95,27 @@ pub(crate) async fn ensure_local_transport_is_current(app: &AppHandle) -> Result
     let local_cover_domain = snapshot
         .local_cover_domain
         .unwrap_or_else(|| "unknown".to_string());
+
+    if crate::generator::is_legacy_cover_domain_requiring_refresh(&remote_cover_domain)
+        || crate::generator::is_legacy_cover_domain_requiring_refresh(&local_cover_domain)
+    {
+        let _ = app.emit(
+            "tunnel-log",
+            format!(
+                "[SYSTEM] This device still uses the legacy cover domain {}. Run Deploy/Update once to migrate the transport to a currently supported domain before starting the tunnel.",
+                if crate::generator::is_legacy_cover_domain_requiring_refresh(&remote_cover_domain) {
+                    remote_cover_domain.clone()
+                } else {
+                    local_cover_domain.clone()
+                }
+            ),
+        );
+
+        return Err(
+            "The current cover domain is no longer supported. Run Deploy/Update before starting the tunnel."
+                .to_string(),
+        );
+    }
 
     let _ = app.emit(
         "tunnel-log",
@@ -278,6 +302,8 @@ fi
 }
 
 pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result<String, String> {
+    ensure_master_role(&app, "rotate the cover domain")?;
+
     let profile = load_saved_server_profile(app.clone())?
         .ok_or_else(|| "Saved server profile not found. Deploy once first.".to_string())?;
 
@@ -367,7 +393,6 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
             );
         }
 
-        let deploy_script = include_str!("../../scripts/deploy.sh");
         let (ss_server_password, master_ss_user_password, master_combined_password) =
             resolve_master_ss_transport(&rotate_app, &remote_bootstrap)?;
         let warp_config = ensure_remote_warp_config(&rotate_app, &sess)?;
@@ -405,54 +430,38 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
         })
         .to_string();
 
-        let injected_script = format!(
-            r#"#!/bin/bash
-mkdir -p /opt/rkn
-export RKN_IMAGE='{}'
-export RKN_CONTAINER_NAME='{}'
-cat << 'CONFIGEOF' > /opt/rkn/config.candidate.json
-{}
-CONFIGEOF
-
-cat << 'BOOTSTRAPEOF' > /opt/rkn/bootstrap.candidate.json
-{}
-BOOTSTRAPEOF
-
-{}
-"#,
-            PINNED_SING_BOX_IMAGE, container_name, server_cfg, bootstrap_cfg, deploy_script
-        );
-
         emit_ssh_stage(
             &rotate_app,
             "ROTATE",
             "Deploying new cover domain to server...",
         );
-        let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
-        channel.exec("bash -s 2>&1").map_err(|e| e.to_string())?;
-        channel
-            .write_all(injected_script.as_bytes())
-            .map_err(|e| e.to_string())?;
-        channel.send_eof().map_err(|e| e.to_string())?;
-        stream_remote_deploy_output(&rotate_app, &sess, &mut channel)?;
-
-        channel.wait_close().map_err(|e| e.to_string())?;
-        let exit_status = channel.exit_status().map_err(|e| e.to_string())?;
-
-        if exit_status != 0 {
-            return Err(format!("SNI rotation deploy failed with code {}", exit_status));
-        }
-
-        validate_remote_runtime(
+        execute_remote_deploy(
             &sess,
-            &container_name,
-            remote_bootstrap.external_port,
-            remote_bootstrap.internal_ss_port,
+            &rotate_app,
+            &RemoteDeployExecution {
+                container_name: &container_name,
+                external_port: remote_bootstrap.external_port,
+                internal_ss_port: remote_bootstrap.internal_ss_port,
+                server_cfg: &server_cfg,
+                bootstrap_cfg: &bootstrap_cfg,
+            },
         )?;
 
         std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
         let client_cfg_path = local_data.join("client_config.json");
         std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
+
+        let rotated_bootstrap = super::RemoteTransportBootstrap {
+            external_port: remote_bootstrap.external_port,
+            internal_ss_port: remote_bootstrap.internal_ss_port,
+            cover_domain: cover_domain.to_string(),
+            fallback_cover_domains,
+            shadow_pass: remote_bootstrap.shadow_pass,
+            ss_password: master_combined_password,
+            ss_server_password,
+            issued_invites: remote_bootstrap.issued_invites,
+        };
+        let _ = save_cached_transport_bootstrap(&rotate_app, &rotated_bootstrap);
 
         let _ = rotate_app.emit(
             "tunnel-log",
