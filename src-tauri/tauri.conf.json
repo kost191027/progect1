@@ -31,6 +31,9 @@
     "externalBin": [
       "bins/sing-box"
     ],
+    "resources": {
+      "bins/libcronet.dll": "libcronet.dll"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
