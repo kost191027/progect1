@@ -358,7 +358,32 @@ fn write_clipboard_text(text: String) -> Result<(), String> {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "clip"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to launch clip: {}", e))?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("Failed to write clipboard text: {}", e))?;
+        }
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("Failed to wait for clip: {}", e))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err("clip exited with a non-zero status".to_string())
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = text;
         Err("Clipboard write is not implemented for this platform yet.".to_string())
@@ -380,7 +405,21 @@ fn read_clipboard_text() -> Result<String, String> {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
+            .output()
+            .map_err(|e| format!("Failed to launch PowerShell clipboard reader: {}", e))?;
+
+        if !output.status.success() {
+            return Err("PowerShell clipboard read exited with a non-zero status".to_string());
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Err("Clipboard read is not implemented for this platform yet.".to_string())
     }
@@ -784,7 +823,20 @@ async fn launch_tunnel_process_windows(
         }
     }
 
-    // 2. Check that sing-box binary exists and is not blocked
+    // 2. Ensure libcronet.dll is next to sing-box (runtime dependency)
+    let cronet_path = singbox_dir.join("libcronet.dll");
+    if !cronet_path.exists() {
+        let resource_cronet = app
+            .path()
+            .resource_dir()
+            .ok()
+            .map(|d| d.join("libcronet.dll"));
+        if let Some(src) = resource_cronet.filter(|p| p.exists()) {
+            let _ = std::fs::copy(&src, &cronet_path);
+        }
+    }
+
+    // 3. Check that sing-box binary exists and is not blocked
     if !std::path::Path::new(singbox_path).exists() {
         return Err(format!(
             "sing-box binary not found at {}. Reinstall the application.",
@@ -797,22 +849,37 @@ async fn launch_tunnel_process_windows(
         .app_local_data_dir()
         .unwrap_or_else(|_| std::env::temp_dir());
     let pid_file = local_data.join("elevated_singbox.pid");
+    let bootstrap_script = local_data.join("elevated_singbox_bootstrap.ps1");
+    let bootstrap_err = local_data.join("elevated_singbox_bootstrap.err");
     let _ = std::fs::remove_file(&pid_file);
+    let _ = std::fs::remove_file(&bootstrap_err);
 
     let pid_file_str = pid_file.to_string_lossy().to_string();
+    let bootstrap_script_str = bootstrap_script.to_string_lossy().to_string();
+    let bootstrap_err_str = bootstrap_err.to_string_lossy().to_string();
 
-    // PowerShell script that runs inside the elevated process:
-    // - Start sing-box with output redirected to log file
-    // - Write PID to the pid file so the parent can read it
-    let inner_ps = format!(
-        r#"$ErrorActionPreference='Stop'; $p = Start-Process -FilePath '{singbox}' -ArgumentList 'run','-c','{config}' -PassThru -NoNewWindow -RedirectStandardOutput '{log}' -RedirectStandardError '{log}.err'; $p.Id | Out-File -FilePath '{pidfile}' -Encoding ASCII -NoNewline"#,
+    let bootstrap_script_body = format!(
+        r#"$ErrorActionPreference = 'Stop'
+try {{
+  $p = Start-Process -FilePath '{singbox}' -ArgumentList @('run','-c','{config}') -PassThru -WindowStyle Hidden
+  [System.IO.File]::WriteAllText('{pidfile}', $p.Id.ToString(), [System.Text.Encoding]::ASCII)
+  exit 0
+}} catch {{
+  [System.IO.File]::WriteAllText('{bootstrap_err}', ($_ | Out-String), [System.Text.Encoding]::UTF8)
+  exit 1
+}}"#,
         singbox = singbox_path.replace('\'', "''"),
         config = config_str.replace('\'', "''"),
-        log = log_path.replace('\'', "''"),
         pidfile = pid_file_str.replace('\'', "''"),
+        bootstrap_err = bootstrap_err_str.replace('\'', "''"),
     );
 
-    // Outer command: launch elevated PowerShell with the inner script
+    std::fs::write(&bootstrap_script, bootstrap_script_body)
+        .map_err(|e| format!("Failed to write Windows tunnel bootstrap script: {}", e))?;
+
+    // Outer command: launch elevated PowerShell with the script file and wait for the
+    // short bootstrap wrapper to finish. The wrapper starts sing-box, writes its PID,
+    // then exits immediately.
     let output = app
         .shell()
         .command("powershell")
@@ -820,8 +887,8 @@ async fn launch_tunnel_process_windows(
             "-NoProfile",
             "-Command",
             &format!(
-                "Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','{}'",
-                inner_ps.replace('\'', "''")
+                "$p = Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','{}'); if ($p.ExitCode -ne 0) {{ exit 1 }} else {{ exit 0 }}",
+                bootstrap_script_str.replace('\'', "''")
             ),
         ])
         .output()
@@ -840,6 +907,14 @@ async fn launch_tunnel_process_windows(
             );
             return Err("User cancelled admin prompt".to_string());
         }
+        let bootstrap_hint = std::fs::read_to_string(&bootstrap_err).unwrap_or_default();
+        if !bootstrap_hint.trim().is_empty() {
+            return Err(format!(
+                "PowerShell elevation error: {} {}",
+                stderr,
+                bootstrap_hint.trim()
+            ));
+        }
         return Err(format!("PowerShell elevation error: {}", stderr));
     }
 
@@ -855,9 +930,11 @@ async fn launch_tunnel_process_windows(
         }
     }
 
-    // Check for common failure reasons and emit diagnostics
-    let err_log = format!("{}.err", log_path);
-    let err_hint = std::fs::read_to_string(&err_log)
+    // Check for common failure reasons and emit diagnostics.
+    // sing-box writes its own log via config log.output; read last lines for clues.
+    let err_hint = recent_log_tail(log_path, 10);
+
+    let bootstrap_hint = std::fs::read_to_string(&bootstrap_err)
         .ok()
         .and_then(|s| {
             let trimmed = s.trim().to_string();
@@ -869,14 +946,21 @@ async fn launch_tunnel_process_windows(
         })
         .unwrap_or_default();
 
-    let diagnostic = if err_hint.contains("wintun") || err_hint.contains("Wintun") {
+    let combined_hint = if !bootstrap_hint.is_empty() {
+        format!("{} {}", bootstrap_hint, err_hint)
+    } else {
+        err_hint.clone()
+    };
+
+    let diagnostic = if combined_hint.contains("wintun") || combined_hint.contains("Wintun") {
         "Wintun driver failed to initialize. It may be blocked by antivirus software."
-    } else if err_hint.contains("Access is denied") || err_hint.contains("access denied") {
+    } else if combined_hint.contains("Access is denied") || combined_hint.contains("access denied")
+    {
         "Access denied — administrator privileges are required. Check UAC settings."
-    } else if err_hint.contains("antivirus") || err_hint.contains("blocked") {
+    } else if combined_hint.contains("antivirus") || combined_hint.contains("blocked") {
         "sing-box may be blocked by antivirus software. Add an exception and retry."
-    } else if !err_hint.is_empty() {
-        &err_hint
+    } else if !combined_hint.is_empty() {
+        &combined_hint
     } else {
         "Timed out waiting for elevated sing-box to start. Check UAC settings and antivirus."
     };
@@ -907,6 +991,24 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
 
     #[cfg(target_os = "windows")]
     {
+        // On Windows we can't use shell stdout redirect (sing-box runs via Start-Process
+        // -WindowStyle Hidden which is incompatible with -RedirectStandardOutput).
+        // Instead, inject log.output into the config so sing-box writes logs itself.
+        let win_config_path = local_data.join("client_config_win.json");
+        let config_str = match std::fs::read_to_string(&config_path) {
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(mut cfg) => {
+                    cfg["log"]["output"] = serde_json::json!(log_path);
+                    let _ = std::fs::write(
+                        &win_config_path,
+                        serde_json::to_string_pretty(&cfg).unwrap_or(raw.clone()),
+                    );
+                    win_config_path.to_string_lossy().to_string()
+                }
+                Err(_) => config_str,
+            },
+            Err(_) => config_str,
+        };
         launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
     }
 
@@ -972,6 +1074,22 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
     {
         let _ = terminate_root_process(old_pid);
         sleep(Duration::from_secs(1)).await;
+        // Inject log.output into config for Windows (same as launch_tunnel_process)
+        let win_config_path = local_data.join("client_config_win.json");
+        let config_str = match std::fs::read_to_string(&config_path) {
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(mut cfg) => {
+                    cfg["log"]["output"] = serde_json::json!(log_path);
+                    let _ = std::fs::write(
+                        &win_config_path,
+                        serde_json::to_string_pretty(&cfg).unwrap_or(raw.clone()),
+                    );
+                    win_config_path.to_string_lossy().to_string()
+                }
+                Err(_) => config_str,
+            },
+            Err(_) => config_str,
+        };
         launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
     }
 
