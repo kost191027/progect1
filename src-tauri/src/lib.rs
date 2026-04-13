@@ -11,6 +11,7 @@ use tokio::time::{sleep, Duration};
 
 mod generator;
 mod geodata;
+#[path = "ssh/mod.rs"]
 mod ssh;
 
 const TRAY_ICON: Image<'_> = tauri::include_image!("./icons/tray-icon.png");
@@ -166,7 +167,22 @@ fn process_exists(pid: u32) -> bool {
 }
 
 fn escape_applescript(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut escaped = String::with_capacity(value.len());
+
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\r' => {}
+            _ => escaped.push(ch),
+        }
+    }
+
+    escaped
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
 fn run_admin_command(script: &str) -> Result<std::process::Output, String> {
@@ -394,6 +410,10 @@ fn classify_proxy_failure(line: &str) -> bool {
             || lower.contains("connection reset"))
 }
 
+fn classify_outdated_subordinate_config(line: &str) -> bool {
+    line.to_lowercase().contains("traffic hijacked")
+}
+
 fn current_singbox_target_triple() -> Result<&'static str, String> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
@@ -463,8 +483,10 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
     }
 
     let shell_cmd = format!(
-        "'{}' run -c '{}' > {} 2>&1 & echo $!",
-        singbox_path, config_str, log_path
+        "{} run -c {} > {} 2>&1 & echo $!",
+        shell_single_quote(&singbox_path),
+        shell_single_quote(&config_str),
+        shell_single_quote(log_path),
     );
 
     let osascript_arg = format!(
@@ -516,7 +538,10 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
     );
 
     let shell_cmd = format!(
-        "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n'{singbox_path}' run -c '{config_str}' > {log_path} 2>&1 & echo $!",
+        "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n{} run -c {} > {} 2>&1 & echo $!",
+        shell_single_quote(&singbox_path),
+        shell_single_quote(&config_str),
+        shell_single_quote(log_path),
     );
 
     let osascript_arg = format!(
@@ -627,6 +652,13 @@ fn spawn_log_reader(app: AppHandle, pid: u32, log_path: &'static str) {
                 Ok(Some(line)) => {
                     if !line.trim().is_empty() {
                         let _ = app.emit("tunnel-log", format!("[CORE] {}", line));
+                        if classify_outdated_subordinate_config(&line) {
+                            let _ = app.emit(
+                                "subordinate-config-outdated",
+                                "The subordinate tunnel config is outdated and must be refreshed."
+                                    .to_string(),
+                            );
+                        }
                         if classify_proxy_failure(&line) {
                             let state = app.state::<AppState>();
                             register_proxy_failure(&app, &state);
@@ -719,6 +751,31 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{escape_applescript, shell_single_quote};
+
+    #[test]
+    fn escape_applescript_preserves_shell_special_chars_inside_string_literal() {
+        let input = r#"/tmp/test's "path" $(whoami) `id` \ still-here"#;
+        let escaped = escape_applescript(input);
+
+        assert!(escaped.contains("test's"));
+        assert!(escaped.contains("\\\"path\\\""));
+        assert!(escaped.contains("$(whoami)"));
+        assert!(escaped.contains("`id`"));
+        assert!(escaped.contains("\\\\ still-here"));
+    }
+
+    #[test]
+    fn shell_single_quote_safely_quotes_special_path() {
+        let input = r#"/tmp/test's "path" $(whoami) `id`"#;
+        let quoted = shell_single_quote(input);
+
+        assert_eq!(quoted, r#"'/tmp/test'"'"'s "path" $(whoami) `id`'"#);
+    }
 }
 
 async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
@@ -852,6 +909,8 @@ async fn reset_local_data(app: AppHandle) -> Result<(), String> {
 
     ssh::clear_issued_invites(&app)?;
     ssh::clear_local_warp_profile_sync(&app)?;
+    ssh::clear_cached_transport_bootstrap(&app)?;
+    ssh::clear_backend_app_role(&app)?;
 
     let _ = fs::remove_file("/tmp/rkn-tun.log");
     set_network_fingerprint(&state, None);

@@ -20,7 +20,6 @@ pub const INTERNAL_SS_PORT: u16 = 14433;
 const PRIMARY_COVER_DOMAINS: &[&str] = &[
     "feishu.cn",
     "coding.net",
-    "cloud.tencent.com",
     "weather-data.apple.com",
     "publicassets.cdn-apple.com",
 ];
@@ -29,13 +28,14 @@ const PRIMARY_COVER_DOMAINS: &[&str] = &[
 ///
 /// `feishu.cn`, `coding.net`, `upyun.com`, `douyin.com`, `toutiao.com`,
 /// `publicassets.cdn-apple.com` and `weather-data.apple.com` come from the
-/// upstream ShadowTLS TLS 1.3 compatibility list. `cloud.tencent.com` and
-/// `captive.apple.com` are kept because they are used in the upstream
-/// ShadowTLS examples and have worked for us on some paths.
+/// upstream ShadowTLS TLS 1.3 compatibility list. `captive.apple.com` is kept
+/// because it has worked for us on some paths. `cloud.tencent.com` used to
+/// work, but now frequently serves a `coding.net` certificate and breaks
+/// ShadowTLS verification, so it is treated as a legacy domain and excluded
+/// from new selections.
 const ROTATION_COVER_DOMAINS: &[&str] = &[
     "feishu.cn",
     "coding.net",
-    "cloud.tencent.com",
     "weather-data.apple.com",
     "publicassets.cdn-apple.com",
     "upyun.com",
@@ -71,6 +71,10 @@ pub fn select_cover_domain(short_id: &str) -> &'static str {
         .and_then(|h| u8::from_str_radix(h, 16).ok())
         .unwrap_or(0) as usize;
     PRIMARY_COVER_DOMAINS[seed % PRIMARY_COVER_DOMAINS.len()]
+}
+
+pub fn is_legacy_cover_domain_requiring_refresh(domain: &str) -> bool {
+    matches!(domain, "cloud.tencent.com")
 }
 
 pub fn select_next_cover_domain(
