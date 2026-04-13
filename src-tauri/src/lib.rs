@@ -1,4 +1,4 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::io::Write;
 use std::sync::Mutex;
 use std::{fs, path::PathBuf};
@@ -7,7 +7,9 @@ use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 #[cfg(target_os = "windows")]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, Wry};
+#[cfg(target_os = "macos")]
+use tauri::RunEvent;
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{sleep, Duration};
