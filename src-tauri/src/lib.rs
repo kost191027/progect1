@@ -353,8 +353,11 @@ fn read_clipboard_text() -> Result<String, String> {
 fn current_network_fingerprint() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        // Windows network fingerprinting will be implemented in 6.3
-        None
+        if let Some(fingerprint) = current_network_fingerprint_windows_powershell() {
+            return Some(fingerprint);
+        }
+
+        current_network_fingerprint_windows_ipconfig()
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -433,6 +436,159 @@ fn current_network_fingerprint() -> Option<String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn current_network_fingerprint_windows_powershell() -> Option<String> {
+    let script = r#"
+      $ErrorActionPreference = 'Stop'
+      $items = @(
+        Get-NetIPConfiguration |
+          Where-Object {
+            $_.NetAdapter -and
+            $_.NetAdapter.Status -eq 'Up' -and
+            $_.IPv4Address -and
+            $_.InterfaceAlias -notmatch 'Loopback|isatap|Teredo|Wintun|TAP|VPN|vEthernet|Bluetooth|Npcap|tun'
+          } |
+          Select-Object `
+            @{Name='alias';Expression={$_.InterfaceAlias}}, `
+            @{Name='index';Expression={$_.InterfaceIndex}}, `
+            @{Name='ipv4';Expression={($_.IPv4Address | Select-Object -ExpandProperty IPAddress -First 1)}}, `
+            @{Name='gateway';Expression={($_.IPv4DefaultGateway | Select-Object -ExpandProperty NextHop -First 1)}}, `
+            @{Name='dns';Expression={@(($_.DNSServer.ServerAddresses)) -join ','}} |
+          Sort-Object index, alias
+      )
+      $items | ConvertTo-Json -Compress
+    "#;
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_windows_network_fingerprint_json(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "windows")]
+fn current_network_fingerprint_windows_ipconfig() -> Option<String> {
+    let output = std::process::Command::new("ipconfig").output().ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut blocks = Vec::new();
+    let mut current_adapter: Option<String> = None;
+    let mut current_ipv4: Option<String> = None;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if !line.starts_with(' ') && line.contains(':') {
+            if let Some(adapter) = current_adapter.take() {
+                if let Some(ip) = current_ipv4.take() {
+                    let lower = adapter.to_lowercase();
+                    if !lower.contains("loopback")
+                        && !lower.contains("isatap")
+                        && !lower.contains("teredo")
+                        && !lower.contains("wintun")
+                        && !lower.contains("vethernet")
+                    {
+                        blocks.push(format!("{}|{}", adapter, ip));
+                    }
+                }
+            }
+
+            current_adapter = line
+                .trim_end()
+                .strip_suffix(':')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            current_ipv4 = None;
+            continue;
+        }
+
+        if trimmed.contains("IPv4") && trimmed.contains(':') {
+            if let Some(ip) = trimmed.split(':').last() {
+                let ip = ip.trim();
+                if !ip.is_empty() {
+                    current_ipv4 = Some(ip.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(adapter) = current_adapter.take() {
+        if let Some(ip) = current_ipv4.take() {
+            let lower = adapter.to_lowercase();
+            if !lower.contains("loopback")
+                && !lower.contains("isatap")
+                && !lower.contains("teredo")
+                && !lower.contains("wintun")
+                && !lower.contains("vethernet")
+            {
+                blocks.push(format!("{}|{}", adapter, ip));
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks.join(";"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_network_fingerprint_json(stdout: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok()?;
+    let items = parsed.as_array()?;
+    let mut blocks = Vec::new();
+
+    for item in items {
+        let alias = item
+            .get("alias")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let index = item.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ipv4 = item
+            .get("ipv4")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let gateway = item
+            .get("gateway")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let dns = item
+            .get("dns")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+
+        if alias.is_empty() || ipv4.is_empty() {
+            continue;
+        }
+
+        blocks.push(format!("{index}|{alias}|{ipv4}|{gateway}|{dns}"));
+    }
+
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks.join(";"))
+    }
+}
+
 fn set_network_fingerprint(state: &AppState, fingerprint: Option<String>) {
     let mut guard = state.network_fingerprint.lock().unwrap();
     *guard = fingerprint;
@@ -445,6 +601,17 @@ fn get_network_fingerprint(state: &AppState) -> Option<String> {
 fn finish_recovery(state: &AppState) {
     let mut guard = state.recovery_in_progress.lock().unwrap();
     *guard = false;
+}
+
+#[cfg(target_os = "windows")]
+fn begin_recovery(state: &AppState) -> bool {
+    let mut guard = state.recovery_in_progress.lock().unwrap();
+    if *guard {
+        return false;
+    }
+
+    *guard = true;
+    true
 }
 
 fn reset_guard_state(state: &AppState) {
@@ -954,6 +1121,11 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
 
 fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
     tauri::async_runtime::spawn(async move {
+        #[cfg(target_os = "windows")]
+        let mut last_tick = std::time::Instant::now();
+        #[cfg(target_os = "windows")]
+        let mut adapter_missing = false;
+
         loop {
             sleep(Duration::from_secs(5)).await;
 
@@ -968,6 +1140,66 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
             }
 
             let current_fingerprint = current_network_fingerprint();
+
+            #[cfg(target_os = "windows")]
+            {
+                let elapsed = last_tick.elapsed();
+                last_tick = std::time::Instant::now();
+
+                if elapsed >= Duration::from_secs(20) {
+                    let state = app.state::<AppState>();
+                    if begin_recovery(&state) {
+                        if let Some(fingerprint) = current_fingerprint.clone() {
+                            set_network_fingerprint(&state, Some(fingerprint));
+                        } else {
+                            set_network_fingerprint(&state, None);
+                        }
+
+                        reset_guard_state(&state);
+                        emit_guard_state(&app, "active");
+                        let _ = app.emit(
+                            "tunnel-log",
+                            "[SYSTEM] Windows resume detected after sleep or suspend. Keeping the tunnel active and reinitializing the recovery state for the current network context.".to_string(),
+                        );
+                        finish_recovery(&state);
+                    }
+                }
+
+                if current_fingerprint.is_none() {
+                    if !adapter_missing {
+                        adapter_missing = true;
+                        let state = app.state::<AppState>();
+                        if begin_recovery(&state) {
+                            set_network_fingerprint(&state, None);
+                            let _ = app.emit(
+                                "tunnel-log",
+                                "[SYSTEM] Windows network adapter is temporarily unavailable. Waiting for the adapter to come back before refreshing the tunnel recovery state.".to_string(),
+                            );
+                            finish_recovery(&state);
+                        }
+                    }
+                    continue;
+                }
+
+                if adapter_missing {
+                    adapter_missing = false;
+                    let state = app.state::<AppState>();
+                    if begin_recovery(&state) {
+                        if let Some(fingerprint) = current_fingerprint.clone() {
+                            set_network_fingerprint(&state, Some(fingerprint));
+                        }
+                        reset_guard_state(&state);
+                        emit_guard_state(&app, "active");
+                        let _ = app.emit(
+                            "tunnel-log",
+                            "[SYSTEM] Windows network adapter reconnected. Keeping the tunnel active and refreshing the routing context for the restored adapter.".to_string(),
+                        );
+                        finish_recovery(&state);
+                    }
+                    continue;
+                }
+            }
+
             let fingerprint_changed = {
                 let state = app.state::<AppState>();
                 let previous = get_network_fingerprint(&state);
@@ -983,6 +1215,26 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                 set_network_fingerprint(&state, Some(fingerprint));
             }
 
+            #[cfg(target_os = "windows")]
+            {
+                if begin_recovery(&state) {
+                    let was_engaged = *state.kill_switch_engaged.lock().unwrap();
+                    let previous_failures = *state.proxy_failure_count.lock().unwrap();
+                    reset_guard_state(&state);
+
+                    if was_engaged || previous_failures > 0 {
+                        emit_guard_state(&app, "active");
+                    }
+
+                    let _ = app.emit(
+                        "tunnel-log",
+                        "[SYSTEM] Windows network change detected. Keeping the tunnel active and refreshing the recovery state for the new adapter.".to_string(),
+                    );
+                    finish_recovery(&state);
+                }
+                continue;
+            }
+
             let _ = app.emit(
                 "tunnel-log",
                 "[SYSTEM] Network change detected. Keeping tunnel active and updating the network context.".to_string(),
@@ -993,6 +1245,8 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use super::parse_windows_network_fingerprint_json;
     use super::{escape_applescript, shell_single_quote};
 
     #[test]
@@ -1013,6 +1267,18 @@ mod tests {
         let quoted = shell_single_quote(input);
 
         assert_eq!(quoted, r#"'/tmp/test'"'"'s "path" $(whoami) `id`'"#);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parse_windows_network_fingerprint_json_builds_stable_fingerprint() {
+        let sample = r#"[{"alias":"Wi-Fi","index":17,"ipv4":"192.168.1.25","gateway":"192.168.1.1","dns":"1.1.1.1,8.8.8.8"},{"alias":"Ethernet","index":7,"ipv4":"10.0.0.14","gateway":"10.0.0.1","dns":"10.0.0.1"}]"#;
+        let parsed = parse_windows_network_fingerprint_json(sample);
+
+        assert_eq!(
+            parsed.as_deref(),
+            Some("17|Wi-Fi|192.168.1.25|192.168.1.1|1.1.1.1,8.8.8.8;7|Ethernet|10.0.0.14|10.0.0.1|10.0.0.1")
+        );
     }
 }
 
