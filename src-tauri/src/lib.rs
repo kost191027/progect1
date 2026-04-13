@@ -334,6 +334,11 @@ fn recent_log_tail(log_path: &str, max_lines: usize) -> String {
     lines.join("\n")
 }
 
+#[cfg(target_os = "windows")]
+fn trim_utf8_bom(value: &str) -> &str {
+    value.strip_prefix('\u{feff}').unwrap_or(value)
+}
+
 #[tauri::command]
 fn write_clipboard_text(text: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -940,13 +945,15 @@ try {{
     if (-not [string]::IsNullOrWhiteSpace($logTail)) {{
       $message = $message + [Environment]::NewLine + $logTail.Trim()
     }}
-    [System.IO.File]::WriteAllText('{bootstrap_err}', $message, [System.Text.Encoding]::UTF8)
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText('{bootstrap_err}', $message, $utf8NoBom)
     exit 1
   }}
 
   exit 0
 }} catch {{
-  [System.IO.File]::WriteAllText('{bootstrap_err}', ($_ | Out-String), [System.Text.Encoding]::UTF8)
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText('{bootstrap_err}', ($_ | Out-String), $utf8NoBom)
   exit 1
 }}"#,
         singbox = singbox_path.replace('\'', "''"),
@@ -1003,7 +1010,9 @@ try {{
             );
             return Err("User cancelled admin prompt".to_string());
         }
-        let bootstrap_hint = std::fs::read_to_string(&bootstrap_err).unwrap_or_default();
+        let bootstrap_hint = std::fs::read_to_string(&bootstrap_err)
+            .map(|value| trim_utf8_bom(&value).to_string())
+            .unwrap_or_default();
         if !bootstrap_hint.trim().is_empty() {
             return Err(format!(
                 "PowerShell elevation error: {} {}",
@@ -1039,7 +1048,7 @@ try {{
     let bootstrap_hint = std::fs::read_to_string(&bootstrap_err)
         .ok()
         .and_then(|s| {
-            let trimmed = s.trim().to_string();
+            let trimmed = trim_utf8_bom(&s).trim().to_string();
             if trimmed.is_empty() {
                 None
             } else {
@@ -1285,7 +1294,7 @@ async fn verify_tunnel_start(
             .and_then(|dir| {
                 std::fs::read_to_string(dir.join("elevated_singbox_bootstrap.err")).ok()
             })
-            .map(|value| value.trim().to_string())
+            .map(|value| trim_utf8_bom(&value).trim().to_string())
             .filter(|value| !value.is_empty());
 
         #[cfg(not(target_os = "windows"))]

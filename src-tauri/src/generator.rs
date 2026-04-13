@@ -14,30 +14,24 @@ pub const INTERNAL_SS_PORT: u16 = 14433;
 /// Stable domains used for first deploys.
 ///
 /// We avoid staying Apple-only here because some routes can start failing on
-/// `captive.apple.com` / `publicassets.cdn-apple.com` even when the generated
-/// client and server configs still match. The primary pool therefore mixes the
-/// upstream ShadowTLS TLS1.3-compatible domains with a smaller Apple subset.
-const PRIMARY_COVER_DOMAINS: &[&str] = &[
-    "feishu.cn",
-    "coding.net",
-    "weather-data.apple.com",
-    "publicassets.cdn-apple.com",
-];
+/// Apple endpoints even when the generated client and server configs still
+/// match. `publicassets.cdn-apple.com` is now treated as a legacy domain after
+/// returning mismatched certificates on real clients, so new deploys avoid it.
+const PRIMARY_COVER_DOMAINS: &[&str] = &["feishu.cn", "coding.net", "weather-data.apple.com"];
 
 /// Additional ShadowTLS-friendly domains used only for SNI rotation.
 ///
-/// `feishu.cn`, `coding.net`, `upyun.com`, `douyin.com`, `toutiao.com`,
-/// `publicassets.cdn-apple.com` and `weather-data.apple.com` come from the
-/// upstream ShadowTLS TLS 1.3 compatibility list. `captive.apple.com` is kept
-/// because it has worked for us on some paths. `cloud.tencent.com` used to
-/// work, but now frequently serves a `coding.net` certificate and breaks
-/// ShadowTLS verification, so it is treated as a legacy domain and excluded
-/// from new selections.
+/// `feishu.cn`, `coding.net`, `upyun.com`, `douyin.com`, `toutiao.com` and
+/// `weather-data.apple.com` come from the upstream ShadowTLS TLS 1.3
+/// compatibility list. `captive.apple.com` is kept because it has worked for
+/// us on some paths. `cloud.tencent.com` and `publicassets.cdn-apple.com` are
+/// now treated as legacy domains and excluded from new selections because they
+/// can return certificates for a different hostname and break ShadowTLS
+/// verification.
 const ROTATION_COVER_DOMAINS: &[&str] = &[
     "feishu.cn",
     "coding.net",
     "weather-data.apple.com",
-    "publicassets.cdn-apple.com",
     "upyun.com",
     "douyin.com",
     "toutiao.com",
@@ -74,7 +68,7 @@ pub fn select_cover_domain(short_id: &str) -> &'static str {
 }
 
 pub fn is_legacy_cover_domain_requiring_refresh(domain: &str) -> bool {
-    matches!(domain, "cloud.tencent.com")
+    matches!(domain, "cloud.tencent.com" | "publicassets.cdn-apple.com")
 }
 
 pub fn select_next_cover_domain(
