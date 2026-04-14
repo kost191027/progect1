@@ -307,10 +307,19 @@ fn terminate_root_process(pid: u32) -> Result<(), String> {
 fn tunnel_log_path() -> &'static str {
     #[cfg(target_os = "windows")]
     {
-        // %TEMP%\rkn-tun.log — resolved at runtime, but for now we use a fixed path
-        // under the Windows temp directory. The actual path resolution happens via
-        // std::env::temp_dir() in the launch flow. This constant is the fallback.
-        "C:\\Windows\\Temp\\rkn-tun.log"
+        // Use the current user's temp dir (e.g. C:\Users\<user>\AppData\Local\Temp)
+        // instead of C:\Windows\Temp. Files created by an elevated process under
+        // C:\Windows\Temp get restrictive ACLs that prevent the non-elevated app
+        // from reading them back (Access Denied / os error 5).
+        // The user's %TEMP% is readable by both elevated and non-elevated processes
+        // of the same user.
+        static LOG_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        LOG_PATH.get_or_init(|| {
+            std::env::temp_dir()
+                .join("rkn-tun.log")
+                .to_string_lossy()
+                .into_owned()
+        })
     }
 
     #[cfg(not(target_os = "windows"))]
