@@ -1109,10 +1109,17 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
             Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
                 Ok(mut cfg) => {
                     cfg["log"]["output"] = serde_json::json!(log_path);
-                    let _ = std::fs::write(
+                    std::fs::write(
                         &win_config_path,
                         serde_json::to_string_pretty(&cfg).unwrap_or(raw.clone()),
-                    );
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Failed to write Windows runtime client config {}: {}",
+                            win_config_path.display(),
+                            e
+                        )
+                    })?;
                     win_config_path.to_string_lossy().to_string()
                 }
                 Err(_) => config_str,
@@ -1208,10 +1215,17 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
             Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
                 Ok(mut cfg) => {
                     cfg["log"]["output"] = serde_json::json!(log_path);
-                    let _ = std::fs::write(
+                    std::fs::write(
                         &win_config_path,
                         serde_json::to_string_pretty(&cfg).unwrap_or(raw.clone()),
-                    );
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Failed to write Windows runtime client config {}: {}",
+                            win_config_path.display(),
+                            e
+                        )
+                    })?;
                     win_config_path.to_string_lossy().to_string()
                 }
                 Err(_) => config_str,
@@ -1697,8 +1711,12 @@ async fn reset_local_data(app: AppHandle) -> Result<(), String> {
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     let files_to_remove = [
         local_data.join("client_config.json"),
+        local_data.join("client_config_win.json"),
         local_data.join("server_profile.json"),
         local_data.join("active_tunnel_pid"),
+        local_data.join("elevated_singbox_bootstrap.err"),
+        local_data.join("elevated_singbox_bootstrap.ps1"),
+        local_data.join("elevated_singbox.pid"),
     ];
 
     for path in files_to_remove {
