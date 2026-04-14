@@ -1081,23 +1081,22 @@ try {{
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
-    let output = app
-        .shell()
-        .command("powershell")
+    let launch_output = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
             "-Command",
             &format!(
-                "$bf = Join-Path $env:LOCALAPPDATA 'com.freedom.rkn\\{}'; $p = Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$bf); if ($p.ExitCode -ne 0) {{ exit 1 }} else {{ exit 0 }}",
+                "$bf = Join-Path $env:LOCALAPPDATA 'com.freedom.rkn\\{}'; Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$bf)",
                 bootstrap_filename
             ),
         ])
         .output()
-        .await
         .map_err(|e| format!("Failed to launch elevated PowerShell: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !launch_output.status.success() {
+        let stderr = String::from_utf8_lossy(&launch_output.stderr)
+            .trim()
+            .to_string();
         if stderr.contains("canceled")
             || stderr.contains("cancelled")
             || stderr.contains("0x80004005")
@@ -1123,8 +1122,10 @@ try {{
 
     // Poll for the PID file written by the elevated process. On weaker Windows
     // machines the elevated bootstrap can take noticeably longer after the UAC
-    // confirmation, so keep the wait budget generous.
-    for _ in 0..40 {
+    // confirmation, so keep the wait budget generous. We do not block on the
+    // outer PowerShell wrapper itself because older Windows installs can hang
+    // there even after the UAC prompt is accepted.
+    for _ in 0..60 {
         sleep(Duration::from_millis(500)).await;
         if let Ok(contents) = std::fs::read_to_string(&pid_file) {
             let trimmed = contents.trim();
