@@ -372,8 +372,11 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 // - do not force a fixed adapter name on older systems
                 // - relax strict_route because some older Windows installs loop
                 //   while reinitializing routes after TUN startup
+                // - prefer gVisor stack because some old Windows builds fail to
+                //   bind the system stack to the TUN address during startup
                 object.remove("interface_name");
                 object.insert("strict_route".to_string(), serde_json::json!(false));
+                object.insert("stack".to_string(), serde_json::json!("gvisor"));
             }
         }
     }
