@@ -339,6 +339,25 @@ fn trim_utf8_bom(value: &str) -> &str {
     value.strip_prefix('\u{feff}').unwrap_or(value)
 }
 
+/// Extract the VPN server IP from the client config's outbound section.
+#[cfg(target_os = "windows")]
+fn extract_server_ip_from_config(cfg: &serde_json::Value) -> Option<String> {
+    let outbounds = cfg.get("outbounds")?.as_array()?;
+    for outbound in outbounds {
+        let outbound_type = outbound.get("type")?.as_str()?;
+        // The ShadowTLS outbound has the real server IP
+        if outbound_type == "shadowtls" || outbound_type == "shadowsocks" {
+            if let Some(server) = outbound.get("server").and_then(|v| v.as_str()) {
+                // Only return actual IPs, not hostnames
+                if server.parse::<std::net::Ipv4Addr>().is_ok() {
+                    return Some(server.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(target_os = "windows")]
 fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Result<String, String> {
     let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
@@ -370,25 +389,31 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             if let Some(object) = inbound.as_object_mut() {
                 // Windows compatibility profile:
                 // - do not force a fixed adapter name on older systems
-                // - relax strict_route because some older Windows installs loop
-                //   while reinitializing routes after TUN startup
-                // - prefer gVisor stack because some old Windows builds fail to
-                //   bind the system stack to the TUN address during startup
+                // - relax strict_route to avoid route conflicts during TUN startup
+                // - prefer gVisor stack for broader Windows compatibility
                 object.remove("interface_name");
                 object.insert("strict_route".to_string(), serde_json::json!(false));
                 object.insert("stack".to_string(), serde_json::json!("gvisor"));
+
+                // CRITICAL: extract the VPN server IP from outbound config and
+                // exclude it from TUN routing at the OS level. Without this,
+                // auto_route captures sing-box's own traffic to the server,
+                // creating an infinite routing loop (1 GB+ RAM, 50%+ CPU).
+                if let Some(server_ip) = extract_server_ip_from_config(&cfg) {
+                    object.insert(
+                        "inet4_route_exclude_address".to_string(),
+                        serde_json::json!([format!("{}/32", server_ip)]),
+                    );
+                }
             }
         }
     }
 
     if let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) {
-        // Older Windows installs can churn the default-interface watcher during
-        // early TUN bring-up. Keep the first-start profile conservative and let
-        // the separate recovery monitor react to later network changes.
-        route.insert(
-            "auto_detect_interface".to_string(),
-            serde_json::json!(false),
-        );
+        // auto_detect_interface MUST stay true so that the "direct" outbound
+        // binds to the physical network adapter instead of the TUN. Without it,
+        // traffic to the VPN server goes through the TUN → routing loop.
+        route.insert("auto_detect_interface".to_string(), serde_json::json!(true));
     }
 
     serde_json::to_string_pretty(&cfg)

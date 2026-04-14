@@ -332,6 +332,11 @@ pub fn build_client_config(
 
     if !cfg!(target_os = "macos") {
         tun_inbound["interface_name"] = json!("tun0");
+        // On Windows, strict_route captures ALL traffic including sing-box's own
+        // outbound to the VPN server, causing an infinite routing loop (high CPU,
+        // memory explosion). Explicitly exclude the server IP from TUN routing
+        // at the OS level so that direct outbound traffic bypasses Wintun.
+        tun_inbound["inet4_route_exclude_address"] = json!([format!("{}/32", server_ip)]);
     }
 
     let mut config = json!({
