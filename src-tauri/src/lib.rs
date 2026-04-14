@@ -371,6 +371,9 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
     cfg["log"]["level"] = serde_json::json!("debug");
     cfg["log"]["timestamp"] = serde_json::json!(true);
 
+    // Extract server IP before mutably borrowing inbounds
+    let server_ip = extract_server_ip_from_config(&cfg);
+
     if let Some(inbounds) = cfg
         .get_mut("inbounds")
         .and_then(|value| value.as_array_mut())
@@ -395,14 +398,13 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 object.insert("strict_route".to_string(), serde_json::json!(false));
                 object.insert("stack".to_string(), serde_json::json!("gvisor"));
 
-                // CRITICAL: extract the VPN server IP from outbound config and
-                // exclude it from TUN routing at the OS level. Without this,
-                // auto_route captures sing-box's own traffic to the server,
-                // creating an infinite routing loop (1 GB+ RAM, 50%+ CPU).
-                if let Some(server_ip) = extract_server_ip_from_config(&cfg) {
+                // CRITICAL: exclude the VPN server IP from TUN routing at the OS
+                // level. Without this, auto_route captures sing-box's own traffic
+                // to the server → infinite routing loop (1 GB+ RAM, 50%+ CPU).
+                if let Some(ref ip) = server_ip {
                     object.insert(
                         "inet4_route_exclude_address".to_string(),
-                        serde_json::json!([format!("{}/32", server_ip)]),
+                        serde_json::json!([format!("{}/32", ip)]),
                     );
                 }
             }
@@ -997,7 +999,6 @@ async fn launch_tunnel_process_windows(
     let _ = std::fs::remove_file(&bootstrap_err);
 
     let pid_file_str = pid_file.to_string_lossy().to_string();
-    let bootstrap_script_str = bootstrap_script.to_string_lossy().to_string();
     let bootstrap_err_str = bootstrap_err.to_string_lossy().to_string();
 
     let bootstrap_script_body = format!(
@@ -1187,7 +1188,6 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
         return Err("Client config not found. Please deploy a server first.".to_string());
     }
 
-    let config_str = config_path.to_string_lossy().to_string();
     let log_path = tunnel_log_path();
     let _ = std::fs::remove_file(log_path);
 
@@ -1230,6 +1230,8 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
 
     #[cfg(not(target_os = "windows"))]
     {
+        let config_str = config_path.to_string_lossy().to_string();
+
         if announce_prompt {
             let _ = app.emit(
                 "tunnel-log",
@@ -1285,7 +1287,6 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
         return Err("Client config not found. Please deploy a server first.".to_string());
     }
 
-    let config_str = config_path.to_string_lossy().to_string();
     let log_path = tunnel_log_path();
     let _ = std::fs::remove_file(log_path);
 
@@ -1320,6 +1321,7 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
 
     #[cfg(not(target_os = "windows"))]
     {
+        let config_str = config_path.to_string_lossy().to_string();
         let shell_cmd = format!(
             "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n{} run -c {} > {} 2>&1 & echo $!",
             shell_single_quote(&singbox_path),
