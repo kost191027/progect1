@@ -16,7 +16,7 @@ defaults:
 
 jobs:
   build-windows-test:
-    name: Build Windows Test Bundle
+    name: Build Windows Test Portable
     runs-on: windows-latest
     env:
       VITE_APP_BUILD: ${{ github.run_number }}
@@ -60,33 +60,36 @@ jobs:
           echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
           echo "VITE_APP_VERSION=${version}" >> "$GITHUB_ENV"
 
-      - name: Build Tauri Windows test bundle
-        run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles app
+      - name: Build Tauri Windows test binary
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc --no-bundle
 
-      - name: Locate Windows test bundle
+      - name: Assemble Windows portable test package
         id: package
         shell: bash
         run: |
           version="${{ steps.meta.outputs.version }}"
           short_sha="${{ steps.meta.outputs.short_sha }}"
-          app_dir="src-tauri/target/x86_64-pc-windows-msvc/release/bundle/app"
+          release_dir="dist/test-release/windows-x64"
+          portable_dir="${release_dir}/RKN-${version}-windows-test-${short_sha}"
+          target_dir="src-tauri/target/x86_64-pc-windows-msvc/release"
 
-          if [[ ! -d "${app_dir}" ]]; then
-            echo "Expected Windows app bundle directory was not produced."
+          mkdir -p "${portable_dir}"
+
+          if [[ ! -f "${target_dir}/rkn.exe" ]]; then
+            echo "Expected rkn.exe was not produced."
             exit 1
           fi
 
-          bundle_root="$(find "${app_dir}" -mindepth 1 -maxdepth 1 | head -n 1)"
+          cp "${target_dir}/rkn.exe" "${portable_dir}/RKN.exe"
 
-          if [[ -z "${bundle_root}" ]]; then
-            echo "Expected Windows app bundle contents were not produced."
-            exit 1
-          fi
+          cp "src-tauri/bins/sing-box-x86_64-pc-windows-msvc.exe" "${portable_dir}/sing-box-x86_64-pc-windows-msvc.exe"
+          cp "src-tauri/bins/wintun.dll" "${portable_dir}/wintun.dll"
+          cp "src-tauri/bins/libcronet.dll" "${portable_dir}/libcronet.dll"
 
-          echo "bundle_path=${bundle_root}" >> "$GITHUB_OUTPUT"
+          echo "bundle_path=${portable_dir}" >> "$GITHUB_OUTPUT"
           echo "bundle_name=RKN-${version}-windows-test-${short_sha}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Windows test bundle
+      - name: Upload Windows test portable package
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.bundle_name }}
