@@ -403,7 +403,7 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 // to the server → infinite routing loop (1 GB+ RAM, 50%+ CPU).
                 if let Some(ref ip) = server_ip {
                     object.insert(
-                        "inet4_route_exclude_address".to_string(),
+                        "route_exclude_address".to_string(),
                         serde_json::json!([format!("{}/32", ip)]),
                     );
                 }
