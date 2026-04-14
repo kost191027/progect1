@@ -339,6 +339,59 @@ fn trim_utf8_bom(value: &str) -> &str {
     value.strip_prefix('\u{feff}').unwrap_or(value)
 }
 
+#[cfg(target_os = "windows")]
+fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Result<String, String> {
+    let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
+        format!(
+            "Failed to parse generated client config for Windows runtime: {}",
+            e
+        )
+    })?;
+
+    cfg["log"]["output"] = serde_json::json!(log_path);
+    cfg["log"]["level"] = serde_json::json!("debug");
+    cfg["log"]["timestamp"] = serde_json::json!(true);
+
+    if let Some(inbounds) = cfg
+        .get_mut("inbounds")
+        .and_then(|value| value.as_array_mut())
+    {
+        for inbound in inbounds {
+            let is_tun = inbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .map(|value| value == "tun")
+                .unwrap_or(false);
+
+            if !is_tun {
+                continue;
+            }
+
+            if let Some(object) = inbound.as_object_mut() {
+                // Windows compatibility profile:
+                // - do not force a fixed adapter name on older systems
+                // - relax strict_route because some older Windows installs loop
+                //   while reinitializing routes after TUN startup
+                object.remove("interface_name");
+                object.insert("strict_route".to_string(), serde_json::json!(false));
+            }
+        }
+    }
+
+    if let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) {
+        // Older Windows installs can churn the default-interface watcher during
+        // early TUN bring-up. Keep the first-start profile conservative and let
+        // the separate recovery monitor react to later network changes.
+        route.insert(
+            "auto_detect_interface".to_string(),
+            serde_json::json!(false),
+        );
+    }
+
+    serde_json::to_string_pretty(&cfg)
+        .map_err(|e| format!("Failed to serialize Windows runtime client config: {}", e))
+}
+
 #[tauri::command]
 fn write_clipboard_text(text: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -928,6 +981,8 @@ try {{
   $psi.Arguments = 'run -c "{config}"'
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
 
   $p = New-Object System.Diagnostics.Process
   $p.StartInfo = $psi
@@ -936,14 +991,28 @@ try {{
 
   if ($p.WaitForExit(8000)) {{
     $logTail = ''
+    $stdoutTail = ''
+    $stderrTail = ''
+    try {{
+      $stdoutTail = $p.StandardOutput.ReadToEnd()
+    }} catch {{}}
+    try {{
+      $stderrTail = $p.StandardError.ReadToEnd()
+    }} catch {{}}
     if (Test-Path '{log_path}') {{
       try {{
         $logTail = (Get-Content -Path '{log_path}' -Tail 20 | Out-String)
       }} catch {{}}
     }}
     $message = "sing-box exited during bootstrap with code $($p.ExitCode)."
+    if (-not [string]::IsNullOrWhiteSpace($stderrTail)) {{
+      $message = $message + [Environment]::NewLine + "stderr:" + [Environment]::NewLine + $stderrTail.Trim()
+    }}
+    if (-not [string]::IsNullOrWhiteSpace($stdoutTail)) {{
+      $message = $message + [Environment]::NewLine + "stdout:" + [Environment]::NewLine + $stdoutTail.Trim()
+    }}
     if (-not [string]::IsNullOrWhiteSpace($logTail)) {{
-      $message = $message + [Environment]::NewLine + $logTail.Trim()
+      $message = $message + [Environment]::NewLine + "log tail:" + [Environment]::NewLine + $logTail.Trim()
     }}
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText('{bootstrap_err}', $message, $utf8NoBom)
@@ -1101,31 +1170,23 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
             "[SYSTEM] Running local sing-box preflight...".to_string(),
         );
 
-        // On Windows we can't use shell stdout redirect (sing-box runs via Start-Process
-        // -WindowStyle Hidden which is incompatible with -RedirectStandardOutput).
-        // Instead, inject log.output into the config so sing-box writes logs itself.
         let win_config_path = local_data.join("client_config_win.json");
-        let config_str = match std::fs::read_to_string(&config_path) {
-            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-                Ok(mut cfg) => {
-                    cfg["log"]["output"] = serde_json::json!(log_path);
-                    std::fs::write(
-                        &win_config_path,
-                        serde_json::to_string_pretty(&cfg).unwrap_or(raw.clone()),
-                    )
-                    .map_err(|e| {
-                        format!(
-                            "Failed to write Windows runtime client config {}: {}",
-                            win_config_path.display(),
-                            e
-                        )
-                    })?;
-                    win_config_path.to_string_lossy().to_string()
-                }
-                Err(_) => config_str,
-            },
-            Err(_) => config_str,
-        };
+        let raw = std::fs::read_to_string(&config_path).map_err(|e| {
+            format!(
+                "Failed to read base client config {}: {}",
+                config_path.display(),
+                e
+            )
+        })?;
+        let runtime_cfg = build_windows_runtime_client_config(&raw, log_path)?;
+        std::fs::write(&win_config_path, runtime_cfg).map_err(|e| {
+            format!(
+                "Failed to write Windows runtime client config {}: {}",
+                win_config_path.display(),
+                e
+            )
+        })?;
+        let config_str = win_config_path.to_string_lossy().to_string();
 
         run_windows_singbox_preflight(&singbox_path, &config_str)?;
 
@@ -1209,29 +1270,23 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
     {
         let _ = terminate_root_process(old_pid);
         sleep(Duration::from_secs(1)).await;
-        // Inject log.output into config for Windows (same as launch_tunnel_process)
         let win_config_path = local_data.join("client_config_win.json");
-        let config_str = match std::fs::read_to_string(&config_path) {
-            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-                Ok(mut cfg) => {
-                    cfg["log"]["output"] = serde_json::json!(log_path);
-                    std::fs::write(
-                        &win_config_path,
-                        serde_json::to_string_pretty(&cfg).unwrap_or(raw.clone()),
-                    )
-                    .map_err(|e| {
-                        format!(
-                            "Failed to write Windows runtime client config {}: {}",
-                            win_config_path.display(),
-                            e
-                        )
-                    })?;
-                    win_config_path.to_string_lossy().to_string()
-                }
-                Err(_) => config_str,
-            },
-            Err(_) => config_str,
-        };
+        let raw = std::fs::read_to_string(&config_path).map_err(|e| {
+            format!(
+                "Failed to read base client config {}: {}",
+                config_path.display(),
+                e
+            )
+        })?;
+        let runtime_cfg = build_windows_runtime_client_config(&raw, log_path)?;
+        std::fs::write(&win_config_path, runtime_cfg).map_err(|e| {
+            format!(
+                "Failed to write Windows runtime client config {}: {}",
+                win_config_path.display(),
+                e
+            )
+        })?;
+        let config_str = win_config_path.to_string_lossy().to_string();
         launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
     }
 
