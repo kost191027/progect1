@@ -16,7 +16,7 @@ defaults:
 
 jobs:
   build-windows-test:
-    name: Build Windows Test Installer
+    name: Build Windows Test Bundle
     runs-on: windows-latest
     env:
       VITE_APP_BUILD: ${{ github.run_number }}
@@ -60,36 +60,36 @@ jobs:
           echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
           echo "VITE_APP_VERSION=${version}" >> "$GITHUB_ENV"
 
-      - name: Build Tauri Windows test release
-        run: npm run tauri build -- --target x86_64-pc-windows-msvc
+      - name: Build Tauri Windows test bundle
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles app
 
-      - name: Normalize Windows test artifact names
+      - name: Locate Windows test bundle
         id: package
         shell: bash
         run: |
           version="${{ steps.meta.outputs.version }}"
           short_sha="${{ steps.meta.outputs.short_sha }}"
-          release_dir="dist/test-release/windows-x64"
-          nsis_dir="src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          app_dir="src-tauri/target/x86_64-pc-windows-msvc/release/bundle/app"
 
-          mkdir -p "${release_dir}"
-
-          setup_src="$(find "${nsis_dir}" -maxdepth 1 -name '*.exe' | head -n 1)"
-
-          if [[ -z "${setup_src}" ]]; then
-            echo "Expected Windows NSIS .exe artifact was not produced."
+          if [[ ! -d "${app_dir}" ]]; then
+            echo "Expected Windows app bundle directory was not produced."
             exit 1
           fi
 
-          setup_name="RKN-${version}-windows-test-${short_sha}.exe"
-          cp "${setup_src}" "${release_dir}/${setup_name}"
+          bundle_root="$(find "${app_dir}" -mindepth 1 -maxdepth 1 | head -n 1)"
 
-          echo "setup_path=${release_dir}/${setup_name}" >> "$GITHUB_OUTPUT"
+          if [[ -z "${bundle_root}" ]]; then
+            echo "Expected Windows app bundle contents were not produced."
+            exit 1
+          fi
 
-      - name: Upload Windows test installer
+          echo "bundle_path=${bundle_root}" >> "$GITHUB_OUTPUT"
+          echo "bundle_name=RKN-${version}-windows-test-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Windows test bundle
         uses: actions/upload-artifact@v4
         with:
-          name: RKN-${{ steps.meta.outputs.version }}-windows-test-${{ steps.meta.outputs.short_sha }}
-          path: ${{ steps.package.outputs.setup_path }}
+          name: ${{ steps.package.outputs.bundle_name }}
+          path: ${{ steps.package.outputs.bundle_path }}
           retention-days: 14
           compression-level: 0

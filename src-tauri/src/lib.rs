@@ -10,6 +10,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
+#[cfg(not(target_os = "windows"))]
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{sleep, Duration};
@@ -194,10 +195,25 @@ fn maybe_announce_windows_tray_behavior(app: &AppHandle) {
     );
 }
 
+/// Create a `Command` that will not flash a console window on Windows.
+///
+/// GUI applications on Windows inherit no console, so spawning a console
+/// subsystem process (powershell, tasklist, ipconfig …) via the default
+/// `Command` allocates a brand-new visible console window every time.
+/// Passing `CREATE_NO_WINDOW` (0x08000000) suppresses this.
+#[cfg(target_os = "windows")]
+fn windowless_command(program: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let mut cmd = std::process::Command::new(program);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 fn process_exists(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
-        let output = std::process::Command::new("tasklist")
+        let output = windowless_command("tasklist")
             .args(["/FI", &format!("PID eq {}", pid), "/NH"])
             .output();
         output
@@ -220,6 +236,7 @@ fn process_exists(pid: u32) -> bool {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn escape_applescript(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
 
@@ -235,47 +252,28 @@ fn escape_applescript(value: &str) -> String {
     escaped
 }
 
+#[cfg(not(target_os = "windows"))]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
+#[cfg(not(target_os = "windows"))]
 fn run_admin_command(script: &str) -> Result<std::process::Output, String> {
-    #[cfg(target_os = "windows")]
-    {
-        // On Windows, run_admin_command is only used for terminate_root_process.
-        // taskkill doesn't need elevation if the process was started by the same user session.
-        // For the rare case where it does, we use PowerShell -Verb RunAs synchronously.
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','{}'",
-                    script.replace('\'', "''")
-                ),
-            ])
-            .output()
-            .map_err(|e| format!("Failed to execute elevated PowerShell: {}", e))
-    }
+    let osascript_arg = format!(
+        "do shell script \"{}\" with administrator privileges",
+        escape_applescript(script)
+    );
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        let osascript_arg = format!(
-            "do shell script \"{}\" with administrator privileges",
-            escape_applescript(script)
-        );
-
-        std::process::Command::new("osascript")
-            .args(["-e", &osascript_arg])
-            .output()
-            .map_err(|e| format!("Failed to execute osascript: {}", e))
-    }
+    std::process::Command::new("osascript")
+        .args(["-e", &osascript_arg])
+        .output()
+        .map_err(|e| format!("Failed to execute osascript: {}", e))
 }
 
 fn terminate_root_process(pid: u32) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        let output = std::process::Command::new("taskkill")
+        let output = windowless_command("taskkill")
             .args(["/F", "/PID", &pid.to_string()])
             .output()
             .map_err(|e| format!("Failed to execute taskkill: {}", e))?;
@@ -459,7 +457,7 @@ fn write_clipboard_text(text: String) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let mut child = std::process::Command::new("cmd")
+        let mut child = windowless_command("cmd")
             .args(["/C", "clip"])
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -506,7 +504,7 @@ fn read_clipboard_text() -> Result<String, String> {
 
     #[cfg(target_os = "windows")]
     {
-        let output = std::process::Command::new("powershell")
+        let output = windowless_command("powershell")
             .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
             .output()
             .map_err(|e| format!("Failed to launch PowerShell clipboard reader: {}", e))?;
@@ -633,7 +631,7 @@ fn current_network_fingerprint_windows_powershell() -> Option<String> {
       $items | ConvertTo-Json -Compress
     "#;
 
-    let output = std::process::Command::new("powershell")
+    let output = windowless_command("powershell")
         .args(["-NoProfile", "-Command", script])
         .output()
         .ok()?;
@@ -647,7 +645,7 @@ fn current_network_fingerprint_windows_powershell() -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn current_network_fingerprint_windows_ipconfig() -> Option<String> {
-    let output = std::process::Command::new("ipconfig").output().ok()?;
+    let output = windowless_command("ipconfig").output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -906,7 +904,7 @@ fn run_windows_singbox_preflight(singbox_path: &str, config_path: &str) -> Resul
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
 
-    let version_output = std::process::Command::new(singbox_path)
+    let version_output = windowless_command(singbox_path)
         .current_dir(singbox_dir)
         .arg("version")
         .output()
@@ -919,7 +917,7 @@ fn run_windows_singbox_preflight(singbox_path: &str, config_path: &str) -> Resul
         ));
     }
 
-    let check_output = std::process::Command::new(singbox_path)
+    let check_output = windowless_command(singbox_path)
         .current_dir(singbox_dir)
         .args(["check", "-c", config_path])
         .output()
@@ -1090,7 +1088,7 @@ try {{
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
-    let launch_output = std::process::Command::new("powershell")
+    let launch_output = windowless_command("powershell")
         .args([
             "-NoProfile",
             "-Command",
