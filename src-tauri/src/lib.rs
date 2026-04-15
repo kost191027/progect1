@@ -280,7 +280,7 @@ fn terminate_root_process(app: Option<&AppHandle>, pid: u32) -> Result<(), Strin
                 // Best effort fallback
                 let mut fallback =
                     std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default());
-                fallback.push("com.konstantinsmygin.progect-1");
+                fallback.push("com.freedom.rkn");
                 fallback
             });
 
@@ -1666,19 +1666,11 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                         }
                         reset_guard_state(&state);
                         emit_guard_state(&app, "active");
-                        if let Ok(new_pid) = restart_tunnel_process(&app, pid).await {
-                            let state = app.state::<AppState>();
-                            if verify_tunnel_start(&app, &state, new_pid, tunnel_log_path())
-                                .await
-                                .is_ok()
-                            {
-                                spawn_log_reader(app.clone(), new_pid, tunnel_log_path());
-                                spawn_process_exit_monitor(app.clone(), new_pid);
-                                spawn_network_recovery_monitor(app.clone(), new_pid);
-                            }
-                        }
+                        let _ = app.emit(
+                            "tunnel-log",
+                            "[SYSTEM] Windows network adapter reconnected. Keeping the tunnel active and refreshing the recovery state.".to_string(),
+                        );
                         finish_recovery(&state);
-                        return; // Exit old monitor thread
                     }
                     continue;
                 }
@@ -1714,19 +1706,7 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                         "tunnel-log",
                         "[SYSTEM] Windows network change detected. Keeping the tunnel active and refreshing the recovery state for the new adapter.".to_string(),
                     );
-                    if let Ok(new_pid) = restart_tunnel_process(&app, pid).await {
-                        let state = app.state::<AppState>();
-                        if verify_tunnel_start(&app, &state, new_pid, tunnel_log_path())
-                            .await
-                            .is_ok()
-                        {
-                            spawn_log_reader(app.clone(), new_pid, tunnel_log_path());
-                            spawn_process_exit_monitor(app.clone(), new_pid);
-                            spawn_network_recovery_monitor(app.clone(), new_pid);
-                        }
-                    }
                     finish_recovery(&state);
-                    return; // Exit old monitor thread
                 }
             }
 

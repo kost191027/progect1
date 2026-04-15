@@ -335,7 +335,7 @@ pub fn build_client_config(
     let mut tun_inbound = json!({
       "type": "tun",
       "tag": "tun-in",
-      "inet4_address": "172.19.0.1/30",
+      "address": ["172.19.0.1/30"],
       "auto_route": true,
       "strict_route": true,
       "stack": "system"
