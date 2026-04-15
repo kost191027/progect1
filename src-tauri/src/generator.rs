@@ -13,29 +13,37 @@ pub const INTERNAL_SS_PORT: u16 = 14433;
 ///
 /// Stable domains used for first deploys.
 ///
-/// We avoid staying Apple-only here because some routes can start failing on
-/// Apple endpoints even when the generated client and server configs still
-/// match. `publicassets.cdn-apple.com` is now treated as a legacy domain after
-/// returning mismatched certificates on real clients, so new deploys avoid it.
-const PRIMARY_COVER_DOMAINS: &[&str] = &["feishu.cn", "coding.net", "weather-data.apple.com"];
+/// The set is intentionally conservative: only domains from the upstream
+/// ShadowTLS TLS 1.3 compatibility list that have not recently produced
+/// certificate mismatches in our real client tests stay in the primary pool.
+const PRIMARY_COVER_DOMAINS: &[&str] = &[
+    "feishu.cn",
+    "weather-data.apple.com",
+    "upyun.com",
+    "mp.weixin.qq.com",
+];
 
 /// Additional ShadowTLS-friendly domains used only for SNI rotation.
 ///
-/// `feishu.cn`, `coding.net`, `upyun.com`, `douyin.com`, `toutiao.com` and
-/// `weather-data.apple.com` come from the upstream ShadowTLS TLS 1.3
-/// compatibility list. `captive.apple.com` is kept because it has worked for
-/// us on some paths. `cloud.tencent.com` and `publicassets.cdn-apple.com` are
-/// now treated as legacy domains and excluded from new selections because they
-/// can return certificates for a different hostname and break ShadowTLS
-/// verification.
+/// These candidates come from the upstream ShadowTLS TLS 1.3 compatibility
+/// list. `captive.apple.com` is kept because it has worked for us on some
+/// paths. `cloud.tencent.com`, `publicassets.cdn-apple.com` and `coding.net`
+/// are treated as legacy domains and excluded from new selections because they
+/// have returned certificates for a different hostname in real client tests.
 const ROTATION_COVER_DOMAINS: &[&str] = &[
     "feishu.cn",
-    "coding.net",
     "weather-data.apple.com",
     "upyun.com",
+    "mp.weixin.qq.com",
     "douyin.com",
     "toutiao.com",
-    "mp.weixin.qq.com",
+    "sns-video-hw.xhscdn.com",
+    "sns-img-qc.xhscdn.com",
+    "sns-video-qn.xhscdn.com",
+    "p9-dy.byteimg.com",
+    "p6-dy.byteimg.com",
+    "v6-dy-y.ixigua.com",
+    "hls3-akm.douyucdn.cn",
     "captive.apple.com",
 ];
 
@@ -68,7 +76,10 @@ pub fn select_cover_domain(short_id: &str) -> &'static str {
 }
 
 pub fn is_legacy_cover_domain_requiring_refresh(domain: &str) -> bool {
-    matches!(domain, "cloud.tencent.com" | "publicassets.cdn-apple.com")
+    matches!(
+        domain,
+        "cloud.tencent.com" | "publicassets.cdn-apple.com" | "coding.net"
+    )
 }
 
 pub fn select_next_cover_domain(

@@ -274,7 +274,7 @@ fn terminate_root_process(pid: u32) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         let output = windowless_command("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
+            .args(["/F", "/T", "/PID", &pid.to_string()])
             .output()
             .map_err(|e| format!("Failed to execute taskkill: {}", e))?;
 
@@ -813,6 +813,18 @@ fn register_proxy_failure(app: &AppHandle, state: &AppState) {
             .to_string(),
     );
     emit_guard_state(app, "engaged");
+
+    #[cfg(target_os = "windows")]
+    {
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = app_handle.emit(
+                "tunnel-log",
+                "[SYSTEM] Proxy transport is failing repeatedly on Windows. Stopping the tunnel to release system routing and restore the normal network path.".to_string(),
+            );
+            let _ = stop_tunnel_inner(app_handle.clone()).await;
+        });
+    }
 }
 
 fn classify_proxy_failure(line: &str) -> bool {
@@ -824,7 +836,9 @@ fn classify_proxy_failure(line: &str) -> bool {
             || lower.contains("i/o timeout")
             || lower.contains("network is unreachable")
             || lower.contains("no route to host")
-            || lower.contains("connection reset"))
+            || lower.contains("connection reset")
+            || lower.contains("failed to verify certificate")
+            || lower.contains("x509:"))
 }
 
 fn classify_outdated_subordinate_config(line: &str) -> bool {
