@@ -167,7 +167,7 @@ fn show_main_window(app: &AppHandle, screen: Option<&str>) {
 fn quit_application(app: &AppHandle) {
     let state = app.state::<AppState>();
     if let Some(pid) = state.singbox_pid.lock().unwrap().take() {
-        let _ = terminate_root_process(pid);
+        let _ = terminate_root_process(None, pid);
         let _ = std::fs::remove_file(tunnel_log_path());
     }
 
@@ -270,24 +270,22 @@ fn run_admin_command(script: &str) -> Result<std::process::Output, String> {
         .map_err(|e| format!("Failed to execute osascript: {}", e))
 }
 
-fn terminate_root_process(pid: u32) -> Result<(), String> {
+#[allow(unused_variables)]
+fn terminate_root_process(app: Option<&AppHandle>, pid: u32) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        // 1. Send stop signal to the elevated PowerShell supervisor
-        if let Ok(local_data) = std::env::temp_dir().join("com.freedom.rkn").canonicalize() {
-            // Wait, tauri app local data dir is better. But temp dir is what we have without AppHandle.
-            // Actually, we don't have AppHandle here. So we do a fallback taskkill.
-            // But since the PowerShell script now monitors the parent process, if the parent process (RKN)
-            // exits, it kills sing-box anyway.
-        }
+        let local_app_dir = app
+            .and_then(|a| a.path().app_local_data_dir().ok())
+            .unwrap_or_else(|| {
+                // Best effort fallback
+                let mut fallback =
+                    std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default());
+                fallback.push("com.konstantinsmygin.progect-1");
+                fallback
+            });
 
-        // 2. We can try to write the stop signal if we reconstruct the AppData path
-        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            let path = std::path::PathBuf::from(local_app_data)
-                .join("com.freedom.rkn")
-                .join("elevated_singbox.stop");
-            let _ = std::fs::write(&path, "stop");
-        }
+        let signal_path = local_app_dir.join("elevated_singbox.stop");
+        let _ = std::fs::write(&signal_path, "stop");
 
         // Wait a bit for the supervisor to act
         std::thread::sleep(std::time::Duration::from_millis(600));
@@ -633,6 +631,7 @@ fn current_network_fingerprint_windows_powershell() -> Option<String> {
             $_.NetAdapter -and
             $_.NetAdapter.Status -eq 'Up' -and
             $_.IPv4Address -and
+            $_.NetAdapter.InterfaceDescription -notmatch 'Loopback|Wintun|TAP|VPN|Virtual|vEthernet|Bluetooth|Npcap' -and
             $_.InterfaceAlias -notmatch 'Loopback|isatap|Teredo|Wintun|TAP|VPN|vEthernet|Bluetooth|Npcap|tun'
           } |
           Select-Object `
@@ -1357,7 +1356,7 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
 
     #[cfg(target_os = "windows")]
     {
-        let _ = terminate_root_process(old_pid);
+        let _ = terminate_root_process(Some(app), old_pid);
         sleep(Duration::from_secs(1)).await;
         let win_config_path = local_data.join("client_config_win.json");
         let raw = std::fs::read_to_string(&config_path).map_err(|e| {
@@ -1651,11 +1650,19 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                         }
                         reset_guard_state(&state);
                         emit_guard_state(&app, "active");
-                        let _ = app.emit(
-                            "tunnel-log",
-                            "[SYSTEM] Windows network adapter reconnected. Keeping the tunnel active and refreshing the routing context for the restored adapter.".to_string(),
-                        );
+                        if let Ok(new_pid) = restart_tunnel_process(&app, pid).await {
+                            let state = app.state::<AppState>();
+                            if verify_tunnel_start(&app, &state, new_pid, tunnel_log_path())
+                                .await
+                                .is_ok()
+                            {
+                                spawn_log_reader(app.clone(), new_pid, tunnel_log_path());
+                                spawn_process_exit_monitor(app.clone(), new_pid);
+                                spawn_network_recovery_monitor(app.clone(), new_pid);
+                            }
+                        }
                         finish_recovery(&state);
+                        return; // Exit old monitor thread
                     }
                     continue;
                 }
@@ -1691,7 +1698,19 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                         "tunnel-log",
                         "[SYSTEM] Windows network change detected. Keeping the tunnel active and refreshing the recovery state for the new adapter.".to_string(),
                     );
+                    if let Ok(new_pid) = restart_tunnel_process(&app, pid).await {
+                        let state = app.state::<AppState>();
+                        if verify_tunnel_start(&app, &state, new_pid, tunnel_log_path())
+                            .await
+                            .is_ok()
+                        {
+                            spawn_log_reader(app.clone(), new_pid, tunnel_log_path());
+                            spawn_process_exit_monitor(app.clone(), new_pid);
+                            spawn_network_recovery_monitor(app.clone(), new_pid);
+                        }
+                    }
                     finish_recovery(&state);
+                    return; // Exit old monitor thread
                 }
             }
 
@@ -1804,7 +1823,7 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
                 format!("[SYSTEM] Stopping core process (PID {})...", pid),
             );
 
-            if terminate_root_process(pid).is_ok() {
+            if terminate_root_process(Some(&app), pid).is_ok() {
                 let _ = app.emit(
                     "tunnel-log",
                     "[SYSTEM] Core process terminated. Routing disabled.".to_string(),
