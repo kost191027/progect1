@@ -335,7 +335,7 @@ pub fn build_client_config(
     let mut tun_inbound = json!({
       "type": "tun",
       "tag": "tun-in",
-      "address": ["172.19.0.1/30"],
+      "inet4_address": "172.19.0.1/30",
       "auto_route": true,
       "strict_route": true,
       "stack": "system"
@@ -343,11 +343,6 @@ pub fn build_client_config(
 
     if !cfg!(target_os = "macos") {
         tun_inbound["interface_name"] = json!("tun0");
-        // Exclude the VPN server IP from TUN routing at the OS level so that
-        // sing-box can still reach the remote server directly after auto_route
-        // installs the default routes. Use the modern merged field name
-        // accepted by sing-box 1.12+.
-        tun_inbound["route_exclude_address"] = json!([format!("{}/32", server_ip)]);
     }
 
     let mut config = json!({

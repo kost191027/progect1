@@ -631,6 +631,7 @@ fn current_network_fingerprint_windows_powershell() -> Option<String> {
             $_.NetAdapter -and
             $_.NetAdapter.Status -eq 'Up' -and
             $_.IPv4Address -and
+            $_.IPv4DefaultGateway -and
             $_.NetAdapter.InterfaceDescription -notmatch 'Loopback|Wintun|TAP|VPN|Virtual|vEthernet|Bluetooth|Npcap' -and
             $_.InterfaceAlias -notmatch 'Loopback|isatap|Teredo|Wintun|TAP|VPN|vEthernet|Bluetooth|Npcap|tun'
           } |
@@ -669,6 +670,7 @@ fn current_network_fingerprint_windows_ipconfig() -> Option<String> {
     let mut blocks = Vec::new();
     let mut current_adapter: Option<String> = None;
     let mut current_ipv4: Option<String> = None;
+    let mut current_gateway: Option<String> = None;
 
     for line in stdout.lines() {
         let trimmed = line.trim();
@@ -680,14 +682,16 @@ fn current_network_fingerprint_windows_ipconfig() -> Option<String> {
         if !line.starts_with(' ') && line.contains(':') {
             if let Some(adapter) = current_adapter.take() {
                 if let Some(ip) = current_ipv4.take() {
-                    let lower = adapter.to_lowercase();
-                    if !lower.contains("loopback")
-                        && !lower.contains("isatap")
-                        && !lower.contains("teredo")
-                        && !lower.contains("wintun")
-                        && !lower.contains("vethernet")
-                    {
-                        blocks.push(format!("{}|{}", adapter, ip));
+                    if let Some(gw) = current_gateway.take() {
+                        let lower = adapter.to_lowercase();
+                        if !lower.contains("loopback")
+                            && !lower.contains("isatap")
+                            && !lower.contains("teredo")
+                            && !lower.contains("wintun")
+                            && !lower.contains("vethernet")
+                        {
+                            blocks.push(format!("{}|{}|{}", adapter, ip, gw));
+                        }
                     }
                 }
             }
@@ -698,6 +702,7 @@ fn current_network_fingerprint_windows_ipconfig() -> Option<String> {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
             current_ipv4 = None;
+            current_gateway = None;
             continue;
         }
 
@@ -709,18 +714,29 @@ fn current_network_fingerprint_windows_ipconfig() -> Option<String> {
                 }
             }
         }
+
+        if trimmed.contains("Default Gateway") && trimmed.contains(':') {
+            if let Some(gw) = trimmed.split(':').last() {
+                let gw = gw.trim();
+                if !gw.is_empty() {
+                    current_gateway = Some(gw.to_string());
+                }
+            }
+        }
     }
 
     if let Some(adapter) = current_adapter.take() {
         if let Some(ip) = current_ipv4.take() {
-            let lower = adapter.to_lowercase();
-            if !lower.contains("loopback")
-                && !lower.contains("isatap")
-                && !lower.contains("teredo")
-                && !lower.contains("wintun")
-                && !lower.contains("vethernet")
-            {
-                blocks.push(format!("{}|{}", adapter, ip));
+            if let Some(gw) = current_gateway.take() {
+                let lower = adapter.to_lowercase();
+                if !lower.contains("loopback")
+                    && !lower.contains("isatap")
+                    && !lower.contains("teredo")
+                    && !lower.contains("wintun")
+                    && !lower.contains("vethernet")
+                {
+                    blocks.push(format!("{}|{}|{}", adapter, ip, gw));
+                }
             }
         }
     }
