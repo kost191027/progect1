@@ -398,7 +398,7 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
     })?;
 
     cfg["log"]["output"] = serde_json::json!(log_path);
-    cfg["log"]["level"] = serde_json::json!("debug");
+    cfg["log"]["level"] = serde_json::json!("info");
     cfg["log"]["timestamp"] = serde_json::json!(true);
 
     // Extract server IP before mutably borrowing inbounds
@@ -422,11 +422,15 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             if let Some(object) = inbound.as_object_mut() {
                 // Windows compatibility profile:
                 // - do not force a fixed adapter name on older systems
-                // - relax strict_route to avoid route conflicts during TUN startup
-                // - prefer gVisor stack for broader Windows compatibility
+                // - strict_route MUST be true so that ALL traffic (including
+                //   DNS queries from browsers) is captured through the TUN.
+                //   Without it, DNS bypasses the tunnel and nothing loads.
+                // - "mixed" stack: uses the OS TCP/IP stack for TCP (most
+                //   reliable) and gvisor for UDP. This is the recommended
+                //   stack for Windows in sing-box documentation.
                 object.remove("interface_name");
-                object.insert("strict_route".to_string(), serde_json::json!(false));
-                object.insert("stack".to_string(), serde_json::json!("gvisor"));
+                object.insert("strict_route".to_string(), serde_json::json!(true));
+                object.insert("stack".to_string(), serde_json::json!("mixed"));
             }
         }
     }
