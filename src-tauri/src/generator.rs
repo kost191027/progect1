@@ -373,7 +373,6 @@ pub fn build_client_config(
           {
             "type": "local",
             "tag": "local-dns",
-            "detour": "direct",
             "prefer_go": true
           }
         ],

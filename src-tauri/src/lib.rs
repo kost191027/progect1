@@ -273,6 +273,26 @@ fn run_admin_command(script: &str) -> Result<std::process::Output, String> {
 fn terminate_root_process(pid: u32) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        // 1. Send stop signal to the elevated PowerShell supervisor
+        if let Ok(local_data) = std::env::temp_dir().join("com.freedom.rkn").canonicalize() {
+            // Wait, tauri app local data dir is better. But temp dir is what we have without AppHandle.
+            // Actually, we don't have AppHandle here. So we do a fallback taskkill.
+            // But since the PowerShell script now monitors the parent process, if the parent process (RKN)
+            // exits, it kills sing-box anyway.
+        }
+
+        // 2. We can try to write the stop signal if we reconstruct the AppData path
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let path = std::path::PathBuf::from(local_app_data)
+                .join("com.freedom.rkn")
+                .join("elevated_singbox.stop");
+            let _ = std::fs::write(&path, "stop");
+        }
+
+        // Wait a bit for the supervisor to act
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        // 3. Fallback: try taskkill (might fail due to permissions, but the stop signal or parent process exit should work)
         let output = windowless_command("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .output()
@@ -281,7 +301,12 @@ fn terminate_root_process(pid: u32) -> Result<(), String> {
         if output.status.success() {
             Ok(())
         } else {
-            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+            // Ignore taskkill errors if the process is already gone
+            if !process_exists(pid) {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+            }
         }
     }
 
@@ -404,16 +429,6 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 object.remove("interface_name");
                 object.insert("strict_route".to_string(), serde_json::json!(false));
                 object.insert("stack".to_string(), serde_json::json!("gvisor"));
-
-                // CRITICAL: exclude the VPN server IP from TUN routing at the OS
-                // level. Without this, auto_route captures sing-box's own traffic
-                // to the server → infinite routing loop (1 GB+ RAM, 50%+ CPU).
-                if let Some(ref ip) = server_ip {
-                    object.insert(
-                        "route_exclude_address".to_string(),
-                        serde_json::json!([format!("{}/32", ip)]),
-                    );
-                }
             }
         }
     }
@@ -1022,6 +1037,10 @@ async fn launch_tunnel_process_windows(
     let pid_file_str = pid_file.to_string_lossy().to_string();
     let bootstrap_err_str = bootstrap_err.to_string_lossy().to_string();
 
+    let stop_signal_file = local_data.join("elevated_singbox.stop");
+    let stop_signal_file_str = stop_signal_file.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&stop_signal_file);
+
     let bootstrap_script_body = format!(
         r#"$ErrorActionPreference = 'Stop'
 try {{
@@ -1039,6 +1058,7 @@ try {{
   [void]$p.Start()
   [System.IO.File]::WriteAllText('{pidfile}', $p.Id.ToString(), [System.Text.Encoding]::ASCII)
 
+  # Check if it crashed within the first 8 seconds
   if ($p.WaitForExit(8000)) {{
     $logTail = ''
     $stdoutTail = ''
@@ -1069,7 +1089,23 @@ try {{
     exit 1
   }}
 
-  exit 0
+  # Supervisor loop: kill sing-box if we receive a stop signal or if parent GUI process dies
+  $parentPid = {parent_pid}
+  while ($true) {{
+    if (-not (Get-Process -Id $parentPid -ErrorAction SilentlyContinue)) {{
+      try {{ $p.Kill() }} catch {{}}
+      exit 0
+    }}
+    if (Test-Path '{stop_signal_file}') {{
+      try {{ $p.Kill() }} catch {{}}
+      Remove-Item '{stop_signal_file}' -Force -ErrorAction SilentlyContinue
+      exit 0
+    }}
+    if ($p.HasExited) {{
+      exit 0
+    }}
+    Start-Sleep -Milliseconds 500
+  }}
 }} catch {{
   $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText('{bootstrap_err}', ($_ | Out-String), $utf8NoBom)
@@ -1081,6 +1117,8 @@ try {{
         log_path = log_path.replace('\'', "''"),
         pidfile = pid_file_str.replace('\'', "''"),
         bootstrap_err = bootstrap_err_str.replace('\'', "''"),
+        parent_pid = std::process::id(),
+        stop_signal_file = stop_signal_file_str.replace('\'', "''"),
     );
 
     // Write with UTF-8 BOM so PowerShell reads Cyrillic paths correctly
