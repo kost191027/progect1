@@ -445,26 +445,19 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
     }
 
     // DNS fix for Windows:
-    // Both UDP and plain TCP DNS to 8.8.8.8:53 through the proxy fail with
-    // "read response: EOF" on the gvisor stack.  HTTPS connections through
-    // the same proxy work perfectly (confirmed by TLS traffic to Google,
-    // Telegram etc. in real-world logs).  Replace the UDP remote-dns server
-    // with DNS-over-HTTPS (DoH) which rides a normal HTTPS connection
-    // through the proxy — no raw UDP/TCP DNS quirks.
+    // Remote DNS resolution (UDP, TCP, and DoH to 8.8.8.8 / dns.google)
+    // through the proxy all fail on the gvisor stack — responses arrive but
+    // are rejected or truncated with EOF.  However, fakeip works perfectly:
+    // domains get a fake 198.18.x.x IP, and the actual connection goes
+    // through the proxy which resolves the real IP server-side.
+    //
+    // Fix: make fakeip-dns the final (default) DNS resolver on Windows.
+    // All domains that don't match a specific rule (local-dns for Russian
+    // sites, etc.) get a fakeip address instead of attempting real DNS
+    // resolution through the broken proxy DNS path.  The proxy handles
+    // domain→IP resolution transparently on the server side.
     if let Some(dns) = cfg.get_mut("dns").and_then(|v| v.as_object_mut()) {
-        if let Some(servers) = dns.get_mut("servers").and_then(|v| v.as_array_mut()) {
-            for server in servers.iter_mut() {
-                let tag = server.get("tag").and_then(|v| v.as_str()).unwrap_or("");
-                if tag == "remote-dns" {
-                    if let Some(obj) = server.as_object_mut() {
-                        obj.insert("type".to_string(), serde_json::json!("https"));
-                        obj.insert("server".to_string(), serde_json::json!("dns.google"));
-                        obj.insert("server_port".to_string(), serde_json::json!(443));
-                        obj.remove("address_resolver");
-                    }
-                }
-            }
-        }
+        dns.insert("final".to_string(), serde_json::json!("fakeip-dns"));
     }
 
     serde_json::to_string_pretty(&cfg)
