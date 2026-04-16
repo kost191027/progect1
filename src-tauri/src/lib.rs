@@ -421,19 +421,26 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
 
             if let Some(object) = inbound.as_object_mut() {
                 // Windows compatibility profile:
+                // - use a dedicated Windows TUN subnet. On this old Windows
+                //   install the default 172.19.0.1/30 profile repeatedly
+                //   fails during post-start bind with
+                //   `The requested address is not valid in its context`.
+                //   Moving the local runtime to a different private /30 keeps
+                //   macOS/server behavior untouched and gives Windows its own
+                //   more stable local adapter address.
                 // - do not force a fixed adapter name on older systems
                 // - strict_route: false — sing-box uses Windows Filtering
                 //   Platform (WFP) for strict routing, but WFP calls can
                 //   fail on older Windows.  auto_route alone captures
                 //   traffic via 0.0.0.0/1 + 128.0.0.0/1 routes.
-                // - mixed stack — uses the native OS TCP stack (reliable,
-                //   same as macOS "system" stack) plus gvisor for UDP.
-                //   The pure "gvisor" stack reimplements TCP in userspace
-                //   and breaks data transfer through the proxy (connections
-                //   establish but no data flows).
+                // - use the native system stack on Windows. `mixed` still
+                //   keeps part of the virtual stack in play, and on this old
+                //   Windows install it continues to die during TUN bring-up.
+                //   The pure `gvisor` stack was even less stable here.
+                object.insert("address".to_string(), serde_json::json!(["172.18.0.1/30"]));
                 object.remove("interface_name");
                 object.insert("strict_route".to_string(), serde_json::json!(false));
-                object.insert("stack".to_string(), serde_json::json!("mixed"));
+                object.insert("stack".to_string(), serde_json::json!("system"));
             }
         }
     }
