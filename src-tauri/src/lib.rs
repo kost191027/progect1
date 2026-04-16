@@ -420,19 +420,20 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             }
 
             if let Some(object) = inbound.as_object_mut() {
-                // Windows 8 compatibility profile:
+                // Windows compatibility profile:
                 // - do not force a fixed adapter name on older systems
                 // - strict_route: false — sing-box uses Windows Filtering
-                //   Platform (WFP) for strict routing, but the required WFP
-                //   calls crash on Windows 8.  auto_route alone captures
+                //   Platform (WFP) for strict routing, but WFP calls can
+                //   fail on older Windows.  auto_route alone captures
                 //   traffic via 0.0.0.0/1 + 128.0.0.0/1 routes.
-                // - gvisor stack — the ONLY stack that works on Windows 8.
-                //   Both "system" and "mixed" stacks use native OS TCP APIs
-                //   that are unavailable on Windows 8, causing sing-box to
-                //   crash immediately after TUN initialization.
+                // - mixed stack — uses the native OS TCP stack (reliable,
+                //   same as macOS "system" stack) plus gvisor for UDP.
+                //   The pure "gvisor" stack reimplements TCP in userspace
+                //   and breaks data transfer through the proxy (connections
+                //   establish but no data flows).
                 object.remove("interface_name");
                 object.insert("strict_route".to_string(), serde_json::json!(false));
-                object.insert("stack".to_string(), serde_json::json!("gvisor"));
+                object.insert("stack".to_string(), serde_json::json!("mixed"));
             }
         }
     }
@@ -466,6 +467,13 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         }
         // Non-A/AAAA queries (PTR, SRV, etc.) fall through to local DNS
         dns.insert("final".to_string(), serde_json::json!("local-dns"));
+        // Also switch the internal domain resolver away from remote-dns
+        // (which is broken on Windows) so that any internal hostname
+        // lookups (rule-set URLs etc.) use the local system resolver.
+        dns.insert(
+            "default_domain_resolver".to_string(),
+            serde_json::json!("local-dns"),
+        );
     }
 
     serde_json::to_string_pretty(&cfg)
