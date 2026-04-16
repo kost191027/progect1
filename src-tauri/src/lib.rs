@@ -451,13 +451,21 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
     // domains get a fake 198.18.x.x IP, and the actual connection goes
     // through the proxy which resolves the real IP server-side.
     //
-    // Fix: make fakeip-dns the final (default) DNS resolver on Windows.
-    // All domains that don't match a specific rule (local-dns for Russian
-    // sites, etc.) get a fakeip address instead of attempting real DNS
-    // resolution through the broken proxy DNS path.  The proxy handles
-    // domain→IP resolution transparently on the server side.
+    // sing-box does not allow fakeip as the `final` DNS server, so instead
+    // we append a catch-all DNS rule that sends ALL A/AAAA queries to
+    // fakeip-dns.  The `final` server is switched to local-dns for the
+    // remaining query types (PTR, MX, etc.) which are harmless local
+    // lookups that don't need the proxy.
     if let Some(dns) = cfg.get_mut("dns").and_then(|v| v.as_object_mut()) {
-        dns.insert("final".to_string(), serde_json::json!("fakeip-dns"));
+        if let Some(rules) = dns.get_mut("rules").and_then(|v| v.as_array_mut()) {
+            // Catch-all: every A/AAAA query not matched above → fakeip
+            rules.push(serde_json::json!({
+                "query_type": ["A", "AAAA"],
+                "server": "fakeip-dns"
+            }));
+        }
+        // Non-A/AAAA queries (PTR, SRV, etc.) fall through to local DNS
+        dns.insert("final".to_string(), serde_json::json!("local-dns"));
     }
 
     serde_json::to_string_pretty(&cfg)
