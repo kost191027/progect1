@@ -420,20 +420,19 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             }
 
             if let Some(object) = inbound.as_object_mut() {
-                // Windows compatibility profile:
+                // Windows 8 compatibility profile:
                 // - do not force a fixed adapter name on older systems
-                // - strict_route MUST be false on Windows 8: sing-box uses
-                //   Windows Filtering Platform (WFP) for strict routing, but
-                //   the required WFP calls are incompatible with Windows 8 and
-                //   cause an immediate process crash after TUN initialisation.
-                //   auto_route still captures traffic via 0.0.0.0/1 + 128.0.0.0/1
-                //   routes which is sufficient.
-                // - "system" stack: identical to the working macOS config; uses
-                //   the OS native TCP/IP stack which is the most reliable on
-                //   older Windows versions.
+                // - strict_route: false — sing-box uses Windows Filtering
+                //   Platform (WFP) for strict routing, but the required WFP
+                //   calls crash on Windows 8.  auto_route alone captures
+                //   traffic via 0.0.0.0/1 + 128.0.0.0/1 routes.
+                // - gvisor stack — the ONLY stack that works on Windows 8.
+                //   Both "system" and "mixed" stacks use native OS TCP APIs
+                //   that are unavailable on Windows 8, causing sing-box to
+                //   crash immediately after TUN initialization.
                 object.remove("interface_name");
                 object.insert("strict_route".to_string(), serde_json::json!(false));
-                object.insert("stack".to_string(), serde_json::json!("system"));
+                object.insert("stack".to_string(), serde_json::json!("gvisor"));
             }
         }
     }
