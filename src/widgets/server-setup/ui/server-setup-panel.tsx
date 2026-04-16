@@ -1,6 +1,7 @@
 import { Button } from "../../../shared/ui/button";
 import { Input } from "../../../shared/ui/input";
 import { Panel } from "../../../shared/ui/panel";
+import type { WindowsRuntimeMode } from "../../../features/control-center/model/use-control-center";
 
 type ServerSetupPanelProps = {
   host: string;
@@ -16,6 +17,9 @@ type ServerSetupPanelProps = {
   hasLocalWarpProfile: boolean;
   localWarpEndpoint: string | null;
   localWarpAddressV4: string | null;
+  isWindowsRuntime: boolean;
+  windowsRuntimeMode: WindowsRuntimeMode;
+  isSavingWindowsRuntimeMode: boolean;
   warpProfileInput: string;
   warpProfileMessage: string | null;
   resetSuccessMessage: string | null;
@@ -23,6 +27,7 @@ type ServerSetupPanelProps = {
   onUserChange: (value: string) => void;
   onPasswordChange: (value: string) => void;
   onWarpProfileInputChange: (value: string) => void;
+  onWindowsRuntimeModeChange: (mode: WindowsRuntimeMode) => void;
   onDeploy: () => void;
   onResetLocalData: () => void;
   onCreateWarpProfile: () => void;
@@ -44,6 +49,9 @@ export function ServerSetupPanel({
   hasLocalWarpProfile,
   localWarpEndpoint,
   localWarpAddressV4,
+  isWindowsRuntime,
+  windowsRuntimeMode,
+  isSavingWindowsRuntimeMode,
   warpProfileInput,
   warpProfileMessage,
   resetSuccessMessage,
@@ -51,6 +59,7 @@ export function ServerSetupPanel({
   onUserChange,
   onPasswordChange,
   onWarpProfileInputChange,
+  onWindowsRuntimeModeChange,
   onDeploy,
   onResetLocalData,
   onCreateWarpProfile,
@@ -131,6 +140,56 @@ export function ServerSetupPanel({
             {isResettingLocalData ? "Resetting..." : "Reset Local Data"}
           </Button>
         </div>
+
+        {isWindowsRuntime ? (
+          <div className="rounded-2xl border border-zinc-800 bg-[#111212] px-4 py-4">
+            <div className="text-[11px] font-bold uppercase tracking-[0.22em] text-zinc-500">
+              Windows tunnel mode
+            </div>
+            <div className="mt-2 text-sm font-semibold text-zinc-100">
+              {windowsRuntimeMode === "tun" ? "TUN Mode" : "Compatibility Mode"}
+            </div>
+            <p className="mt-2 text-sm leading-6 text-zinc-400">
+              {windowsRuntimeMode === "tun"
+                ? "Full-device routing through sing-box TUN. This is the primary Windows mode and matches macOS behavior as closely as Windows allows."
+                : "Compatibility Mode keeps sing-box but starts it without TUN, using Windows system proxy routing instead. It is meant for PCs where Wintun or TUN startup stays unstable."}
+            </p>
+
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <Button
+                variant={windowsRuntimeMode === "tun" ? "success" : "secondary"}
+                fullWidth
+                disabled={
+                  isSavingWindowsRuntimeMode ||
+                  isDeploying ||
+                  isRunning ||
+                  isResettingLocalData
+                }
+                onClick={() => onWindowsRuntimeModeChange("tun")}
+              >
+                {isSavingWindowsRuntimeMode && windowsRuntimeMode !== "tun"
+                  ? "Switching..."
+                  : "Use TUN Mode"}
+              </Button>
+
+              <Button
+                variant={windowsRuntimeMode === "compatibility" ? "accent" : "secondary"}
+                fullWidth
+                disabled={
+                  isSavingWindowsRuntimeMode ||
+                  isDeploying ||
+                  isRunning ||
+                  isResettingLocalData
+                }
+                onClick={() => onWindowsRuntimeModeChange("compatibility")}
+              >
+                {isSavingWindowsRuntimeMode && windowsRuntimeMode !== "compatibility"
+                  ? "Switching..."
+                  : "Use Compatibility Mode"}
+              </Button>
+            </div>
+          </div>
+        ) : null}
 
         <div className="rounded-2xl border border-zinc-800 bg-[#111212] px-4 py-4">
           <div className="text-[11px] font-bold uppercase tracking-[0.22em] text-zinc-500">

@@ -127,6 +127,9 @@ export function HomePage({ controlCenter }: HomePageProps) {
                 : controlCenter.localWarpProfileStatus.endpoint
             }
             localWarpAddressV4={controlCenter.localWarpProfileStatus.address_v4}
+            isWindowsRuntime={controlCenter.isWindowsRuntime}
+            windowsRuntimeMode={controlCenter.windowsRuntimeMode}
+            isSavingWindowsRuntimeMode={controlCenter.isSavingWindowsRuntimeMode}
             warpProfileInput={controlCenter.warpProfileInput}
             warpProfileMessage={controlCenter.warpProfileMessage}
             resetSuccessMessage={controlCenter.localDataResetMessage}
@@ -134,6 +137,7 @@ export function HomePage({ controlCenter }: HomePageProps) {
             onUserChange={controlCenter.setUser}
             onPasswordChange={controlCenter.setPassword}
             onWarpProfileInputChange={controlCenter.setWarpProfileInput}
+            onWindowsRuntimeModeChange={controlCenter.setWindowsRuntimeMode}
             onDeploy={controlCenter.deployServer}
             onResetLocalData={controlCenter.resetLocalData}
             onCreateWarpProfile={controlCenter.createWarpProfile}

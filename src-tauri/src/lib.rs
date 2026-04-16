@@ -1,5 +1,7 @@
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::io::Write;
+#[cfg(target_os = "windows")]
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::{fs, path::PathBuf};
 use tauri::image::Image;
@@ -34,9 +36,87 @@ struct AppState {
     windows_tray_notice_shown: Mutex<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WindowsRuntimeMode {
+    Tun,
+    Compatibility,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct WindowsRuntimeModeStatus {
+    mode: WindowsRuntimeMode,
+    is_windows: bool,
+    supports_compatibility_mode: bool,
+}
+
 fn tunnel_pid_path(app: &AppHandle) -> Result<PathBuf, String> {
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     Ok(local_data.join("active_tunnel_pid"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_runtime_mode_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    Ok(local_data.join("windows_runtime_mode.json"))
+}
+
+fn load_windows_runtime_mode(app: &AppHandle) -> Result<WindowsRuntimeMode, String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Ok(WindowsRuntimeMode::Tun)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mode_path = windows_runtime_mode_path(app)?;
+        if !mode_path.exists() {
+            return Ok(WindowsRuntimeMode::Tun);
+        }
+
+        let raw = fs::read_to_string(&mode_path).map_err(|e| {
+            format!(
+                "Failed to read Windows runtime mode {}: {}",
+                mode_path.display(),
+                e
+            )
+        })?;
+
+        serde_json::from_str::<WindowsRuntimeMode>(&raw).map_err(|e| {
+            format!(
+                "Failed to parse Windows runtime mode {}: {}",
+                mode_path.display(),
+                e
+            )
+        })
+    }
+}
+
+fn save_windows_runtime_mode(app: &AppHandle, mode: WindowsRuntimeMode) -> Result<(), String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, mode);
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mode_path = windows_runtime_mode_path(app)?;
+
+        if let Some(parent) = mode_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+
+        let payload = serde_json::to_string_pretty(&mode).map_err(|e| e.to_string())?;
+        fs::write(&mode_path, payload).map_err(|e| {
+            format!(
+                "Failed to save Windows runtime mode {}: {}",
+                mode_path.display(),
+                e
+            )
+        })
+    }
 }
 
 fn save_tunnel_pid(app: &AppHandle, pid: u32) -> Result<(), String> {
@@ -389,7 +469,11 @@ fn extract_server_ip_from_config(cfg: &serde_json::Value) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Result<String, String> {
+fn build_windows_runtime_client_config(
+    raw_config: &str,
+    log_path: &str,
+    mode: WindowsRuntimeMode,
+) -> Result<String, String> {
     let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
         format!(
             "Failed to parse generated client config for Windows runtime: {}",
@@ -404,79 +488,106 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
     // Extract server IP before mutably borrowing inbounds
     let server_ip = extract_server_ip_from_config(&cfg);
 
-    if let Some(inbounds) = cfg
-        .get_mut("inbounds")
-        .and_then(|value| value.as_array_mut())
-    {
-        for inbound in inbounds {
-            let is_tun = inbound
-                .get("type")
-                .and_then(|value| value.as_str())
-                .map(|value| value == "tun")
-                .unwrap_or(false);
+    match mode {
+        WindowsRuntimeMode::Tun => {
+            if let Some(inbounds) = cfg
+                .get_mut("inbounds")
+                .and_then(|value| value.as_array_mut())
+            {
+                for inbound in inbounds {
+                    let is_tun = inbound
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value == "tun")
+                        .unwrap_or(false);
 
-            if !is_tun {
-                continue;
+                    if !is_tun {
+                        continue;
+                    }
+
+                    if let Some(object) = inbound.as_object_mut() {
+                        // Windows TUN profile:
+                        // - use a dedicated Windows TUN subnet
+                        // - do not force a fixed adapter name
+                        // - strict_route is relaxed for older Windows installs
+                        // - use the native system stack on Windows
+                        object.insert("address".to_string(), serde_json::json!(["172.18.0.1/30"]));
+                        object.remove("interface_name");
+                        object.insert("strict_route".to_string(), serde_json::json!(false));
+                        object.insert("stack".to_string(), serde_json::json!("system"));
+                    }
+                }
             }
 
-            if let Some(object) = inbound.as_object_mut() {
-                // Windows compatibility profile:
-                // - use a dedicated Windows TUN subnet. On this old Windows
-                //   install the default 172.19.0.1/30 profile repeatedly
-                //   fails during post-start bind with
-                //   `The requested address is not valid in its context`.
-                //   Moving the local runtime to a different private /30 keeps
-                //   macOS/server behavior untouched and gives Windows its own
-                //   more stable local adapter address.
-                // - do not force a fixed adapter name on older systems
-                // - strict_route: false — sing-box uses Windows Filtering
-                //   Platform (WFP) for strict routing, but WFP calls can
-                //   fail on older Windows.  auto_route alone captures
-                //   traffic via 0.0.0.0/1 + 128.0.0.0/1 routes.
-                // - use the native system stack on Windows. `mixed` still
-                //   keeps part of the virtual stack in play, and on this old
-                //   Windows install it continues to die during TUN bring-up.
-                //   The pure `gvisor` stack was even less stable here.
-                object.insert("address".to_string(), serde_json::json!(["172.18.0.1/30"]));
-                object.remove("interface_name");
-                object.insert("strict_route".to_string(), serde_json::json!(false));
-                object.insert("stack".to_string(), serde_json::json!("system"));
+            if let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) {
+                // auto_detect_interface MUST stay true so that the "direct"
+                // outbound binds to the physical adapter instead of the TUN.
+                route.insert("auto_detect_interface".to_string(), serde_json::json!(true));
+            }
+
+            // Windows DNS fix for TUN mode: route A/AAAA queries to fakeip,
+            // keep everything else on local DNS, and avoid unsupported
+            // default_domain_resolver fields in this runtime config.
+            if let Some(dns) = cfg.get_mut("dns").and_then(|v| v.as_object_mut()) {
+                if let Some(rules) = dns.get_mut("rules").and_then(|v| v.as_array_mut()) {
+                    rules.push(serde_json::json!({
+                        "query_type": ["A", "AAAA"],
+                        "server": "fakeip-dns"
+                    }));
+                }
+                dns.insert("final".to_string(), serde_json::json!("local-dns"));
             }
         }
-    }
+        WindowsRuntimeMode::Compatibility => {
+            cfg["inbounds"] = serde_json::json!([
+                {
+                    "type": "mixed",
+                    "tag": "mixed-in",
+                    "listen": "127.0.0.1",
+                    "listen_port": 2080,
+                    "set_system_proxy": true
+                }
+            ]);
 
-    if let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) {
-        // auto_detect_interface MUST stay true so that the "direct" outbound
-        // binds to the physical network adapter instead of the TUN. Without it,
-        // traffic to the VPN server goes through the TUN → routing loop.
-        route.insert("auto_detect_interface".to_string(), serde_json::json!(true));
-    }
+            cfg["dns"] = serde_json::json!({
+                "servers": [
+                    {
+                        "type": "local",
+                        "tag": "local-dns",
+                        "prefer_go": true
+                    }
+                ],
+                "final": "local-dns",
+                "strategy": "ipv4_only"
+            });
 
-    // DNS fix for Windows:
-    // Remote DNS resolution (UDP, TCP, and DoH to 8.8.8.8 / dns.google)
-    // through the proxy all fail on the gvisor stack — responses arrive but
-    // are rejected or truncated with EOF.  However, fakeip works perfectly:
-    // domains get a fake 198.18.x.x IP, and the actual connection goes
-    // through the proxy which resolves the real IP server-side.
-    //
-    // sing-box does not allow fakeip as the `final` DNS server, so instead
-    // we append a catch-all DNS rule that sends ALL A/AAAA queries to
-    // fakeip-dns.  The `final` server is switched to local-dns for the
-    // remaining query types (PTR, MX, etc.) which are harmless local
-    // lookups that don't need the proxy.
-    if let Some(dns) = cfg.get_mut("dns").and_then(|v| v.as_object_mut()) {
-        if let Some(rules) = dns.get_mut("rules").and_then(|v| v.as_array_mut()) {
-            // Catch-all: every A/AAAA query not matched above → fakeip
-            rules.push(serde_json::json!({
-                "query_type": ["A", "AAAA"],
-                "server": "fakeip-dns"
-            }));
+            if let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) {
+                route.remove("auto_detect_interface");
+                route.remove("default_domain_resolver");
+
+                if let Some(rules) = route
+                    .get_mut("rules")
+                    .and_then(|value| value.as_array_mut())
+                {
+                    rules.retain(|rule| {
+                        let action = rule.get("action").and_then(|value| value.as_str());
+                        let protocol = rule.get("protocol").and_then(|value| value.as_str());
+                        let network = rule.get("network").and_then(|value| value.as_str());
+                        let port = rule.get("port").and_then(|value| value.as_u64());
+
+                        if action == Some("hijack-dns") || protocol == Some("dns") {
+                            return false;
+                        }
+
+                        if action == Some("reject") && network == Some("udp") && port == Some(443) {
+                            return false;
+                        }
+
+                        true
+                    });
+                }
+            }
         }
-        // Non-A/AAAA queries (PTR, SRV, etc.) fall through to local DNS.
-        // Do not inject `dns.default_domain_resolver` here: this field is not
-        // accepted by the current sing-box build on Windows and causes the
-        // whole config preflight to fail before startup.
-        dns.insert("final".to_string(), serde_json::json!("local-dns"));
     }
 
     serde_json::to_string_pretty(&cfg)
@@ -1294,6 +1405,58 @@ try {{
     Err(diagnostic.to_string())
 }
 
+#[cfg(target_os = "windows")]
+async fn launch_tunnel_process_windows_compatibility(
+    app: &AppHandle,
+    singbox_path: &str,
+    config_str: &str,
+    log_path: &str,
+) -> Result<u32, String> {
+    let singbox_dir = std::path::Path::new(singbox_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    let cronet_path = singbox_dir.join("libcronet.dll");
+    if !cronet_path.exists() {
+        let resource_cronet = app
+            .path()
+            .resource_dir()
+            .ok()
+            .map(|d| d.join("libcronet.dll"));
+        if let Some(src) = resource_cronet.filter(|p| p.exists()) {
+            let _ = std::fs::copy(&src, &cronet_path);
+        }
+    }
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(log_path)
+        .map_err(|e| format!("Failed to open Windows compatibility log file: {}", e))?;
+    let stderr_file = log_file.try_clone().map_err(|e| {
+        format!(
+            "Failed to duplicate Windows compatibility log handle: {}",
+            e
+        )
+    })?;
+
+    let child = windowless_command(singbox_path)
+        .current_dir(singbox_dir)
+        .args(["run", "-c", config_str])
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "Failed to launch sing-box in Windows compatibility mode: {}",
+                e
+            )
+        })?;
+
+    Ok(child.id())
+}
+
 async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result<u32, String> {
     let singbox_path = resolve_singbox_path()?;
 
@@ -1309,9 +1472,16 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
 
     #[cfg(target_os = "windows")]
     {
+        let runtime_mode = load_windows_runtime_mode(app)?;
         let _ = app.emit(
             "tunnel-log",
-            "[SYSTEM] Running local sing-box preflight...".to_string(),
+            format!(
+                "[SYSTEM] Running local sing-box preflight for Windows {} mode...",
+                match runtime_mode {
+                    WindowsRuntimeMode::Tun => "TUN",
+                    WindowsRuntimeMode::Compatibility => "compatibility",
+                }
+            ),
         );
 
         let win_config_path = local_data.join("client_config_win.json");
@@ -1322,7 +1492,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                 e
             )
         })?;
-        let runtime_cfg = build_windows_runtime_client_config(&raw, log_path)?;
+        let runtime_cfg = build_windows_runtime_client_config(&raw, log_path, runtime_mode)?;
         std::fs::write(&win_config_path, runtime_cfg).map_err(|e| {
             format!(
                 "Failed to write Windows runtime client config {}: {}",
@@ -1334,14 +1504,35 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
 
         run_windows_singbox_preflight(&singbox_path, &config_str)?;
 
-        if announce_prompt {
-            let _ = app.emit(
-                "tunnel-log",
-                "[SYSTEM] Requesting administrator privileges...".to_string(),
-            );
-        }
+        match runtime_mode {
+            WindowsRuntimeMode::Tun => {
+                if announce_prompt {
+                    let _ = app.emit(
+                        "tunnel-log",
+                        "[SYSTEM] Requesting administrator privileges...".to_string(),
+                    );
+                }
 
-        launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
+                launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
+            }
+            WindowsRuntimeMode::Compatibility => {
+                if announce_prompt {
+                    let _ = app.emit(
+                        "tunnel-log",
+                        "[SYSTEM] Starting Windows compatibility mode without TUN elevation..."
+                            .to_string(),
+                    );
+                }
+
+                launch_tunnel_process_windows_compatibility(
+                    app,
+                    &singbox_path,
+                    &config_str,
+                    log_path,
+                )
+                .await
+            }
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1413,6 +1604,7 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
 
     #[cfg(target_os = "windows")]
     {
+        let runtime_mode = load_windows_runtime_mode(app)?;
         let _ = terminate_root_process(Some(app), old_pid);
         sleep(Duration::from_secs(1)).await;
         let win_config_path = local_data.join("client_config_win.json");
@@ -1423,7 +1615,7 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
                 e
             )
         })?;
-        let runtime_cfg = build_windows_runtime_client_config(&raw, log_path)?;
+        let runtime_cfg = build_windows_runtime_client_config(&raw, log_path, runtime_mode)?;
         std::fs::write(&win_config_path, runtime_cfg).map_err(|e| {
             format!(
                 "Failed to write Windows runtime client config {}: {}",
@@ -1432,7 +1624,20 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
             )
         })?;
         let config_str = win_config_path.to_string_lossy().to_string();
-        launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
+        match runtime_mode {
+            WindowsRuntimeMode::Tun => {
+                launch_tunnel_process_windows(app, &singbox_path, &config_str, log_path).await
+            }
+            WindowsRuntimeMode::Compatibility => {
+                launch_tunnel_process_windows_compatibility(
+                    app,
+                    &singbox_path,
+                    &config_str,
+                    log_path,
+                )
+                .await
+            }
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1869,9 +2074,12 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
     let _ = app.emit("tunnel-log", "[SYSTEM] Resolving core binary path...");
     let pid = launch_tunnel_process(&app, true).await?;
 
+    #[cfg(target_os = "windows")]
+    let runtime_mode = load_windows_runtime_mode(&app)?;
+
     let _ = app.emit(
         "tunnel-log",
-        format!("[SYSTEM] Core process started with PID {} (root)", pid),
+        format!("[SYSTEM] Core process started with PID {}.", pid),
     );
 
     verify_tunnel_start(&app, &state, pid, tunnel_log_path()).await?;
@@ -1879,10 +2087,24 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
     spawn_process_exit_monitor(app.clone(), pid);
     spawn_network_recovery_monitor(app.clone(), pid);
 
-    let _ = app.emit(
-        "tunnel-log",
-        "[SYSTEM] TUN adapter initialized. Routing active.".to_string(),
-    );
+    #[cfg(target_os = "windows")]
+    {
+        let message = match runtime_mode {
+            WindowsRuntimeMode::Tun => "[SYSTEM] TUN adapter initialized. Routing active.",
+            WindowsRuntimeMode::Compatibility => {
+                "[SYSTEM] Windows compatibility mode is active. System proxy routing is enabled."
+            }
+        };
+        let _ = app.emit("tunnel-log", message.to_string());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] TUN adapter initialized. Routing active.".to_string(),
+        );
+    }
     refresh_tray_toggle_item(&app);
 
     Ok(())
@@ -1960,6 +2182,7 @@ async fn reset_local_data(app: AppHandle) -> Result<(), String> {
         local_data.join("elevated_singbox_bootstrap.err"),
         local_data.join("elevated_singbox_bootstrap.ps1"),
         local_data.join("elevated_singbox.pid"),
+        local_data.join("windows_runtime_mode.json"),
     ];
 
     for path in files_to_remove {
@@ -1994,6 +2217,49 @@ async fn reset_local_data(app: AppHandle) -> Result<(), String> {
     );
 
     Ok(())
+}
+
+#[tauri::command]
+async fn get_windows_runtime_mode(app: AppHandle) -> Result<WindowsRuntimeModeStatus, String> {
+    Ok(WindowsRuntimeModeStatus {
+        mode: load_windows_runtime_mode(&app)?,
+        is_windows: cfg!(target_os = "windows"),
+        supports_compatibility_mode: cfg!(target_os = "windows"),
+    })
+}
+
+#[tauri::command]
+async fn set_windows_runtime_mode(
+    app: AppHandle,
+    mode: WindowsRuntimeMode,
+) -> Result<WindowsRuntimeModeStatus, String> {
+    if !cfg!(target_os = "windows") {
+        return Ok(WindowsRuntimeModeStatus {
+            mode: WindowsRuntimeMode::Tun,
+            is_windows: false,
+            supports_compatibility_mode: false,
+        });
+    }
+
+    save_windows_runtime_mode(&app, mode)?;
+
+    let _ = app.emit(
+        "tunnel-log",
+        match mode {
+            WindowsRuntimeMode::Tun => {
+                "[SYSTEM] Windows runtime mode switched to TUN mode.".to_string()
+            }
+            WindowsRuntimeMode::Compatibility => {
+                "[SYSTEM] Windows runtime mode switched to Compatibility Mode (system proxy, no TUN).".to_string()
+            }
+        },
+    );
+
+    Ok(WindowsRuntimeModeStatus {
+        mode,
+        is_windows: true,
+        supports_compatibility_mode: true,
+    })
 }
 
 pub(crate) async fn restart_tunnel_if_running(
@@ -2212,6 +2478,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_tunnel,
             stop_tunnel,
+            get_windows_runtime_mode,
+            set_windows_runtime_mode,
             reset_local_data,
             restore_tunnel_session,
             write_clipboard_text,

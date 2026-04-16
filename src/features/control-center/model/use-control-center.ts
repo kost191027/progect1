@@ -36,6 +36,7 @@ export type SavedServerProfile = {
 };
 
 export type AppRole = "master" | "subordinate";
+export type WindowsRuntimeMode = "tun" | "compatibility";
 
 export type TransportStateSnapshot = {
   current_cover_domain: string | null;
@@ -59,6 +60,12 @@ type GeneratedInviteLinkResult = {
 type LocalInstallationState = {
   has_saved_server_profile: boolean;
   has_client_config: boolean;
+};
+
+type WindowsRuntimeModeStatus = {
+  mode: WindowsRuntimeMode;
+  is_windows: boolean;
+  supports_compatibility_mode: boolean;
 };
 
 type InviteImportResult = {
@@ -191,6 +198,9 @@ export function useControlCenter() {
   const [lastAutoImportedInvite, setLastAutoImportedInvite] = useState<string | null>(null);
   const [localWarpProfileStatus, setLocalWarpProfileStatus] =
     useState<LocalWarpProfileStatus>(EMPTY_WARP_PROFILE_STATUS);
+  const [isWindowsRuntime, setIsWindowsRuntime] = useState(false);
+  const [windowsRuntimeMode, setWindowsRuntimeMode] = useState<WindowsRuntimeMode>("tun");
+  const [isSavingWindowsRuntimeMode, setIsSavingWindowsRuntimeMode] = useState(false);
   const [warpProfileInput, setWarpProfileInput] = useState("");
   const [warpProfileMessage, setWarpProfileMessage] = useState<string | null>(null);
   const [isCreatingWarpProfile, setIsCreatingWarpProfile] = useState(false);
@@ -339,6 +349,34 @@ export function useControlCenter() {
     }
 
     void loadLocalState();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadWindowsRuntimeMode() {
+      try {
+        const status = await invoke<WindowsRuntimeModeStatus>("get_windows_runtime_mode");
+        if (!isMounted) {
+          return;
+        }
+
+        setIsWindowsRuntime(status.is_windows && status.supports_compatibility_mode);
+        setWindowsRuntimeMode(status.mode);
+      } catch (error) {
+        if (!isMounted) {
+          return;
+        }
+
+        appendLog(`[WARN] Failed to load the Windows runtime mode: ${error}`);
+      }
+    }
+
+    void loadWindowsRuntimeMode();
 
     return () => {
       isMounted = false;
@@ -754,6 +792,40 @@ export function useControlCenter() {
   function updateWarpProfileInput(value: string) {
     setWarpProfileInput(value);
     setWarpProfileMessage(null);
+  }
+
+  async function switchWindowsRuntimeMode(mode: WindowsRuntimeMode) {
+    if (!isWindowsRuntime || windowsRuntimeMode === mode) {
+      return;
+    }
+
+    setIsSavingWindowsRuntimeMode(true);
+    setLastError(null);
+    setLastUserMessage(
+      mode === "tun"
+        ? "Switching Windows back to full TUN mode."
+        : "Switching Windows to Compatibility Mode without TUN.",
+    );
+
+    try {
+      const status = await invoke<WindowsRuntimeModeStatus>("set_windows_runtime_mode", {
+        mode,
+      });
+      setWindowsRuntimeMode(status.mode);
+      if (mode === "compatibility") {
+        setLastUserMessage(
+          "Windows Compatibility Mode is ready. The next tunnel start will use system proxy routing instead of TUN.",
+        );
+      } else {
+        setLastUserMessage(
+          "Windows TUN Mode is ready. The next tunnel start will try full-device routing again.",
+        );
+      }
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Failed to switch Windows runtime mode: ${error}`);
+    } finally {
+      setIsSavingWindowsRuntimeMode(false);
+    }
   }
 
   function flashPrimaryInviteCopied() {
@@ -1365,6 +1437,9 @@ export function useControlCenter() {
     inviteSyncMessage,
     inviteSyncTone,
     localWarpProfileStatus,
+    isWindowsRuntime,
+    windowsRuntimeMode,
+    isSavingWindowsRuntimeMode,
     warpProfileInput,
     warpProfileMessage,
     localDataResetMessage,
@@ -1395,6 +1470,7 @@ export function useControlCenter() {
     setUser: updateUser,
     setPassword: updatePassword,
     setWarpProfileInput: updateWarpProfileInput,
+    setWindowsRuntimeMode: switchWindowsRuntimeMode,
     startTunnel,
     stopTunnel,
     deployServer,
