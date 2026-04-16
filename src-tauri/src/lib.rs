@@ -422,15 +422,18 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             if let Some(object) = inbound.as_object_mut() {
                 // Windows compatibility profile:
                 // - do not force a fixed adapter name on older systems
-                // - strict_route MUST be true so that ALL traffic (including
-                //   DNS queries from browsers) is captured through the TUN.
-                //   Without it, DNS bypasses the tunnel and nothing loads.
-                // - "mixed" stack: uses the OS TCP/IP stack for TCP (most
-                //   reliable) and gvisor for UDP. This is the recommended
-                //   stack for Windows in sing-box documentation.
+                // - strict_route MUST be false on Windows 8: sing-box uses
+                //   Windows Filtering Platform (WFP) for strict routing, but
+                //   the required WFP calls are incompatible with Windows 8 and
+                //   cause an immediate process crash after TUN initialisation.
+                //   auto_route still captures traffic via 0.0.0.0/1 + 128.0.0.0/1
+                //   routes which is sufficient.
+                // - "system" stack: identical to the working macOS config; uses
+                //   the OS native TCP/IP stack which is the most reliable on
+                //   older Windows versions.
                 object.remove("interface_name");
-                object.insert("strict_route".to_string(), serde_json::json!(true));
-                object.insert("stack".to_string(), serde_json::json!("mixed"));
+                object.insert("strict_route".to_string(), serde_json::json!(false));
+                object.insert("stack".to_string(), serde_json::json!("system"));
             }
         }
     }
