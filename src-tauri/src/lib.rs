@@ -465,15 +465,11 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 "server": "fakeip-dns"
             }));
         }
-        // Non-A/AAAA queries (PTR, SRV, etc.) fall through to local DNS
+        // Non-A/AAAA queries (PTR, SRV, etc.) fall through to local DNS.
+        // Do not inject `dns.default_domain_resolver` here: this field is not
+        // accepted by the current sing-box build on Windows and causes the
+        // whole config preflight to fail before startup.
         dns.insert("final".to_string(), serde_json::json!("local-dns"));
-        // Also switch the internal domain resolver away from remote-dns
-        // (which is broken on Windows) so that any internal hostname
-        // lookups (rule-set URLs etc.) use the local system resolver.
-        dns.insert(
-            "default_domain_resolver".to_string(),
-            serde_json::json!("local-dns"),
-        );
     }
 
     serde_json::to_string_pretty(&cfg)
