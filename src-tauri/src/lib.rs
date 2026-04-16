@@ -444,6 +444,26 @@ fn build_windows_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         route.insert("auto_detect_interface".to_string(), serde_json::json!(true));
     }
 
+    // DNS fix for gvisor stack on Windows 8:
+    // The gvisor userspace TCP/IP stack cannot reliably deliver UDP-over-TCP
+    // (UoT) packets — DNS queries to 8.8.8.8 via the proxy outbound fail
+    // with EOF because the UoT wrapper breaks in gvisor.  Regular TCP
+    // connections through the same proxy work perfectly (confirmed by TLS
+    // traffic in real-world logs).  Switch remote-dns from UDP to TCP so
+    // that DNS queries go through the proxy as plain TCP, bypassing UoT.
+    if let Some(dns) = cfg.get_mut("dns").and_then(|v| v.as_object_mut()) {
+        if let Some(servers) = dns.get_mut("servers").and_then(|v| v.as_array_mut()) {
+            for server in servers.iter_mut() {
+                let tag = server.get("tag").and_then(|v| v.as_str()).unwrap_or("");
+                if tag == "remote-dns" {
+                    if let Some(obj) = server.as_object_mut() {
+                        obj.insert("type".to_string(), serde_json::json!("tcp"));
+                    }
+                }
+            }
+        }
+    }
+
     serde_json::to_string_pretty(&cfg)
         .map_err(|e| format!("Failed to serialize Windows runtime client config: {}", e))
 }
