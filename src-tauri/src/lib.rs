@@ -1605,6 +1605,18 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
             }
 
             if !process_exists(pid) {
+                #[cfg(target_os = "windows")]
+                {
+                    // Old Windows systems can occasionally return a transient
+                    // false negative from the task inspection path right after
+                    // UAC/elevation handoff. Re-check once before declaring the
+                    // tunnel dead.
+                    sleep(Duration::from_millis(700)).await;
+                    if process_exists(pid) {
+                        continue;
+                    }
+                }
+
                 {
                     let state = app.state::<AppState>();
                     let mut guard = state.singbox_pid.lock().unwrap();
@@ -1617,9 +1629,39 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
                     reset_guard_state(&state);
                 }
 
+                let log_tail = recent_log_tail(tunnel_log_path(), 20);
+                #[cfg(target_os = "windows")]
+                let bootstrap_hint = app
+                    .path()
+                    .app_local_data_dir()
+                    .ok()
+                    .and_then(|dir| {
+                        std::fs::read_to_string(dir.join("elevated_singbox_bootstrap.err")).ok()
+                    })
+                    .map(|value| trim_utf8_bom(&value).trim().to_string())
+                    .filter(|value| !value.is_empty());
+
+                #[cfg(not(target_os = "windows"))]
+                let bootstrap_hint: Option<String> = None;
+
+                let details = if let Some(hint) = bootstrap_hint {
+                    if log_tail.is_empty() {
+                        hint
+                    } else {
+                        format!("{}\nRecent logs:\n{}", hint, log_tail)
+                    }
+                } else if log_tail.is_empty() {
+                    "No exit details captured.".to_string()
+                } else {
+                    format!("Recent logs:\n{}", log_tail)
+                };
+
                 let _ = app.emit(
                     "tunnel-log",
-                    "[SYSTEM] Core process exited. Tunnel is no longer active.".to_string(),
+                    format!(
+                        "[SYSTEM] Core process exited. Tunnel is no longer active. {}",
+                        details
+                    ),
                 );
                 emit_tunnel_state(&app, false);
                 emit_guard_state(&app, "inactive");
