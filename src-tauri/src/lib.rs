@@ -549,17 +549,77 @@ fn build_windows_runtime_client_config(
                 }
             ]);
 
-            cfg["dns"] = serde_json::json!({
-                "servers": [
-                    {
-                        "type": "local",
-                        "tag": "local-dns",
-                        "prefer_go": true
+            if let Some(dns) = cfg.get_mut("dns").and_then(|value| value.as_object_mut()) {
+                if let Some(servers) = dns
+                    .get_mut("servers")
+                    .and_then(|value| value.as_array_mut())
+                {
+                    servers.retain(|server| {
+                        server
+                            .get("tag")
+                            .and_then(|value| value.as_str())
+                            .map(|tag| tag != "fakeip-dns")
+                            .unwrap_or(true)
+                    });
+
+                    let mut remote_dns_found = false;
+                    for server in servers.iter_mut() {
+                        let tag = server
+                            .get("tag")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default();
+
+                        if tag == "remote-dns" {
+                            remote_dns_found = true;
+                            if let Some(object) = server.as_object_mut() {
+                                object.insert("type".to_string(), serde_json::json!("https"));
+                                object.insert("server".to_string(), serde_json::json!("8.8.8.8"));
+                                object.insert("server_port".to_string(), serde_json::json!(443));
+                                object.insert("path".to_string(), serde_json::json!("/dns-query"));
+                                object.insert("detour".to_string(), serde_json::json!("proxy"));
+                                object.insert(
+                                    "tls".to_string(),
+                                    serde_json::json!({
+                                        "enabled": true,
+                                        "server_name": "dns.google"
+                                    }),
+                                );
+                                object.remove("address_resolver");
+                                object.remove("address_strategy");
+                                object.remove("domain_resolver");
+                                object.remove("domain_strategy");
+                            }
+                        }
                     }
-                ],
-                "final": "local-dns",
-                "strategy": "ipv4_only"
-            });
+
+                    if !remote_dns_found {
+                        servers.push(serde_json::json!({
+                            "type": "https",
+                            "tag": "remote-dns",
+                            "server": "8.8.8.8",
+                            "server_port": 443,
+                            "path": "/dns-query",
+                            "detour": "proxy",
+                            "tls": {
+                                "enabled": true,
+                                "server_name": "dns.google"
+                            }
+                        }));
+                    }
+                }
+
+                if let Some(rules) = dns.get_mut("rules").and_then(|value| value.as_array_mut()) {
+                    rules.retain(|rule| {
+                        rule.get("server")
+                            .and_then(|value| value.as_str())
+                            .map(|server| server != "fakeip-dns")
+                            .unwrap_or(true)
+                    });
+                }
+
+                dns.insert("final".to_string(), serde_json::json!("remote-dns"));
+                dns.insert("strategy".to_string(), serde_json::json!("ipv4_only"));
+            }
 
             if let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) {
                 route.remove("auto_detect_interface");
