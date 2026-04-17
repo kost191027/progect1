@@ -405,6 +405,39 @@ fn terminate_root_process(app: Option<&AppHandle>, pid: u32) -> Result<(), Strin
     }
 }
 
+#[cfg(target_os = "windows")]
+fn clear_windows_system_proxy() -> Result<(), String> {
+    let script = r#"
+      $ErrorActionPreference = 'Stop'
+      $path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+      Set-ItemProperty -Path $path -Name ProxyEnable -Value 0
+      Remove-ItemProperty -Path $path -Name ProxyServer -ErrorAction SilentlyContinue
+      Remove-ItemProperty -Path $path -Name ProxyOverride -ErrorAction SilentlyContinue
+
+      try {
+        $signature = '[DllImport("wininet.dll")] public static extern bool InternetSetOption(int hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);'
+        Add-Type -MemberDefinition $signature -Name WinINet -Namespace RknProxy -ErrorAction SilentlyContinue | Out-Null
+        [RknProxy.WinINet]::InternetSetOption(0, 39, [IntPtr]::Zero, 0) | Out-Null
+        [RknProxy.WinINet]::InternetSetOption(0, 37, [IntPtr]::Zero, 0) | Out-Null
+      } catch {}
+    "#;
+
+    let output = windowless_command("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+        .map_err(|e| format!("Failed to clear Windows system proxy: {}", e))?;
+
+    let _ = windowless_command("netsh")
+        .args(["winhttp", "reset", "proxy"])
+        .output();
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 fn tunnel_log_path() -> &'static str {
     #[cfg(target_os = "windows")]
     {
@@ -1472,6 +1505,8 @@ async fn launch_tunnel_process_windows_compatibility(
     config_str: &str,
     log_path: &str,
 ) -> Result<u32, String> {
+    let _ = clear_windows_system_proxy();
+
     let singbox_dir = std::path::Path::new(singbox_path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -1935,6 +1970,8 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
                         details
                     ),
                 );
+                #[cfg(target_os = "windows")]
+                let _ = clear_windows_system_proxy();
                 emit_tunnel_state(&app, false);
                 emit_guard_state(&app, "inactive");
                 break;
@@ -2201,6 +2238,8 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             set_network_fingerprint(&state, None);
             finish_recovery(&state);
             reset_guard_state(&state);
+            #[cfg(target_os = "windows")]
+            let _ = clear_windows_system_proxy();
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
             refresh_tray_toggle_item(&app);
@@ -2216,6 +2255,8 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             clear_saved_tunnel_pid(&app);
             finish_recovery(&state);
             reset_guard_state(&state);
+            #[cfg(target_os = "windows")]
+            let _ = clear_windows_system_proxy();
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
             refresh_tray_toggle_item(&app);
