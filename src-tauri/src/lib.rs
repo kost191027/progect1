@@ -656,7 +656,13 @@ fn build_windows_runtime_client_config(
 
             if let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) {
                 route.remove("auto_detect_interface");
-                route.remove("default_domain_resolver");
+                route.insert(
+                    "default_domain_resolver".to_string(),
+                    serde_json::json!({
+                        "server": "remote-dns",
+                        "strategy": "ipv4_only"
+                    }),
+                );
 
                 if let Some(rules) = route
                     .get_mut("rules")
