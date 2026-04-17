@@ -5,13 +5,17 @@ use std::process::Stdio;
 use std::sync::Mutex;
 use std::{fs, path::PathBuf};
 use tauri::image::Image;
+#[cfg(desktop)]
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
+#[cfg(desktop)]
 use tauri::tray::TrayIconBuilder;
-#[cfg(target_os = "windows")]
+#[cfg(all(desktop, target_os = "windows"))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-#[cfg(target_os = "macos")]
+#[cfg(all(desktop, target_os = "macos"))]
 use tauri::RunEvent;
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
+use tauri::{AppHandle, Emitter, Manager, State};
+#[cfg(desktop)]
+use tauri::{WindowEvent, Wry};
 #[cfg(not(target_os = "windows"))]
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -31,6 +35,7 @@ struct AppState {
     recovery_in_progress: Mutex<bool>,
     proxy_failure_count: Mutex<u8>,
     kill_switch_engaged: Mutex<bool>,
+    #[cfg(desktop)]
     tray_toggle_item: Mutex<Option<MenuItem<Wry>>>,
     #[cfg(target_os = "windows")]
     windows_tray_notice_shown: Mutex<bool>,
@@ -212,6 +217,7 @@ fn local_client_config_requires_refresh(app: &AppHandle) -> Result<bool, String>
     Ok(false)
 }
 
+#[cfg(desktop)]
 pub(crate) fn refresh_tray_toggle_item(app: &AppHandle) {
     let state = app.state::<AppState>();
     let maybe_item = state.tray_toggle_item.lock().unwrap().clone();
@@ -232,6 +238,10 @@ pub(crate) fn refresh_tray_toggle_item(app: &AppHandle) {
     let _ = item.set_enabled(is_configured);
 }
 
+#[cfg(not(desktop))]
+pub(crate) fn refresh_tray_toggle_item(_app: &AppHandle) {}
+
+#[cfg(desktop)]
 fn show_main_window(app: &AppHandle, screen: Option<&str>) {
     if let Some(screen) = screen {
         emit_screen_navigation(app, screen);
@@ -241,6 +251,13 @@ fn show_main_window(app: &AppHandle, screen: Option<&str>) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+#[cfg(not(desktop))]
+fn show_main_window(app: &AppHandle, screen: Option<&str>) {
+    if let Some(screen) = screen {
+        emit_screen_navigation(app, screen);
     }
 }
 
@@ -2475,111 +2492,120 @@ pub fn run() {
             recovery_in_progress: Mutex::new(false),
             proxy_failure_count: Mutex::new(0),
             kill_switch_engaged: Mutex::new(false),
+            #[cfg(desktop)]
             tray_toggle_item: Mutex::new(None),
             #[cfg(target_os = "windows")]
             windows_tray_notice_shown: Mutex::new(false),
         })
         .setup(|app| {
-            // --- System Tray (живёт в менюбаре macOS) ---
-            let app_handle = app.app_handle().clone();
-            let toggle_item = MenuItemBuilder::with_id("toggle_tunnel", "Start Tunnel")
-                .enabled(client_config_exists(&app_handle))
-                .build(app)?;
-            let settings_item = MenuItemBuilder::with_id("open_settings", "Settings").build(app)?;
-            let info_item = MenuItemBuilder::with_id("open_info", "Info").build(app)?;
-            let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
-
+            #[cfg(desktop)]
             {
-                let state = app.state::<AppState>();
-                *state.tray_toggle_item.lock().unwrap() = Some(toggle_item.clone());
-            }
+                let app_handle = app.app_handle().clone();
+                let toggle_item = MenuItemBuilder::with_id("toggle_tunnel", "Start Tunnel")
+                    .enabled(client_config_exists(&app_handle))
+                    .build(app)?;
+                let settings_item =
+                    MenuItemBuilder::with_id("open_settings", "Settings").build(app)?;
+                let info_item = MenuItemBuilder::with_id("open_info", "Info").build(app)?;
+                let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
-            let menu = MenuBuilder::new(app)
-                .item(&toggle_item)
-                .item(&settings_item)
-                .item(&info_item)
-                .separator()
-                .item(&quit_item)
-                .build()?;
+                {
+                    let state = app.state::<AppState>();
+                    *state.tray_toggle_item.lock().unwrap() = Some(toggle_item.clone());
+                }
 
-            let _tray = TrayIconBuilder::new()
-                .icon(TRAY_ICON)
-                .icon_as_template(false)
-                .tooltip("RKN — Recursive Kinetic Network")
-                .menu(&menu)
-                .on_tray_icon_event(|tray, event| {
-                    #[cfg(target_os = "windows")]
-                    {
-                        let app = tray.app_handle();
-                        match event {
-                            TrayIconEvent::Click {
-                                button: MouseButton::Left,
-                                button_state: MouseButtonState::Up,
-                                ..
+                let menu = MenuBuilder::new(app)
+                    .item(&toggle_item)
+                    .item(&settings_item)
+                    .item(&info_item)
+                    .separator()
+                    .item(&quit_item)
+                    .build()?;
+
+                let _tray = TrayIconBuilder::new()
+                    .icon(TRAY_ICON)
+                    .icon_as_template(false)
+                    .tooltip("RKN — Recursive Kinetic Network")
+                    .menu(&menu)
+                    .on_tray_icon_event(|tray, event| {
+                        #[cfg(target_os = "windows")]
+                        {
+                            let app = tray.app_handle();
+                            match event {
+                                TrayIconEvent::Click {
+                                    button: MouseButton::Left,
+                                    button_state: MouseButtonState::Up,
+                                    ..
+                                }
+                                | TrayIconEvent::DoubleClick {
+                                    button: MouseButton::Left,
+                                    ..
+                                } => {
+                                    show_main_window(&app, None);
+                                }
+                                _ => {}
                             }
-                            | TrayIconEvent::DoubleClick {
-                                button: MouseButton::Left,
-                                ..
-                            } => {
-                                show_main_window(&app, None);
-                            }
-                            _ => {}
                         }
-                    }
 
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        let _ = (tray, event);
-                    }
-                })
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "toggle_tunnel" => {
-                        let app_handle = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let is_running = {
-                                let state = app_handle.state::<AppState>();
-                                let is_running = state.singbox_pid.lock().unwrap().is_some();
-                                is_running
-                            };
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            let _ = (tray, event);
+                        }
+                    })
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "toggle_tunnel" => {
+                            let app_handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let is_running = {
+                                    let state = app_handle.state::<AppState>();
+                                    let is_running = state.singbox_pid.lock().unwrap().is_some();
+                                    is_running
+                                };
 
-                            let result = if is_running {
-                                stop_tunnel_inner(app_handle.clone()).await
-                            } else {
-                                start_tunnel_inner(app_handle.clone()).await
-                            };
+                                let result = if is_running {
+                                    stop_tunnel_inner(app_handle.clone()).await
+                                } else {
+                                    start_tunnel_inner(app_handle.clone()).await
+                                };
 
-                            if let Err(error) = result {
-                                let _ = app_handle.emit(
-                                    "tunnel-log",
-                                    format!("[ERROR] tray tunnel action failed: {}", error),
-                                );
-                            }
-                        });
-                    }
-                    "open_settings" => {
-                        show_main_window(app, Some("settings"));
-                    }
-                    "open_info" => {
-                        show_main_window(app, Some("info"));
-                    }
-                    "quit" => {
-                        quit_application(app);
-                    }
-                    _ => {}
-                })
-                .build(app)?;
+                                if let Err(error) = result {
+                                    let _ = app_handle.emit(
+                                        "tunnel-log",
+                                        format!("[ERROR] tray tunnel action failed: {}", error),
+                                    );
+                                }
+                            });
+                        }
+                        "open_settings" => {
+                            show_main_window(app, Some("settings"));
+                        }
+                        "open_info" => {
+                            show_main_window(app, Some("info"));
+                        }
+                        "quit" => {
+                            quit_application(app);
+                        }
+                        _ => {}
+                    })
+                    .build(app)?;
 
-            refresh_tray_toggle_item(&app_handle);
+                refresh_tray_toggle_item(&app_handle);
+            }
 
             Ok(())
         })
-        // --- Закрытие окна → скрытие (туннель продолжает работать) ---
         .on_window_event(|window, event| {
+            #[cfg(desktop)]
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 #[cfg(target_os = "windows")]
                 maybe_announce_windows_tray_behavior(&window.app_handle());
                 api.prevent_close();
+            }
+
+            #[cfg(not(desktop))]
+            {
+                let _ = (window, event);
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -2610,12 +2636,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            #[cfg(target_os = "macos")]
+            #[cfg(all(desktop, target_os = "macos"))]
             if let RunEvent::Reopen { .. } = event {
                 show_main_window(app, None);
             }
 
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(all(desktop, target_os = "macos")))]
             let _ = (app, event);
         });
 }

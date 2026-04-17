@@ -23,6 +23,9 @@
   },
   "bundle": {
     "active": true,
+    "android": {
+      "minSdkVersion": 29
+    },
     "targets": [
       "app",
       "dmg",
