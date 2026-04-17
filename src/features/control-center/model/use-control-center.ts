@@ -141,6 +141,14 @@ function stripLogPrefix(message: string) {
 
 function isErrorLog(message: string) {
   const lower = message.toLowerCase();
+
+  if (
+    lower.includes("forcibly closed by the remote host") ||
+    lower.includes("connection upload closed: raw-read tcp 127.0.0.1:2080->127.0.0.1:")
+  ) {
+    return false;
+  }
+
   return (
     lower.includes("[error]") ||
     lower.includes("[main error]") ||
