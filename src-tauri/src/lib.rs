@@ -1,6 +1,6 @@
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::io::Write;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "android"))]
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::{fs, path::PathBuf};
@@ -407,13 +407,41 @@ fn terminate_root_process(app: Option<&AppHandle>, pid: u32) -> Result<(), Strin
 
     #[cfg(not(target_os = "windows"))]
     {
+        #[cfg(target_os = "android")]
+        {
+            let output = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .output()
+                .map_err(|e| format!("Failed to execute Android kill: {}", e))?;
+
+            if output.status.success() || !process_exists(pid) {
+                return Ok(());
+            }
+
+            let force_output = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .output()
+                .map_err(|e| format!("Failed to execute Android force kill: {}", e))?;
+
+            if force_output.status.success() || !process_exists(pid) {
+                return Ok(());
+            }
+
+            return Err(String::from_utf8_lossy(&force_output.stderr)
+                .trim()
+                .to_string());
+        }
+
+        #[cfg(not(target_os = "android"))]
         let kill_cmd = format!(
             "kill {} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {} >/dev/null 2>&1 || true",
             pid, pid
         );
 
+        #[cfg(not(target_os = "android"))]
         let output = run_admin_command(&kill_cmd)?;
 
+        #[cfg(not(target_os = "android"))]
         if output.status.success() {
             Ok(())
         } else {
@@ -1149,6 +1177,7 @@ fn current_singbox_target_triple() -> Result<&'static str, String> {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
+        ("android", "aarch64") => Ok("aarch64-linux-android"),
         (os, arch) => Err(format!(
             "Unsupported platform for sing-box sidecar resolution: {} / {}",
             os, arch
@@ -1157,7 +1186,15 @@ fn current_singbox_target_triple() -> Result<&'static str, String> {
 }
 
 /// Находит абсолютный путь до sidecar-бинарника `sing-box`
-fn resolve_singbox_path() -> Result<String, String> {
+fn resolve_singbox_path(app: &AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        return resolve_android_singbox_path(app);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    let _ = app;
+
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("Cannot resolve binary directory")?;
     let target_triple = current_singbox_target_triple()?;
@@ -1189,6 +1226,91 @@ fn resolve_singbox_path() -> Result<String, String> {
     } else {
         Ok("sing-box".to_string())
     }
+}
+
+#[cfg(target_os = "android")]
+fn resolve_android_singbox_path(app: &AppHandle) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let target_triple = current_singbox_target_triple()?;
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let sidecar_dir = local_data.join("sidecars");
+    std::fs::create_dir_all(&sidecar_dir).map_err(|e| {
+        format!(
+            "Failed to create Android sidecar directory {}: {}",
+            sidecar_dir.display(),
+            e
+        )
+    })?;
+
+    let extracted_path = sidecar_dir.join(format!("sing-box-{}", target_triple));
+    if extracted_path.exists() {
+        let mut perms = std::fs::metadata(&extracted_path)
+            .map_err(|e| {
+                format!(
+                    "Failed to stat Android sidecar {}: {}",
+                    extracted_path.display(),
+                    e
+                )
+            })?
+            .permissions();
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(&extracted_path, perms);
+        return Ok(extracted_path.to_string_lossy().to_string());
+    }
+
+    let mut source_candidates = Vec::new();
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        source_candidates.push(resource_dir.join(format!("sing-box-{}", target_triple)));
+        source_candidates.push(resource_dir.join("sing-box"));
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            source_candidates.push(dir.join(format!("sing-box-{}", target_triple)));
+            source_candidates.push(dir.join("sing-box"));
+        }
+    }
+
+    let source_path = source_candidates
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| {
+            format!(
+                "Android sing-box sidecar was not found. Expected bundled binary for {}.",
+                target_triple
+            )
+        })?;
+
+    std::fs::copy(&source_path, &extracted_path).map_err(|e| {
+        format!(
+            "Failed to extract Android sidecar from {} to {}: {}",
+            source_path.display(),
+            extracted_path.display(),
+            e
+        )
+    })?;
+
+    let mut perms = std::fs::metadata(&extracted_path)
+        .map_err(|e| {
+            format!(
+                "Failed to stat extracted Android sidecar {}: {}",
+                extracted_path.display(),
+                e
+            )
+        })?
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&extracted_path, perms).map_err(|e| {
+        format!(
+            "Failed to mark Android sidecar executable {}: {}",
+            extracted_path.display(),
+            e
+        )
+    })?;
+
+    Ok(extracted_path.to_string_lossy().to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -1575,8 +1697,94 @@ async fn launch_tunnel_process_windows_compatibility(
     Ok(child.id())
 }
 
+#[cfg(target_os = "android")]
+fn summarize_android_command_failure(prefix: &str, output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !stderr.is_empty() && !stdout.is_empty() {
+        format!("{prefix}: {stderr} | {stdout}")
+    } else if !stderr.is_empty() {
+        format!("{prefix}: {stderr}")
+    } else if !stdout.is_empty() {
+        format!("{prefix}: {stdout}")
+    } else {
+        format!(
+            "{prefix}: process exited with code {:?}",
+            output.status.code()
+        )
+    }
+}
+
+#[cfg(target_os = "android")]
+fn run_android_singbox_preflight(singbox_path: &str, config_path: &str) -> Result<(), String> {
+    let singbox_dir = std::path::Path::new(singbox_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    let version_output = std::process::Command::new(singbox_path)
+        .current_dir(singbox_dir)
+        .arg("version")
+        .output()
+        .map_err(|e| format!("Failed to launch Android sing-box preflight: {}", e))?;
+
+    if !version_output.status.success() {
+        return Err(summarize_android_command_failure(
+            "Android sing-box preflight failed",
+            &version_output,
+        ));
+    }
+
+    let check_output = std::process::Command::new(singbox_path)
+        .current_dir(singbox_dir)
+        .args(["check", "-c", config_path])
+        .output()
+        .map_err(|e| format!("Failed to run Android sing-box config preflight: {}", e))?;
+
+    if !check_output.status.success() {
+        return Err(summarize_android_command_failure(
+            "Android sing-box config preflight failed",
+            &check_output,
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+async fn launch_tunnel_process_android(
+    _app: &AppHandle,
+    singbox_path: &str,
+    config_str: &str,
+    log_path: &str,
+) -> Result<u32, String> {
+    let singbox_dir = std::path::Path::new(singbox_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(log_path)
+        .map_err(|e| format!("Failed to open Android sidecar log file: {}", e))?;
+    let stderr_file = log_file
+        .try_clone()
+        .map_err(|e| format!("Failed to duplicate Android sidecar log handle: {}", e))?;
+
+    let child = std::process::Command::new(singbox_path)
+        .current_dir(singbox_dir)
+        .args(["run", "-c", config_str])
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|e| format!("Failed to launch Android sing-box sidecar: {}", e))?;
+
+    Ok(child.id())
+}
+
 async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result<u32, String> {
-    let singbox_path = resolve_singbox_path()?;
+    let singbox_path = resolve_singbox_path(app)?;
 
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     let config_path = local_data.join("client_config.json");
@@ -1655,8 +1863,26 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
 
     #[cfg(not(target_os = "windows"))]
     {
+        #[cfg(target_os = "android")]
+        {
+            let config_str = config_path.to_string_lossy().to_string();
+
+            if announce_prompt {
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Starting Android sidecar runtime without desktop elevation..."
+                        .to_string(),
+                );
+            }
+
+            run_android_singbox_preflight(&singbox_path, &config_str)?;
+            return launch_tunnel_process_android(app, &singbox_path, &config_str, log_path).await;
+        }
+
+        #[cfg(not(target_os = "android"))]
         let config_str = config_path.to_string_lossy().to_string();
 
+        #[cfg(not(target_os = "android"))]
         if announce_prompt {
             let _ = app.emit(
                 "tunnel-log",
@@ -1664,6 +1890,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
             );
         }
 
+        #[cfg(not(target_os = "android"))]
         let shell_cmd = format!(
             "{} run -c {} > {} 2>&1 & echo $!",
             shell_single_quote(&singbox_path),
@@ -1671,11 +1898,13 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
             shell_single_quote(log_path),
         );
 
+        #[cfg(not(target_os = "android"))]
         let osascript_arg = format!(
             "do shell script \"{}\" with administrator privileges",
             escape_applescript(&shell_cmd)
         );
 
+        #[cfg(not(target_os = "android"))]
         let output = app
             .shell()
             .command("osascript")
@@ -1684,6 +1913,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
             .await
             .map_err(|e| format!("Failed to execute osascript: {}", e))?;
 
+        #[cfg(not(target_os = "android"))]
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("User canceled") || stderr.contains("-128") {
@@ -1696,7 +1926,9 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
             return Err(format!("osascript error: {}", stderr));
         }
 
+        #[cfg(not(target_os = "android"))]
         let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        #[cfg(not(target_os = "android"))]
         pid_str
             .parse()
             .map_err(|_| format!("Failed to parse PID from: '{}'", pid_str))
@@ -1704,7 +1936,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
 }
 
 async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, String> {
-    let singbox_path = resolve_singbox_path()?;
+    let singbox_path = resolve_singbox_path(app)?;
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     let config_path = local_data.join("client_config.json");
 
@@ -1760,7 +1992,19 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
 
     #[cfg(not(target_os = "windows"))]
     {
+        #[cfg(target_os = "android")]
+        {
+            let _ = terminate_root_process(Some(app), old_pid);
+            sleep(Duration::from_secs(1)).await;
+            let config_str = config_path.to_string_lossy().to_string();
+            run_android_singbox_preflight(&singbox_path, &config_str)?;
+            return launch_tunnel_process_android(app, &singbox_path, &config_str, log_path).await;
+        }
+
+        #[cfg(not(target_os = "android"))]
         let config_str = config_path.to_string_lossy().to_string();
+
+        #[cfg(not(target_os = "android"))]
         let shell_cmd = format!(
             "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n{} run -c {} > {} 2>&1 & echo $!",
             shell_single_quote(&singbox_path),
@@ -1768,11 +2012,13 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
             shell_single_quote(log_path),
         );
 
+        #[cfg(not(target_os = "android"))]
         let osascript_arg = format!(
             "do shell script \"{}\" with administrator privileges",
             escape_applescript(&shell_cmd)
         );
 
+        #[cfg(not(target_os = "android"))]
         let output = app
             .shell()
             .command("osascript")
@@ -1781,6 +2027,7 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
             .await
             .map_err(|e| format!("Failed to execute osascript: {}", e))?;
 
+        #[cfg(not(target_os = "android"))]
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("User canceled") || stderr.contains("-128") {
@@ -1793,7 +2040,9 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
             return Err(format!("osascript error: {}", stderr));
         }
 
+        #[cfg(not(target_os = "android"))]
         let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        #[cfg(not(target_os = "android"))]
         pid_str
             .parse()
             .map_err(|_| format!("Failed to parse PID from: '{}'", pid_str))
