@@ -19,9 +19,11 @@ npm run android:doctor
 Expected critical checks:
 
 - `JAVA_HOME`
+- Android-compatible Java (`17` or `21` preferred over `26`)
 - `ANDROID_HOME`
 - `NDK_HOME`
 - Android scaffold in `src-tauri/gen/android`
+- Android `llvm-ranlib` availability for cross-compiling crates like `openssl-sys`
 
 ## Fast local loop
 
@@ -30,6 +32,16 @@ Start the hot-reload Android dev session:
 ```bash
 npm run tauri:android:dev
 ```
+
+These Android npm scripts now bootstrap the required mobile toolchain env automatically:
+
+- `JAVA_HOME`
+- `ANDROID_HOME`
+- `ANDROID_SDK_ROOT`
+- `NDK_HOME`
+- `TARGET_CC`
+- `TARGET_AR`
+- `TARGET_RANLIB`
 
 Use this for:
 

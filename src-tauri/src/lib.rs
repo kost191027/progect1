@@ -4,6 +4,7 @@ use std::io::Write;
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::{fs, path::PathBuf};
+#[cfg(desktop)]
 use tauri::image::Image;
 #[cfg(desktop)]
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
@@ -16,7 +17,7 @@ use tauri::RunEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(desktop)]
 use tauri::{WindowEvent, Wry};
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{sleep, Duration};
@@ -26,6 +27,7 @@ mod geodata;
 #[path = "ssh/mod.rs"]
 mod ssh;
 
+#[cfg(desktop)]
 const TRAY_ICON: Image<'_> = tauri::include_image!("./icons/tray-icon.png");
 
 struct AppState {
@@ -164,10 +166,12 @@ fn emit_guard_state(app: &AppHandle, state: &str) {
     let _ = app.emit("tunnel-guard-state", state.to_string());
 }
 
+#[cfg(desktop)]
 fn emit_screen_navigation(app: &AppHandle, screen: &str) {
     let _ = app.emit("navigate-screen", screen.to_string());
 }
 
+#[cfg(desktop)]
 fn client_config_exists(app: &AppHandle) -> bool {
     app.path()
         .app_local_data_dir()
@@ -254,13 +258,7 @@ fn show_main_window(app: &AppHandle, screen: Option<&str>) {
     }
 }
 
-#[cfg(not(desktop))]
-fn show_main_window(app: &AppHandle, screen: Option<&str>) {
-    if let Some(screen) = screen {
-        emit_screen_navigation(app, screen);
-    }
-}
-
+#[cfg(desktop)]
 fn quit_application(app: &AppHandle) {
     let state = app.state::<AppState>();
     if let Some(pid) = state.singbox_pid.lock().unwrap().take() {
@@ -1193,38 +1191,39 @@ fn resolve_singbox_path(app: &AppHandle) -> Result<String, String> {
     }
 
     #[cfg(not(target_os = "android"))]
-    let _ = app;
+    {
+        let _ = app;
 
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let dir = exe.parent().ok_or("Cannot resolve binary directory")?;
-    let target_triple = current_singbox_target_triple()?;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let dir = exe.parent().ok_or("Cannot resolve binary directory")?;
+        let target_triple = current_singbox_target_triple()?;
 
-    let mut candidates = vec![
-        format!("sing-box-{}", target_triple),
-        "sing-box".to_string(),
-    ];
-
-    if cfg!(target_os = "windows") {
-        candidates = vec![
-            format!("sing-box-{}.exe", target_triple),
-            "sing-box.exe".to_string(),
+        let mut candidates = vec![
             format!("sing-box-{}", target_triple),
             "sing-box".to_string(),
         ];
-    }
 
-    for candidate in candidates {
-        let sidecar_path = dir.join(&candidate);
-        if sidecar_path.exists() {
-            return Ok(sidecar_path.to_string_lossy().to_string());
+        if cfg!(target_os = "windows") {
+            candidates = vec![
+                format!("sing-box-{}.exe", target_triple),
+                "sing-box.exe".to_string(),
+                format!("sing-box-{}", target_triple),
+                "sing-box".to_string(),
+            ];
         }
-    }
 
-    // Fallback: system PATH
-    if cfg!(target_os = "windows") {
-        Ok("sing-box.exe".to_string())
-    } else {
-        Ok("sing-box".to_string())
+        for candidate in candidates {
+            let sidecar_path = dir.join(&candidate);
+            if sidecar_path.exists() {
+                return Ok(sidecar_path.to_string_lossy().to_string());
+            }
+        }
+
+        if cfg!(target_os = "windows") {
+            Ok("sing-box.exe".to_string())
+        } else {
+            Ok("sing-box".to_string())
+        }
     }
 }
 
@@ -2747,6 +2746,9 @@ pub fn run() {
             windows_tray_notice_shown: Mutex::new(false),
         })
         .setup(|app| {
+            #[cfg(not(desktop))]
+            let _ = app;
+
             #[cfg(desktop)]
             {
                 let app_handle = app.app_handle().clone();
