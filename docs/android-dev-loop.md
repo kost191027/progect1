@@ -63,6 +63,19 @@ Use this for:
 - sidecar/process smoke tests
 - packaging sanity checks
 
+## Fast device reinstall
+
+If the debug APK is already built and you only want to reinstall it onto a connected phone:
+
+```bash
+npm run android:install:debug
+```
+
+This does:
+
+- `adb install -r ...app-arm64-debug.apk`
+- `adb shell am start -n com.freedom.rkn/.MainActivity`
+
 ## APK build
 
 Build a test APK:

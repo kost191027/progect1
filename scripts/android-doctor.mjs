@@ -41,7 +41,19 @@ function firstExistingDir(candidates) {
   return candidates.find((candidate) => candidate && existsSync(candidate)) || "";
 }
 
-const javaHome = process.env.JAVA_HOME || firstExistingDir(fallbackJavaHomes);
+function isAndroidCompatibleJavaHome(javaHome) {
+  if (!javaHome) {
+    return false;
+  }
+
+  return !javaHome.includes("temurin-26");
+}
+
+const fallbackJavaHome = firstExistingDir(fallbackJavaHomes);
+const javaHome =
+  isAndroidCompatibleJavaHome(process.env.JAVA_HOME || "")
+    ? process.env.JAVA_HOME
+    : fallbackJavaHome;
 pushCheck(
   "JAVA_HOME",
   Boolean(javaHome) && existsSync(javaHome),
@@ -56,11 +68,12 @@ pushCheck(
   androidHome || "not set",
 );
 
-const ndkHome =
-  process.env.NDK_HOME ||
-  process.env.ANDROID_NDK_HOME ||
-  fallbackNdkHome ||
-  fallbackAndroidNdkHome;
+const ndkHome = firstExistingDir([
+  process.env.NDK_HOME,
+  process.env.ANDROID_NDK_HOME,
+  fallbackNdkHome,
+  fallbackAndroidNdkHome,
+]);
 pushCheck(
   "NDK_HOME",
   Boolean(ndkHome) && existsSync(join(ndkHome, "source.properties")),
@@ -68,7 +81,7 @@ pushCheck(
 );
 
 pushCheck("java", commandExists("java"), commandExists("java") ? "ok" : "missing");
-const javaLooksCompatible = Boolean(javaHome) && !javaHome.includes("temurin-26");
+const javaLooksCompatible = isAndroidCompatibleJavaHome(javaHome);
 pushCheck(
   "Android Java compatibility",
   javaLooksCompatible,

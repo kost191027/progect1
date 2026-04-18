@@ -331,7 +331,7 @@ fn process_exists(pid: u32) -> bool {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
 fn escape_applescript(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
 
@@ -347,12 +347,12 @@ fn escape_applescript(value: &str) -> String {
     escaped
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
 fn run_admin_command(script: &str) -> Result<std::process::Output, String> {
     let osascript_arg = format!(
         "do shell script \"{}\" with administrator privileges",

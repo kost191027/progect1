@@ -39,6 +39,14 @@ function firstExistingDir(candidates) {
   return candidates.find((candidate) => candidate && existsSync(candidate)) || "";
 }
 
+function isAndroidCompatibleJavaHome(javaHome) {
+  if (!javaHome) {
+    return false;
+  }
+
+  return !javaHome.includes("temurin-26");
+}
+
 function resolvePrebuiltBin(ndkHome) {
   const prebuiltRoot = join(ndkHome, "toolchains", "llvm", "prebuilt");
   if (!existsSync(prebuiltRoot)) {
@@ -54,7 +62,11 @@ function resolvePrebuiltBin(ndkHome) {
   return hostDir ? join(hostDir, "bin") : "";
 }
 
-const javaHome = process.env.JAVA_HOME || firstExistingDir(fallbackJavaHomes);
+const fallbackJavaHome = firstExistingDir(fallbackJavaHomes);
+const javaHome =
+  isAndroidCompatibleJavaHome(process.env.JAVA_HOME || "")
+    ? process.env.JAVA_HOME
+    : fallbackJavaHome;
 const androidHome = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || fallbackAndroidHome;
 const ndkHome = firstExistingDir(fallbackNdkHomes);
 
