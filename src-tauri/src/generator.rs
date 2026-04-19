@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use tauri::AppHandle;
+#[cfg(not(target_os = "android"))]
 use tauri_plugin_shell::ShellExt;
 
 use crate::geodata::{
@@ -112,26 +113,55 @@ pub fn select_next_cover_domain(
 }
 
 async fn run_singbox_generate(app: &AppHandle, args: &[&str]) -> Result<String, String> {
-    let sidecar = app
-        .shell()
-        .sidecar("sing-box")
-        .map_err(|e| e.to_string())?
-        .args(args);
+    #[cfg(target_os = "android")]
+    {
+        let singbox_path = crate::resolve_singbox_path(app)?;
+        let singbox_dir = std::path::Path::new(&singbox_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let output = std::process::Command::new(&singbox_path)
+            .current_dir(singbox_dir)
+            .args(args)
+            .output()
+            .map_err(|e| format!("Failed to launch Android sing-box generator: {}", e))?;
 
-    let output = sidecar.output().await.map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let message = if !stderr.is_empty() { stderr } else { stdout };
+            return Err(format!(
+                "sing-box generate {} failed: {}",
+                args.join(" "),
+                message
+            ));
+        }
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(format!(
-            "sing-box generate {} failed: {}",
-            args.join(" "),
-            message
-        ));
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    #[cfg(not(target_os = "android"))]
+    {
+        let sidecar = app
+            .shell()
+            .sidecar("sing-box")
+            .map_err(|e| e.to_string())?
+            .args(args);
+
+        let output = sidecar.output().await.map_err(|e| e.to_string())?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let message = if !stderr.is_empty() { stderr } else { stdout };
+            return Err(format!(
+                "sing-box generate {} failed: {}",
+                args.join(" "),
+                message
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
 }
 
 fn is_hex_string(value: &str) -> bool {

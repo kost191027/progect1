@@ -10,6 +10,7 @@ type ActivityLogSectionProps = {
   defaultOpen?: boolean;
   storageKey?: string;
   onCopyLogs: () => Promise<void>;
+  canCopyLogs?: boolean;
 };
 
 export function ActivityLogSection({
@@ -18,6 +19,7 @@ export function ActivityLogSection({
   defaultOpen = true,
   storageKey,
   onCopyLogs,
+  canCopyLogs = true,
 }: ActivityLogSectionProps) {
   const [showAll, setShowAll] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -81,18 +83,20 @@ export function ActivityLogSection({
               {showAll ? "Show Latest" : `Show All (${logs.length})`}
             </Button>
 
-            <Button
-              variant="secondary"
-              className="px-2.5 py-1 text-[11px] leading-4 normal-case tracking-normal"
-              onClick={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                void onCopyLogs();
-                setCopied(true);
-              }}
-            >
-              {copied ? "Copied!" : "Copy Logs"}
-            </Button>
+            {canCopyLogs ? (
+              <Button
+                variant="secondary"
+                className="px-2.5 py-1 text-[11px] leading-4 normal-case tracking-normal"
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  void onCopyLogs();
+                  setCopied(true);
+                }}
+              >
+                {copied ? "Copied!" : "Copy Logs"}
+              </Button>
+            ) : null}
           </div>
         )}
 

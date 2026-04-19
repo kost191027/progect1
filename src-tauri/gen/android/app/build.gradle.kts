@@ -1,4 +1,6 @@
 import java.util.Properties
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 plugins {
     id("com.android.application")
@@ -56,6 +58,36 @@ android {
 
 rust {
     rootDirRel = "../../../"
+}
+
+val androidBundledSingboxSource = file("../../../bins/sing-box-aarch64-linux-android")
+val androidBundledSingboxTarget =
+    file("src/main/jniLibs/arm64-v8a/libsingbox.so")
+
+tasks.register("prepareAndroidSingboxSidecar") {
+    inputs.file(androidBundledSingboxSource)
+    outputs.file(androidBundledSingboxTarget)
+
+    doLast {
+        if (!androidBundledSingboxSource.exists()) {
+            throw GradleException(
+                "Android sing-box sidecar is missing at ${androidBundledSingboxSource.absolutePath}",
+            )
+        }
+
+        androidBundledSingboxTarget.parentFile.mkdirs()
+        Files.copy(
+            androidBundledSingboxSource.toPath(),
+            androidBundledSingboxTarget.toPath(),
+            StandardCopyOption.REPLACE_EXISTING,
+        )
+        androidBundledSingboxTarget.setReadable(true, false)
+        androidBundledSingboxTarget.setExecutable(true, false)
+    }
+}
+
+tasks.named("preBuild").configure {
+    dependsOn("prepareAndroidSingboxSidecar")
 }
 
 dependencies {

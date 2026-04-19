@@ -94,6 +94,9 @@ const LAST_DEPLOYED_AT_KEY = "rkn.last-deployed-at";
 const APP_ROLE_KEY = "rkn.app-role";
 const SUBORDINATE_HOST_KEY = "rkn.subordinate-host";
 const SUBORDINATE_COVER_DOMAIN_KEY = "rkn.subordinate-cover-domain";
+const SERVER_DRAFT_HOST_KEY = "rkn.server-draft.host";
+const SERVER_DRAFT_USER_KEY = "rkn.server-draft.user";
+const SERVER_DRAFT_PASSWORD_KEY = "rkn.server-draft.password";
 const EMPTY_WARP_PROFILE_STATUS: LocalWarpProfileStatus = {
   has_profile: false,
   endpoint: null,
@@ -184,10 +187,18 @@ export function useControlCenter() {
   const [isStopping, setIsStopping] = useState(false);
   const [guardState, setGuardState] = useState<GuardState>("inactive");
   const [host, setHost] = useState(() => {
-    return window.localStorage.getItem(SUBORDINATE_HOST_KEY) ?? "";
+    return (
+      window.localStorage.getItem(SUBORDINATE_HOST_KEY) ??
+      window.localStorage.getItem(SERVER_DRAFT_HOST_KEY) ??
+      ""
+    );
   });
-  const [user, setUser] = useState("root");
-  const [password, setPassword] = useState("");
+  const [user, setUser] = useState(() => {
+    return window.localStorage.getItem(SERVER_DRAFT_USER_KEY) ?? "root";
+  });
+  const [password, setPassword] = useState(() => {
+    return window.localStorage.getItem(SERVER_DRAFT_PASSWORD_KEY) ?? "";
+  });
   const [savedProfile, setSavedProfile] = useState<SavedServerProfile | null>(null);
   const [currentCoverDomain, setCurrentCoverDomain] = useState<string | null>(() => {
     return window.localStorage.getItem(SUBORDINATE_COVER_DOMAIN_KEY);
@@ -268,6 +279,18 @@ export function useControlCenter() {
       unlisten.then((cleanup) => cleanup());
     };
   }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(SERVER_DRAFT_HOST_KEY, host);
+  }, [host]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SERVER_DRAFT_USER_KEY, user);
+  }, [user]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SERVER_DRAFT_PASSWORD_KEY, password);
+  }, [password]);
 
   useEffect(() => {
     const unlisten = listen<InviteRemoteSyncEvent>("invite-remote-sync", (event) => {
@@ -1069,6 +1092,13 @@ export function useControlCenter() {
   }
 
   async function copyLogs() {
+    if (isAndroidRuntime) {
+      appendLog(
+        "[WARN] Copy Logs is not available on Android yet. Use the visible log stream on the phone for now.",
+      );
+      return;
+    }
+
     try {
       await copyTextToClipboard(logs.join("\n"));
       appendLog("[SYSTEM] Log stream copied to clipboard.");
@@ -1128,6 +1158,9 @@ export function useControlCenter() {
       window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
       window.localStorage.removeItem(LAST_DEPLOYED_AT_KEY);
       window.localStorage.removeItem(HAS_COMPLETED_FIRST_START_KEY);
+      window.localStorage.removeItem(SERVER_DRAFT_HOST_KEY);
+      window.localStorage.removeItem(SERVER_DRAFT_USER_KEY);
+      window.localStorage.removeItem(SERVER_DRAFT_PASSWORD_KEY);
       setLocalDataResetMessage(
         `Local data reset completed. ${isAndroidRuntime ? "This phone" : "This Mac"} is back in a clean state and ready for a fresh Deploy.`,
       );

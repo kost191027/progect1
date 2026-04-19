@@ -1,3 +1,7 @@
+#[cfg(target_os = "android")]
+use jni::objects::{JObject, JValue};
+#[cfg(target_os = "android")]
+use jni::JavaVM;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::io::Write;
 #[cfg(any(target_os = "windows", target_os = "android"))]
@@ -29,6 +33,8 @@ mod ssh;
 
 #[cfg(desktop)]
 const TRAY_ICON: Image<'_> = tauri::include_image!("./icons/tray-icon.png");
+#[cfg(target_os = "android")]
+const ANDROID_SINGBOX_BYTES: &[u8] = include_bytes!("../bins/sing-box-aarch64-linux-android");
 
 struct AppState {
     /// PID процесса sing-box, запущенного root-правами через osascript
@@ -60,6 +66,11 @@ struct WindowsRuntimeModeStatus {
 fn tunnel_pid_path(app: &AppHandle) -> Result<PathBuf, String> {
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     Ok(local_data.join("active_tunnel_pid"))
+}
+
+#[cfg(target_os = "android")]
+fn android_service_pid_path() -> Result<PathBuf, String> {
+    Ok(android_files_dir_path()?.join("active_tunnel_pid"))
 }
 
 #[cfg(target_os = "windows")]
@@ -133,14 +144,44 @@ fn save_tunnel_pid(app: &AppHandle, pid: u32) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    fs::write(pid_path, pid.to_string()).map_err(|e| e.to_string())
+    fs::write(&pid_path, pid.to_string()).map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "android")]
+    {
+        let service_pid_path = android_service_pid_path()?;
+        if let Some(parent) = service_pid_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::write(service_pid_path, pid.to_string()).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 fn load_saved_tunnel_pid(app: &AppHandle) -> Result<Option<u32>, String> {
     let pid_path = tunnel_pid_path(app)?;
 
     if !pid_path.exists() {
-        return Ok(None);
+        #[cfg(target_os = "android")]
+        {
+            let service_pid_path = android_service_pid_path()?;
+            if !service_pid_path.exists() {
+                return Ok(None);
+            }
+
+            let pid_raw = fs::read_to_string(service_pid_path).map_err(|e| e.to_string())?;
+            let pid = pid_raw
+                .trim()
+                .parse::<u32>()
+                .map_err(|e| format!("Failed to parse saved tunnel PID: {}", e))?;
+
+            return Ok(Some(pid));
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            return Ok(None);
+        }
     }
 
     let pid_raw = fs::read_to_string(pid_path).map_err(|e| e.to_string())?;
@@ -154,6 +195,11 @@ fn load_saved_tunnel_pid(app: &AppHandle) -> Result<Option<u32>, String> {
 
 fn clear_saved_tunnel_pid(app: &AppHandle) {
     if let Ok(pid_path) = tunnel_pid_path(app) {
+        let _ = fs::remove_file(pid_path);
+    }
+
+    #[cfg(target_os = "android")]
+    if let Ok(pid_path) = android_service_pid_path() {
         let _ = fs::remove_file(pid_path);
     }
 }
@@ -499,7 +545,19 @@ fn tunnel_log_path() -> &'static str {
         })
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "android")]
+    {
+        static LOG_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        LOG_PATH.get_or_init(|| {
+            android_files_dir_path()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("rkn-tun.log")
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "android")))]
     {
         "/tmp/rkn-tun.log"
     }
@@ -1184,7 +1242,7 @@ fn current_singbox_target_triple() -> Result<&'static str, String> {
 }
 
 /// Находит абсолютный путь до sidecar-бинарника `sing-box`
-fn resolve_singbox_path(app: &AppHandle) -> Result<String, String> {
+pub(crate) fn resolve_singbox_path(app: &AppHandle) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
         return resolve_android_singbox_path(app);
@@ -1231,61 +1289,61 @@ fn resolve_singbox_path(app: &AppHandle) -> Result<String, String> {
 fn resolve_android_singbox_path(app: &AppHandle) -> Result<String, String> {
     use std::os::unix::fs::PermissionsExt;
 
-    let target_triple = current_singbox_target_triple()?;
+    let native_library_dir = with_android_activity(|env, activity| {
+        let bridge = find_android_app_class(env, &activity, "com.freedom.rkn.AndroidVpnBridge")?;
+        let value = env
+            .call_static_method(
+                bridge,
+                "getNativeLibraryDir",
+                "(Landroid/content/Context;)Ljava/lang/String;",
+                &[JValue::Object(&activity)],
+            )
+            .map_err(|e| format!("Failed to resolve Android native library dir: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android native library dir: {}", e))?;
+        let java_string = jni::objects::JString::from(value);
+        let resolved = env
+            .get_string(&java_string)
+            .map_err(|e| format!("Failed to read Android native library dir: {}", e))?
+            .to_string_lossy()
+            .into_owned();
+        Ok(resolved)
+    })?;
+
+    if !native_library_dir.trim().is_empty() {
+        for candidate in ["libsingbox.so", "sing-box"] {
+            let path = std::path::Path::new(&native_library_dir).join(candidate);
+            if path.exists() {
+                let mut perms = std::fs::metadata(&path)
+                    .map_err(|e| {
+                        format!(
+                            "Failed to stat Android native sidecar {}: {}",
+                            path.display(),
+                            e
+                        )
+                    })?
+                    .permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(&path, perms);
+                return Ok(path.to_string_lossy().to_string());
+            }
+        }
+    }
+
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     let sidecar_dir = local_data.join("sidecars");
     std::fs::create_dir_all(&sidecar_dir).map_err(|e| {
         format!(
-            "Failed to create Android sidecar directory {}: {}",
+            "Failed to create Android fallback sidecar directory {}: {}",
             sidecar_dir.display(),
             e
         )
     })?;
 
-    let extracted_path = sidecar_dir.join(format!("sing-box-{}", target_triple));
-    if extracted_path.exists() {
-        let mut perms = std::fs::metadata(&extracted_path)
-            .map_err(|e| {
-                format!(
-                    "Failed to stat Android sidecar {}: {}",
-                    extracted_path.display(),
-                    e
-                )
-            })?
-            .permissions();
-        perms.set_mode(0o755);
-        let _ = std::fs::set_permissions(&extracted_path, perms);
-        return Ok(extracted_path.to_string_lossy().to_string());
-    }
-
-    let mut source_candidates = Vec::new();
-
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        source_candidates.push(resource_dir.join(format!("sing-box-{}", target_triple)));
-        source_candidates.push(resource_dir.join("sing-box"));
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            source_candidates.push(dir.join(format!("sing-box-{}", target_triple)));
-            source_candidates.push(dir.join("sing-box"));
-        }
-    }
-
-    let source_path = source_candidates
-        .into_iter()
-        .find(|candidate| candidate.exists())
-        .ok_or_else(|| {
-            format!(
-                "Android sing-box sidecar was not found. Expected bundled binary for {}.",
-                target_triple
-            )
-        })?;
-
-    std::fs::copy(&source_path, &extracted_path).map_err(|e| {
+    let extracted_path = sidecar_dir.join("sing-box-aarch64-linux-android");
+    std::fs::write(&extracted_path, ANDROID_SINGBOX_BYTES).map_err(|e| {
         format!(
-            "Failed to extract Android sidecar from {} to {}: {}",
-            source_path.display(),
+            "Android native sidecar was not packaged, and the embedded fallback could not be written to {}: {}",
             extracted_path.display(),
             e
         )
@@ -1294,20 +1352,14 @@ fn resolve_android_singbox_path(app: &AppHandle) -> Result<String, String> {
     let mut perms = std::fs::metadata(&extracted_path)
         .map_err(|e| {
             format!(
-                "Failed to stat extracted Android sidecar {}: {}",
+                "Failed to stat extracted Android fallback sidecar {}: {}",
                 extracted_path.display(),
                 e
             )
         })?
         .permissions();
     perms.set_mode(0o755);
-    std::fs::set_permissions(&extracted_path, perms).map_err(|e| {
-        format!(
-            "Failed to mark Android sidecar executable {}: {}",
-            extracted_path.display(),
-            e
-        )
-    })?;
+    let _ = std::fs::set_permissions(&extracted_path, perms);
 
     Ok(extracted_path.to_string_lossy().to_string())
 }
@@ -1694,6 +1746,154 @@ async fn launch_tunnel_process_windows_compatibility(
         })?;
 
     Ok(child.id())
+}
+
+#[cfg(target_os = "android")]
+fn with_android_activity<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce(&mut jni::JNIEnv<'_>, JObject<'_>) -> Result<T, String>,
+{
+    let android_context = ndk_context::android_context();
+    let vm_ptr = android_context.vm();
+    let activity_ptr = android_context.context();
+
+    if vm_ptr.is_null() || activity_ptr.is_null() {
+        return Err("Android runtime context is unavailable.".to_string());
+    }
+
+    let vm = unsafe { JavaVM::from_raw(vm_ptr.cast()) }
+        .map_err(|e| format!("Failed to access Android JavaVM: {}", e))?;
+    let result = {
+        let mut env = vm
+            .attach_current_thread()
+            .map_err(|e| format!("Failed to attach Android thread to JVM: {}", e))?;
+        let activity = unsafe { JObject::from_raw(activity_ptr.cast()) };
+        f(&mut env, activity)
+    };
+    std::mem::forget(vm);
+    result
+}
+
+#[cfg(target_os = "android")]
+fn android_files_dir_path() -> Result<PathBuf, String> {
+    with_android_activity(|env, activity| {
+        let files_dir = env
+            .call_method(&activity, "getFilesDir", "()Ljava/io/File;", &[])
+            .map_err(|e| format!("Failed to access Android filesDir: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android filesDir handle: {}", e))?;
+        let absolute_path = env
+            .call_method(&files_dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
+            .map_err(|e| format!("Failed to resolve Android filesDir path: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android filesDir path: {}", e))?;
+        let java_string = jni::objects::JString::from(absolute_path);
+        let resolved = env
+            .get_string(&java_string)
+            .map_err(|e| format!("Failed to read Android filesDir path: {}", e))?
+            .to_string_lossy()
+            .into_owned();
+
+        Ok(PathBuf::from(resolved))
+    })
+}
+
+#[cfg(target_os = "android")]
+fn find_android_app_class<'a>(
+    env: &mut jni::JNIEnv<'a>,
+    activity: &JObject<'a>,
+    class_name: &str,
+) -> Result<jni::objects::JClass<'a>, String> {
+    let class_loader = env
+        .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+        .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+        .l()
+        .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+    let class_name_java = env
+        .new_string(class_name)
+        .map_err(|e| format!("Failed to allocate Android class name string: {}", e))?;
+    let loaded_class = env
+        .call_method(
+            &class_loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&JObject::from(class_name_java))],
+        )
+        .map_err(|e| format!("Failed to load Android app class {}: {}", class_name, e))?
+        .l()
+        .map_err(|e| format!("Failed to decode Android app class {}: {}", class_name, e))?;
+
+    Ok(jni::objects::JClass::from(loaded_class))
+}
+
+#[cfg(target_os = "android")]
+fn android_vpn_permission_granted() -> Result<bool, String> {
+    with_android_activity(|env, activity| {
+        let bridge = find_android_app_class(env, &activity, "com.freedom.rkn.AndroidVpnBridge")?;
+        let granted = env
+            .call_static_method(
+                bridge,
+                "isVpnPermissionGranted",
+                "(Landroid/content/Context;)Z",
+                &[JValue::Object(&activity)],
+            )
+            .map_err(|e| format!("Failed to query Android VPN permission state: {}", e))?
+            .z()
+            .map_err(|e| format!("Failed to decode Android VPN permission state: {}", e))?;
+
+        Ok(granted)
+    })
+}
+
+#[cfg(target_os = "android")]
+fn request_android_vpn_permission() -> Result<bool, String> {
+    with_android_activity(|env, activity| {
+        let bridge = find_android_app_class(env, &activity, "com.freedom.rkn.AndroidVpnBridge")?;
+        let already_granted = env
+            .call_static_method(
+                bridge,
+                "requestVpnPermission",
+                "(Landroid/app/Activity;)Z",
+                &[JValue::Object(&activity)],
+            )
+            .map_err(|e| format!("Failed to request Android VPN permission: {}", e))?
+            .z()
+            .map_err(|e| format!("Failed to decode Android VPN permission result: {}", e))?;
+
+        Ok(already_granted)
+    })
+}
+
+#[cfg(target_os = "android")]
+fn start_android_tunnel_service() -> Result<(), String> {
+    with_android_activity(|env, activity| {
+        let bridge = find_android_app_class(env, &activity, "com.freedom.rkn.AndroidVpnBridge")?;
+        env.call_static_method(
+            bridge,
+            "startTunnelService",
+            "(Landroid/content/Context;)V",
+            &[JValue::Object(&activity)],
+        )
+        .map_err(|e| format!("Failed to start Android tunnel service: {}", e))?;
+
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "android")]
+fn stop_android_tunnel_service() -> Result<(), String> {
+    with_android_activity(|env, activity| {
+        let bridge = find_android_app_class(env, &activity, "com.freedom.rkn.AndroidVpnBridge")?;
+        env.call_static_method(
+            bridge,
+            "stopTunnelService",
+            "(Landroid/content/Context;)V",
+            &[JValue::Object(&activity)],
+        )
+        .map_err(|e| format!("Failed to stop Android tunnel service: {}", e))?;
+
+        Ok(())
+    })
 }
 
 #[cfg(target_os = "android")]
@@ -2243,6 +2443,8 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
                 );
                 #[cfg(target_os = "windows")]
                 let _ = clear_windows_system_proxy();
+                #[cfg(target_os = "android")]
+                let _ = stop_android_tunnel_service();
                 emit_tunnel_state(&app, false);
                 emit_guard_state(&app, "inactive");
                 break;
@@ -2439,8 +2641,39 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
     ssh::ensure_local_transport_is_current(&app).await?;
     crate::geodata::ensure_local_client_rule_sets(&app).await?;
 
+    #[cfg(target_os = "android")]
+    {
+        if !android_vpn_permission_granted()? {
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Android VPN permission is required before protection can start. Opening the system prompt now.".to_string(),
+            );
+
+            if !request_android_vpn_permission()? {
+                return Err(
+                    "Android VPN permission requested. Approve it in the system dialog, then tap Start Protection again."
+                        .to_string(),
+                );
+            }
+        }
+
+        start_android_tunnel_service()?;
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Android VPN service anchor is active. Starting the local core next."
+                .to_string(),
+        );
+    }
+
     let _ = app.emit("tunnel-log", "[SYSTEM] Resolving core binary path...");
-    let pid = launch_tunnel_process(&app, true).await?;
+    let pid = match launch_tunnel_process(&app, true).await {
+        Ok(pid) => pid,
+        Err(error) => {
+            #[cfg(target_os = "android")]
+            let _ = stop_android_tunnel_service();
+            return Err(error);
+        }
+    };
 
     #[cfg(target_os = "windows")]
     let runtime_mode = load_windows_runtime_mode(&app)?;
@@ -2450,7 +2683,12 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         format!("[SYSTEM] Core process started with PID {}.", pid),
     );
 
-    verify_tunnel_start(&app, &state, pid, tunnel_log_path()).await?;
+    verify_tunnel_start(&app, &state, pid, tunnel_log_path())
+        .await
+        .inspect_err(|_| {
+            #[cfg(target_os = "android")]
+            let _ = stop_android_tunnel_service();
+        })?;
     spawn_log_reader(app.clone(), pid, tunnel_log_path());
     spawn_process_exit_monitor(app.clone(), pid);
     spawn_network_recovery_monitor(app.clone(), pid);
@@ -2468,6 +2706,14 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
 
     #[cfg(not(target_os = "windows"))]
     {
+        #[cfg(target_os = "android")]
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Android protection runtime is active. The VPN service anchor and local core are now running."
+                .to_string(),
+        );
+
+        #[cfg(not(target_os = "android"))]
         let _ = app.emit(
             "tunnel-log",
             "[SYSTEM] TUN adapter initialized. Routing active.".to_string(),
@@ -2511,6 +2757,8 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             reset_guard_state(&state);
             #[cfg(target_os = "windows")]
             let _ = clear_windows_system_proxy();
+            #[cfg(target_os = "android")]
+            let _ = stop_android_tunnel_service();
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
             refresh_tray_toggle_item(&app);
@@ -2528,6 +2776,8 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             reset_guard_state(&state);
             #[cfg(target_os = "windows")]
             let _ = clear_windows_system_proxy();
+            #[cfg(target_os = "android")]
+            let _ = stop_android_tunnel_service();
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
             refresh_tray_toggle_item(&app);
