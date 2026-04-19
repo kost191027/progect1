@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { Button } from "../../../shared/ui/button";
+import { SETTINGS_PANEL_ICONS } from "../../../shared/lib/settings-panel-icons";
 import { Panel } from "../../../shared/ui/panel";
 
 type DiagnosticsActionsPanelProps = {
@@ -12,6 +13,9 @@ type DiagnosticsActionsPanelProps = {
   diagnosticsTone: "neutral" | "ready" | "attention";
   currentCoverDomain: string | null;
   availableCoverDomains: string[];
+  collapsible?: boolean;
+  defaultOpen?: boolean;
+  storageKey?: string;
   onCheckStatus: () => void;
   onRotateSni: (domain: string) => void;
 };
@@ -25,6 +29,9 @@ export function DiagnosticsActionsPanel({
   diagnosticsTone,
   currentCoverDomain,
   availableCoverDomains,
+  collapsible,
+  defaultOpen,
+  storageKey,
   onCheckStatus,
   onRotateSni,
 }: DiagnosticsActionsPanelProps) {
@@ -74,6 +81,10 @@ export function DiagnosticsActionsPanel({
       title="Diagnostics"
       subtitle="Use these actions when you need extra server details or want to switch the active cover domain."
       className="bg-[#161616]"
+      collapsible={collapsible}
+      defaultOpen={defaultOpen}
+      storageKey={storageKey}
+      iconSrc={collapsible ? SETTINGS_PANEL_ICONS.diagnostics : undefined}
     >
       <div className="flex flex-col gap-3">
         <div

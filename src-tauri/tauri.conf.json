@@ -13,8 +13,11 @@
     "windows": [
       {
         "title": "RKN",
-        "width": 800,
-        "height": 600
+        "width": 430,
+        "height": 720,
+        "minWidth": 390,
+        "minHeight": 640,
+        "center": true
       }
     ],
     "security": {

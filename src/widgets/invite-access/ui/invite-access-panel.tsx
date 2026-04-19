@@ -4,10 +4,12 @@ import type {
   IssuedInviteLink,
 } from "../../../features/control-center/model/use-control-center";
 import { Button } from "../../../shared/ui/button";
+import { SETTINGS_PANEL_ICONS } from "../../../shared/lib/settings-panel-icons";
 import { Panel } from "../../../shared/ui/panel";
 
 type InviteAccessPanelProps = {
   appRole: AppRole;
+  isAndroidRuntime?: boolean;
   host: string;
   canPasteInviteLink?: boolean;
   currentCoverDomain: string | null;
@@ -23,6 +25,9 @@ type InviteAccessPanelProps = {
   inviteSyncMessage: string | null;
   inviteSyncTone: "pending" | "warning" | null;
   resetSuccessMessage: string | null;
+  collapsible?: boolean;
+  defaultOpen?: boolean;
+  storageKey?: string;
   onGenerateInvite: () => void;
   onEnterInvite: () => void;
   onResetLocalData: () => void;
@@ -32,6 +37,7 @@ type InviteAccessPanelProps = {
 
 export function InviteAccessPanel({
   appRole,
+  isAndroidRuntime = false,
   host,
   canPasteInviteLink = true,
   currentCoverDomain,
@@ -47,6 +53,9 @@ export function InviteAccessPanel({
   inviteSyncMessage,
   inviteSyncTone,
   resetSuccessMessage,
+  collapsible,
+  defaultOpen,
+  storageKey,
   onGenerateInvite,
   onEnterInvite,
   onResetLocalData,
@@ -56,18 +65,30 @@ export function InviteAccessPanel({
   const isMaster = appRole === "master";
   const [isInviteListCollapsed, setIsInviteListCollapsed] = useState(false);
   const subtitle = isMaster
-    ? "Create a share link for another installation without exposing SSH credentials."
-    : "This installation is linked to a master app and receives its client configuration through invite links.";
+    ? isAndroidRuntime
+      ? "Create a phone link without exposing SSH credentials."
+      : "Create a share link for another installation without exposing SSH credentials."
+    : isAndroidRuntime
+      ? "This phone is linked to a master app and receives its client configuration through invite links."
+      : "This installation is linked to a master app and receives its client configuration through invite links.";
 
   return (
     <Panel
-      title={isMaster ? "Share Access" : "Linked Access"}
+      title={
+        isMaster
+          ? "Access Links"
+          : "Linked Access"
+      }
       subtitle={subtitle}
       className={
         requiresInviteRefresh && !isMaster
           ? "border-amber-900/50 bg-amber-950/15"
           : "bg-[#161616]"
       }
+      collapsible={collapsible}
+      defaultOpen={defaultOpen}
+      storageKey={storageKey}
+      iconSrc={collapsible ? SETTINGS_PANEL_ICONS.shareAccess : undefined}
     >
       <div className="flex flex-col gap-4">
         <div className="space-y-2">
@@ -75,14 +96,23 @@ export function InviteAccessPanel({
             {isMaster ? "Current source" : "Current link"}
           </div>
           <div className="text-sm font-semibold text-zinc-100">
-            {host || (isMaster ? "Deploy a server first" : "Awaiting an invite link")}
+            {host ||
+              (isMaster
+                ? "Deploy a server first"
+                : isAndroidRuntime
+                  ? "Awaiting a phone link"
+                  : "Awaiting an invite link")}
           </div>
           <p className="text-sm leading-6 text-zinc-400">
             {currentCoverDomain
               ? `Active cover domain: ${currentCoverDomain}`
               : isMaster
-                ? "A share link can be created after the app has an active remote transport."
-                : "Paste an invite link from the master app to install a client config on this device."}
+                ? isAndroidRuntime
+                  ? "A phone link can be created after the app has an active remote transport."
+                  : "A share link can be created after the app has an active remote transport."
+                : isAndroidRuntime
+                  ? "Paste a phone link from the master app to install a client config on this phone."
+                  : "Paste an invite link from the master app to install a client config on this device."}
           </p>
           {requiresInviteRefresh && !isMaster ? (
             <p className="text-sm leading-6 text-amber-200">
@@ -108,12 +138,18 @@ export function InviteAccessPanel({
                 onClick={onGenerateInvite}
               >
                 {isGeneratingInvite
-                  ? "Creating Invite..."
+                  ? isAndroidRuntime
+                    ? "Creating Link..."
+                    : "Creating Invite..."
                   : primaryInviteCopied
                     ? "Copied"
                     : issuedInviteLinks.length > 0
-                      ? "Create New Invite"
-                      : "Create Invite Link"}
+                      ? isAndroidRuntime
+                        ? "Create New Link"
+                        : "Create New Invite"
+                      : isAndroidRuntime
+                        ? "Create Phone Link"
+                        : "Create Invite Link"}
               </Button>
               <Button
                 variant="secondary"
@@ -122,7 +158,11 @@ export function InviteAccessPanel({
                 disabled={isImportingInvite || !canPasteInviteLink}
                 onClick={onEnterInvite}
               >
-                {canPasteInviteLink ? "Paste Invite Link" : "Reset To Relink"}
+                {canPasteInviteLink
+                  ? isAndroidRuntime
+                    ? "Paste Phone Link"
+                    : "Paste Invite Link"
+                  : "Reset To Relink"}
               </Button>
             </div>
             {!canPasteInviteLink ? (
@@ -145,7 +185,7 @@ export function InviteAccessPanel({
             <div className="rounded-2xl border border-zinc-800 bg-[#111212] px-4 py-4">
               <div className="flex items-center justify-between gap-3">
                 <div className="text-[11px] font-bold uppercase tracking-[0.22em] text-zinc-500">
-                  Issued invite links
+                  {isAndroidRuntime ? "Issued phone links" : "Issued invite links"}
                 </div>
                 {issuedInviteLinks.length > 0 ? (
                   <button
@@ -211,7 +251,9 @@ export function InviteAccessPanel({
                 </div>
               ) : (
                 <p className="mt-3 text-sm leading-6 text-zinc-400">
-                  No invite links have been issued yet on this master app.
+                  {isAndroidRuntime
+                    ? "No phone links have been issued yet on this master app."
+                    : "No invite links have been issued yet on this master app."}
                 </p>
               )}
             </div>
@@ -226,7 +268,13 @@ export function InviteAccessPanel({
                 disabled={isImportingInvite}
                 onClick={onEnterInvite}
               >
-                {requiresInviteRefresh ? "Paste Fresh Invite Link" : "Enter Invite Link"}
+                {requiresInviteRefresh
+                  ? isAndroidRuntime
+                    ? "Paste Fresh Link"
+                    : "Paste Fresh Invite Link"
+                  : isAndroidRuntime
+                    ? "Enter Phone Link"
+                    : "Enter Invite Link"}
               </Button>
               <Button
                 variant="danger"
@@ -235,7 +283,7 @@ export function InviteAccessPanel({
                 disabled={isImportingInvite}
                 onClick={onResetLocalData}
               >
-                Unlink This App
+                {isAndroidRuntime ? "Unlink This Phone" : "Unlink This App"}
               </Button>
             </div>
             {inviteImportSuccessMessage ? (

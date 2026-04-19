@@ -2,6 +2,7 @@ import type {
   GuardState,
   StatusSummary,
 } from "../../../features/control-center/model/use-control-center";
+import { SETTINGS_PANEL_ICONS } from "../../../shared/lib/settings-panel-icons";
 import { Panel } from "../../../shared/ui/panel";
 import { StatusBadge } from "../../../shared/ui/status-badge";
 
@@ -9,6 +10,10 @@ type SystemStatusPanelProps = {
   isRunning: boolean;
   guardState: GuardState;
   statusSummary: StatusSummary;
+  isAndroidRuntime?: boolean;
+  collapsible?: boolean;
+  defaultOpen?: boolean;
+  storageKey?: string;
 };
 
 const toneClasses: Record<StatusSummary["state"], string> = {
@@ -24,12 +29,30 @@ export function SystemStatusPanel({
   isRunning,
   guardState,
   statusSummary,
+  isAndroidRuntime = false,
+  collapsible,
+  defaultOpen,
+  storageKey,
 }: SystemStatusPanelProps) {
   return (
     <Panel
-      title="Status"
-      subtitle="The app keeps a simple summary here so the main state is visible without reading the raw log stream."
+      title="Connection Status"
+      subtitle={
+        isAndroidRuntime
+          ? "The phone keeps a simple summary here so you can see whether protection is on without reading the activity log."
+          : "The app keeps a simple summary here so the main state is visible without reading the raw log stream."
+      }
       className="bg-[#1a1a1a]"
+      collapsible={collapsible}
+      defaultOpen={defaultOpen}
+      storageKey={storageKey}
+      iconSrc={
+        collapsible
+          ? isRunning
+            ? SETTINGS_PANEL_ICONS.statusOn
+            : SETTINGS_PANEL_ICONS.statusOff
+          : undefined
+      }
     >
       <div className="flex flex-col gap-4">
         <div
@@ -37,7 +60,7 @@ export function SystemStatusPanel({
         >
           <div>
             <div className="text-xs font-bold uppercase tracking-wider text-zinc-500">
-              Current state
+              {isAndroidRuntime ? "Current phone state" : "Current state"}
             </div>
             <div className="mt-1 text-base font-semibold text-white">{statusSummary.title}</div>
             <p className="mt-2 max-w-xl text-sm leading-6 text-zinc-300">{statusSummary.description}</p>
@@ -56,7 +79,13 @@ export function SystemStatusPanel({
           <div className="rounded-xl border border-zinc-800 bg-[#181818] px-4 py-3 text-sm">
             <div className="text-xs font-bold uppercase tracking-wider text-zinc-500">Core</div>
             <div className="mt-1 font-semibold text-white">
-              {isRunning ? "Tunnel running" : "Tunnel stopped"}
+              {isRunning
+                ? isAndroidRuntime
+                  ? "Protection running"
+                  : "Tunnel running"
+                : isAndroidRuntime
+                  ? "Protection stopped"
+                  : "Tunnel stopped"}
             </div>
           </div>
 

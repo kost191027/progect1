@@ -1,5 +1,7 @@
 import { Button } from "../../../shared/ui/button";
 import { Input } from "../../../shared/ui/input";
+import { getLocalDeviceReference } from "../../../shared/lib/runtime-platform";
+import { SETTINGS_PANEL_ICONS } from "../../../shared/lib/settings-panel-icons";
 import { Panel } from "../../../shared/ui/panel";
 import type { WindowsRuntimeMode } from "../../../features/control-center/model/use-control-center";
 
@@ -23,6 +25,9 @@ type ServerSetupPanelProps = {
   warpProfileInput: string;
   warpProfileMessage: string | null;
   resetSuccessMessage: string | null;
+  collapsible?: boolean;
+  defaultOpen?: boolean;
+  storageKey?: string;
   onHostChange: (value: string) => void;
   onUserChange: (value: string) => void;
   onPasswordChange: (value: string) => void;
@@ -55,6 +60,9 @@ export function ServerSetupPanel({
   warpProfileInput,
   warpProfileMessage,
   resetSuccessMessage,
+  collapsible,
+  defaultOpen,
+  storageKey,
   onHostChange,
   onUserChange,
   onPasswordChange,
@@ -66,11 +74,17 @@ export function ServerSetupPanel({
   onImportWarpProfile,
   onClearWarpProfile,
 }: ServerSetupPanelProps) {
+  const localDeviceReference = getLocalDeviceReference();
+
   return (
     <Panel
       title="Server Access"
       subtitle="Save the server address and credentials locally, then deploy or update the node from here."
       className="bg-[#1a1a1a]"
+      collapsible={collapsible}
+      defaultOpen={defaultOpen}
+      storageKey={storageKey}
+      iconSrc={collapsible ? SETTINGS_PANEL_ICONS.serverAccess : undefined}
     >
       <div className="flex flex-col gap-4">
         <div className="flex flex-col gap-3">
@@ -210,7 +224,11 @@ export function ServerSetupPanel({
             <Button
               variant="primary"
               fullWidth
-              title={hasLocalWarpProfile ? "Your local WARP profile is already created on this Mac." : undefined}
+              title={
+                hasLocalWarpProfile
+                  ? `Your local WARP profile is already created on ${localDeviceReference}.`
+                  : undefined
+              }
               disabled={
                 isDeploying ||
                 isResettingLocalData ||
@@ -245,7 +263,7 @@ export function ServerSetupPanel({
 
           <textarea
             rows={7}
-            placeholder="Paste a personal WARP profile here when you want deploys to reuse it on this Mac."
+            placeholder={`Paste a personal WARP profile here when you want deploys to reuse it on ${localDeviceReference}.`}
             value={warpProfileInput}
             onChange={(event) => onWarpProfileInputChange(event.target.value)}
             className="mt-4 w-full rounded-2xl border border-zinc-700 bg-[#101111] px-4 py-3 text-sm leading-6 text-white placeholder:text-zinc-600 transition-colors focus:border-zinc-500 focus:outline-none"

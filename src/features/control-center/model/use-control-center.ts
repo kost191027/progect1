@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useState } from "react";
+import { getLocalDeviceReference, isAndroidClient } from "../../../shared/lib/runtime-platform";
 
 export type GuardState = "inactive" | "active" | "engaged";
 export type UserFacingState =
@@ -169,6 +170,8 @@ function latestLogMatching(logs: string[], marker: string) {
 }
 
 export function useControlCenter() {
+  const localDeviceReference = getLocalDeviceReference();
+  const isAndroidRuntime = isAndroidClient();
   const [isRunning, setIsRunning] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
@@ -684,7 +687,7 @@ export function useControlCenter() {
 
     if (!profile) {
       appendLog(
-        "[MAIN ERROR] No saved server profile is available on this Mac. Re-enter the server details before refreshing the configuration.",
+        `[MAIN ERROR] No saved server profile is available on ${localDeviceReference}. Re-enter the server details before refreshing the configuration.`,
       );
       return;
     }
@@ -915,7 +918,7 @@ export function useControlCenter() {
       setLocalWarpProfileStatus(status);
       setWarpProfileInput("");
       setWarpProfileMessage(
-        "Local WARP profile created automatically from the current server. Future deploys on this Mac will reuse it first.",
+        `Local WARP profile created automatically from the current server. Future deploys on ${localDeviceReference} will reuse it first.`,
       );
       appendLog(
         "[SYSTEM] Local WARP profile created automatically from the current server.",
@@ -940,9 +943,9 @@ export function useControlCenter() {
       setLocalWarpProfileStatus(EMPTY_WARP_PROFILE_STATUS);
       setWarpProfileInput("");
       setWarpProfileMessage(
-        "Imported WARP profile removed from this Mac. Future deploys will use automatic bootstrap unless you import a profile again.",
+        `Imported WARP profile removed from ${localDeviceReference}. Future deploys will use automatic bootstrap unless you import a profile again.`,
       );
-      appendLog("[SYSTEM] Imported local WARP profile removed from this Mac.");
+      appendLog(`[SYSTEM] Imported local WARP profile removed from ${localDeviceReference}.`);
     } catch (error) {
       appendLog(`[MAIN ERROR] Failed to clear the local WARP profile: ${error}`);
     } finally {
@@ -1083,7 +1086,7 @@ export function useControlCenter() {
     setWarpProfileMessage(null);
     setLocalDataResetMessage(null);
     setLastUserMessage(
-      "Removing the saved local server profile, client config, and imported WARP profile from this Mac.",
+      `Removing the saved local server profile, client config, and imported WARP profile from ${localDeviceReference}.`,
     );
     appendLog("--- RESETTING LOCAL APP DATA ---");
 
@@ -1126,12 +1129,12 @@ export function useControlCenter() {
       window.localStorage.removeItem(LAST_DEPLOYED_AT_KEY);
       window.localStorage.removeItem(HAS_COMPLETED_FIRST_START_KEY);
       setLocalDataResetMessage(
-        "Local data reset completed. This Mac is back in a clean state and ready for a fresh Deploy.",
+        `Local data reset completed. ${isAndroidRuntime ? "This phone" : "This Mac"} is back in a clean state and ready for a fresh Deploy.`,
       );
       closeInviteLinkModal();
       appendLog("[SYSTEM] Local data reset completed.");
       setLastUserMessage(
-        "Local server profile, client config, and imported WARP profile were removed from this Mac. Enter server details again to deploy a fresh config.",
+        `Local server profile, client config, and imported WARP profile were removed from ${localDeviceReference}. Enter server details again to deploy a fresh config.`,
       );
     } catch (error) {
       appendLog(`[MAIN ERROR] Local data reset failed: ${error}`);
@@ -1168,16 +1171,20 @@ export function useControlCenter() {
     if (isDeploying) {
       return {
         state: "deploying",
-        title: "Deploying server",
-        description: "The app is connecting over SSH, updating the transport stack, and preparing a fresh client config.",
+        title: isAndroidRuntime ? "Syncing phone with server" : "Deploying server",
+        description: isAndroidRuntime
+          ? "The phone is connecting over SSH, updating the transport stack, and preparing a fresh mobile client config."
+          : "The app is connecting over SSH, updating the transport stack, and preparing a fresh client config.",
       };
     }
 
     if (isStarting) {
       return {
         state: "connecting",
-        title: "Starting tunnel",
-        description: "The app is requesting permissions, launching sing-box, and waiting for the tunnel to become active.",
+        title: isAndroidRuntime ? "Starting protection" : "Starting tunnel",
+        description: isAndroidRuntime
+          ? "The phone is preparing permissions, launching sing-box, and waiting for protection to become active."
+          : "The app is requesting permissions, launching sing-box, and waiting for the tunnel to become active.",
       };
     }
 
@@ -1186,7 +1193,9 @@ export function useControlCenter() {
         state: "engaged",
         title: "Protection degraded",
         description:
-          "The proxy path is unhealthy. Safe direct routes may still work, while protected traffic stays blocked instead of leaking.",
+          isAndroidRuntime
+            ? "The proxy path is unhealthy. Some safe direct routes may still work, while protected phone traffic stays blocked instead of leaking."
+            : "The proxy path is unhealthy. Safe direct routes may still work, while protected traffic stays blocked instead of leaking.",
       };
     }
 
@@ -1194,25 +1203,31 @@ export function useControlCenter() {
       return {
         state: "protected",
         title: "Protected",
-        description: "The tunnel is running and the proxy path is currently healthy.",
+        description: isAndroidRuntime
+          ? "Phone protection is running and the proxy path is currently healthy."
+          : "The tunnel is running and the proxy path is currently healthy.",
       };
     }
 
     if (appRole === "master" && requiresRedeploy) {
       return {
         state: "error",
-        title: "Deploy required",
+        title: isAndroidRuntime ? "Sync required" : "Deploy required",
         description:
-          "Another client changed the active cover domain. Run Deploy on this device before starting the tunnel again.",
+          isAndroidRuntime
+            ? "Another client changed the active cover domain. Run Deploy on this phone before starting protection again."
+            : "Another client changed the active cover domain. Run Deploy on this device before starting the tunnel again.",
       };
     }
 
     if (appRole === "subordinate" && requiresInviteRefresh) {
       return {
         state: "error",
-        title: "Invite link update required",
+        title: isAndroidRuntime ? "Phone link update required" : "Invite link update required",
         description:
-          "The master app changed the transport configuration. Paste a fresh invite link on this device before starting the tunnel again.",
+          isAndroidRuntime
+            ? "The master app changed the transport configuration. Paste a fresh phone link on this phone before starting protection again."
+            : "The master app changed the transport configuration. Paste a fresh invite link on this device before starting the tunnel again.",
       };
     }
 
@@ -1226,10 +1241,11 @@ export function useControlCenter() {
 
     return {
       state: "inactive",
-      title: "Tunnel inactive",
+      title: isAndroidRuntime ? "Protection inactive" : "Tunnel inactive",
       description: lastUserMessage,
     };
   }, [
+    isAndroidRuntime,
     appRole,
     guardState,
     isDeploying,
@@ -1274,10 +1290,18 @@ export function useControlCenter() {
   const serverStatusSummary = useMemo<ServerStatusSummary>(() => {
     if (appRole === "subordinate") {
       return {
-        title: requiresInviteRefresh ? "Needs fresh invite link" : "Managed by master app",
+        title: requiresInviteRefresh
+          ? isAndroidRuntime
+            ? "Needs fresh phone link"
+            : "Needs fresh invite link"
+          : "Managed by master app",
         description: requiresInviteRefresh
-          ? "This invite link is no longer accepted by the master app. Ask for a fresh invite link, or unlink this app and configure it as a master app again."
-          : "This installation is meant to receive and refresh its client config from a master app. Server deploy and SNI rotation stay disabled here.",
+          ? isAndroidRuntime
+            ? "This phone link is no longer accepted by the master app. Ask for a fresh phone link, or unlink this phone and configure it as a master app again."
+            : "This invite link is no longer accepted by the master app. Ask for a fresh invite link, or unlink this app and configure it as a master app again."
+          : isAndroidRuntime
+            ? "This phone is meant to receive and refresh its client config from a master app. Server deploy and SNI rotation stay disabled here."
+            : "This installation is meant to receive and refresh its client config from a master app. Server deploy and SNI rotation stay disabled here.",
         tone: requiresInviteRefresh ? "attention" : "ready",
       };
     }
@@ -1293,34 +1317,40 @@ export function useControlCenter() {
     if (!savedProfile) {
       return {
         title: "Ready for first deploy",
-        description: "The current server details are filled in. Deploy will prepare the node and create a client config.",
+        description: isAndroidRuntime
+          ? "The current server details are filled in. Deploy will prepare the node and create a phone client config."
+          : "The current server details are filled in. Deploy will prepare the node and create a client config.",
         tone: "neutral",
       };
     }
 
     if (!profilesMatch(savedProfile, currentProfile)) {
       return {
-        title: "Needs deploy",
-        description: "The server details were changed locally. Run Deploy to apply the new configuration.",
+        title: isAndroidRuntime ? "Needs sync" : "Needs deploy",
+        description: isAndroidRuntime
+          ? "The server details were changed locally. Run Deploy to sync the phone with the new configuration."
+          : "The server details were changed locally. Run Deploy to apply the new configuration.",
         tone: "attention",
       };
     }
 
     if (requiresRedeploy) {
       return {
-        title: "Needs deploy",
+        title: isAndroidRuntime ? "Needs sync" : "Needs deploy",
         description:
-          "Another client changed the active cover domain. Run Deploy on this Mac to refresh the local client config before starting the tunnel.",
+          `Another client changed the active cover domain. Run Deploy on ${localDeviceReference} to refresh the local client config before starting the tunnel.`,
         tone: "attention",
       };
     }
 
     return {
       title: "Configured",
-      description: "The current server profile matches the last successful deploy and is ready to use.",
+      description: isAndroidRuntime
+        ? "The current server profile matches the last successful deploy and is ready to protect this phone."
+        : "The current server profile matches the last successful deploy and is ready to use.",
       tone: "ready",
     };
-  }, [appRole, currentProfile, host, password, requiresRedeploy, savedProfile, user]);
+  }, [appRole, currentProfile, host, isAndroidRuntime, password, requiresRedeploy, savedProfile, user]);
 
   const diagnosticsSummary = useMemo<DiagnosticsSummary>(() => {
     const runtimeHealth = latestLogMatching(logs, "Runtime health:");
@@ -1368,16 +1398,16 @@ export function useControlCenter() {
 
   const powerQuickStatus = useMemo(() => {
     if (isDeploying) {
-      return "Deploying server";
+      return isAndroidRuntime ? "Syncing phone" : "Deploying server";
     }
 
     if (appRole === "subordinate") {
       if (requiresInviteRefresh) {
-        return "Needs fresh invite";
+        return isAndroidRuntime ? "Needs fresh link" : "Needs fresh invite";
       }
 
       if (isStarting) {
-        return "Connecting";
+        return isAndroidRuntime ? "Starting protection" : "Connecting";
       }
 
       if (isRunning && guardState === "engaged") {
@@ -1388,19 +1418,19 @@ export function useControlCenter() {
         return "Protected";
       }
 
-      return "Ready to start";
+      return isAndroidRuntime ? "Ready to protect" : "Ready to start";
     }
 
     if (!savedProfile || !profilesMatch(savedProfile, currentProfile)) {
-      return "Needs deploy";
+      return isAndroidRuntime ? "Needs sync" : "Needs deploy";
     }
 
     if (requiresRedeploy) {
-      return "Needs deploy";
+      return isAndroidRuntime ? "Needs sync" : "Needs deploy";
     }
 
     if (isStarting) {
-      return "Connecting";
+      return isAndroidRuntime ? "Starting protection" : "Connecting";
     }
 
     if (isRunning && guardState === "engaged") {
@@ -1411,11 +1441,12 @@ export function useControlCenter() {
       return "Protected";
     }
 
-    return "Ready to start";
+    return isAndroidRuntime ? "Ready to protect" : "Ready to start";
   }, [
     appRole,
     currentProfile,
     guardState,
+    isAndroidRuntime,
     isDeploying,
     isRunning,
     isStarting,
@@ -1447,6 +1478,8 @@ export function useControlCenter() {
     localWarpProfileStatus,
     isWindowsRuntime,
     windowsRuntimeMode,
+    isAndroidRuntime,
+    localDeviceReference,
     isSavingWindowsRuntimeMode,
     warpProfileInput,
     warpProfileMessage,
