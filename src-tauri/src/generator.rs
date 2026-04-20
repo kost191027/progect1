@@ -1,3 +1,7 @@
+#[cfg(target_os = "android")]
+use base64::engine::general_purpose::STANDARD;
+#[cfg(target_os = "android")]
+use base64::Engine;
 use serde_json::{json, Value};
 use tauri::AppHandle;
 #[cfg(not(target_os = "android"))]
@@ -164,43 +168,81 @@ async fn run_singbox_generate(app: &AppHandle, args: &[&str]) -> Result<String, 
     }
 }
 
+#[cfg(target_os = "android")]
+fn random_bytes(len: usize) -> Result<Vec<u8>, String> {
+    let mut bytes = vec![0_u8; len];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| format!("Failed to generate Android transport secret bytes: {}", e))?;
+    Ok(bytes)
+}
+
 fn is_hex_string(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 pub async fn generate_short_id(app: &AppHandle) -> Result<String, String> {
-    let short_id = run_singbox_generate(app, &["generate", "rand", "8", "--hex"]).await?;
-
-    if !is_hex_string(&short_id) {
-        return Err(format!("Generated short_id is not valid hex: {}", short_id));
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        let bytes = random_bytes(8)?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
-    Ok(short_id.to_ascii_lowercase())
+    #[cfg(not(target_os = "android"))]
+    {
+        let short_id = run_singbox_generate(app, &["generate", "rand", "8", "--hex"]).await?;
+
+        if !is_hex_string(&short_id) {
+            return Err(format!("Generated short_id is not valid hex: {}", short_id));
+        }
+
+        Ok(short_id.to_ascii_lowercase())
+    }
 }
 
 pub async fn generate_shadowtls_password(app: &AppHandle) -> Result<String, String> {
-    let password = run_singbox_generate(app, &["generate", "rand", "16", "--hex"]).await?;
-
-    if !is_hex_string(&password) {
-        return Err(format!(
-            "Generated ShadowTLS password is not valid hex: {}",
-            password
-        ));
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        let bytes = random_bytes(16)?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
-    if password.len() < 32 {
-        return Err(format!(
-            "Generated ShadowTLS password is unexpectedly short ({} chars): {}",
-            password.len(),
-            password
-        ));
-    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let password = run_singbox_generate(app, &["generate", "rand", "16", "--hex"]).await?;
 
-    Ok(password.to_ascii_lowercase())
+        if !is_hex_string(&password) {
+            return Err(format!(
+                "Generated ShadowTLS password is not valid hex: {}",
+                password
+            ));
+        }
+
+        if password.len() < 32 {
+            return Err(format!(
+                "Generated ShadowTLS password is unexpectedly short ({} chars): {}",
+                password.len(),
+                password
+            ));
+        }
+
+        Ok(password.to_ascii_lowercase())
+    }
 }
 
 pub async fn generate_ss_password(app: &AppHandle) -> Result<String, String> {
-    run_singbox_generate(app, &["generate", "rand", "16", "--base64"]).await
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        let bytes = random_bytes(16)?;
+        Ok(STANDARD.encode(bytes))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        run_singbox_generate(app, &["generate", "rand", "16", "--base64"]).await
+    }
 }
 
 pub struct ServerConfigParams<'a> {

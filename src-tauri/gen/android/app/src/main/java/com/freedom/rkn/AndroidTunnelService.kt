@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
@@ -17,9 +18,12 @@ class AndroidTunnelService : VpnService() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        activeInstance = this
+
         when (intent?.action) {
             ACTION_STOP -> {
                 stopManagedCoreProcess()
+                closeTunnelInterface()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
@@ -28,11 +32,13 @@ class AndroidTunnelService : VpnService() {
             null -> {
                 ensureNotificationChannel()
                 startForeground(NOTIFICATION_ID, buildNotification())
+                ensureTunnelInterface()
                 return START_STICKY
             }
             else -> {
                 ensureNotificationChannel()
                 startForeground(NOTIFICATION_ID, buildNotification())
+                ensureTunnelInterface()
                 return START_STICKY
             }
         }
@@ -45,9 +51,18 @@ class AndroidTunnelService : VpnService() {
 
     override fun onRevoke() {
         stopManagedCoreProcess()
+        closeTunnelInterface()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         super.onRevoke()
+    }
+
+    override fun onDestroy() {
+        if (activeInstance === this) {
+            activeInstance = null
+        }
+        closeTunnelInterface()
+        super.onDestroy()
     }
 
     private fun buildNotification(): Notification {
@@ -126,9 +141,54 @@ class AndroidTunnelService : VpnService() {
         runCatching { pidFile.delete() }
     }
 
+    private fun ensureTunnelInterface() {
+        synchronized(STATE_LOCK) {
+            if (activeTunnelInterface != null) {
+                lastTunnelState = buildTunnelStateSummary(activeTunnelInterface)
+                lastTunnelError = null
+                return
+            }
+
+            try {
+                val descriptor = Builder()
+                    .setSession(getString(R.string.app_name))
+                    .setMtu(TUN_MTU)
+                    .addAddress(TUN_ADDRESS, TUN_PREFIX_LENGTH)
+                    .addRoute("0.0.0.0", 0)
+                    .apply {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            setMetered(false)
+                        }
+                    }
+                    .establish()
+                    ?: throw IllegalStateException("VpnService.Builder.establish() returned null")
+
+                activeTunnelInterface = descriptor
+                lastTunnelState = buildTunnelStateSummary(descriptor)
+                lastTunnelError = null
+            } catch (error: Throwable) {
+                lastTunnelError = error.message ?: error::class.java.simpleName
+                lastTunnelState = "failed(${lastTunnelError})"
+                closeTunnelInterface()
+            }
+        }
+    }
+
     companion object {
         private const val NOTIFICATION_CHANNEL_ID = "rkn_tunnel_runtime"
         private const val NOTIFICATION_ID = 6103
+        private const val TUN_ADDRESS = "172.19.0.1"
+        private const val TUN_PREFIX_LENGTH = 30
+        private const val TUN_MTU = 1500
+        private val STATE_LOCK = Any()
+        @Volatile
+        private var activeTunnelInterface: ParcelFileDescriptor? = null
+        @Volatile
+        private var activeInstance: AndroidTunnelService? = null
+        @Volatile
+        private var lastTunnelError: String? = null
+        @Volatile
+        private var lastTunnelState: String = "idle"
 
         const val ACTION_START = "com.freedom.rkn.action.START_TUNNEL_SERVICE"
         const val ACTION_STOP = "com.freedom.rkn.action.STOP_TUNNEL_SERVICE"
@@ -143,6 +203,42 @@ class AndroidTunnelService : VpnService() {
         fun buildStopIntent(context: Context): Intent {
             return Intent(context, AndroidTunnelService::class.java).apply {
                 action = ACTION_STOP
+            }
+        }
+
+        fun isTunnelInterfaceReady(): Boolean {
+            return activeTunnelInterface != null
+        }
+
+        fun getTunnelDebugState(): String {
+            return lastTunnelError?.let { error ->
+                "failed($error)"
+            } ?: lastTunnelState
+        }
+
+        fun peekTunnelFd(): Int {
+            return activeTunnelInterface?.fd ?: -1
+        }
+
+        fun protectSocketFd(fd: Int): Boolean {
+            val service = activeInstance ?: return false
+            return runCatching { service.protect(fd) }.getOrDefault(false)
+        }
+
+        private fun buildTunnelStateSummary(descriptor: ParcelFileDescriptor?): String {
+            val fd = descriptor?.fd ?: -1
+            return "ready(fd=$fd, addr=$TUN_ADDRESS/$TUN_PREFIX_LENGTH, route=0.0.0.0/0, mtu=$TUN_MTU)"
+        }
+
+        private fun closeTunnelInterface() {
+            synchronized(STATE_LOCK) {
+                activeTunnelInterface?.let { descriptor ->
+                    runCatching { descriptor.close() }
+                }
+                activeTunnelInterface = null
+                if (lastTunnelError == null) {
+                    lastTunnelState = "idle"
+                }
             }
         }
     }

@@ -223,6 +223,8 @@ export function useControlCenter() {
   const [isWindowsRuntime, setIsWindowsRuntime] = useState(false);
   const [windowsRuntimeMode, setWindowsRuntimeMode] = useState<WindowsRuntimeMode>("tun");
   const [isSavingWindowsRuntimeMode, setIsSavingWindowsRuntimeMode] = useState(false);
+  const [isAwaitingAndroidVpnPermission, setIsAwaitingAndroidVpnPermission] =
+    useState(false);
   const [warpProfileInput, setWarpProfileInput] = useState("");
   const [warpProfileMessage, setWarpProfileMessage] = useState<string | null>(null);
   const [isCreatingWarpProfile, setIsCreatingWarpProfile] = useState(false);
@@ -570,6 +572,9 @@ export function useControlCenter() {
       setIsStarting(false);
       setIsStopping(false);
       if (event.payload) {
+        setIsAwaitingAndroidVpnPermission(false);
+      }
+      if (event.payload) {
         setLastError(null);
         setLastUserMessage("Tunnel is active and ready to carry protected traffic.");
         setHasCompletedFirstStart(true);
@@ -581,6 +586,70 @@ export function useControlCenter() {
       unlisten.then((cleanup) => cleanup());
     };
   }, []);
+
+  useEffect(() => {
+    if (!isAndroidRuntime || !isAwaitingAndroidVpnPermission) {
+      return;
+    }
+
+    let cancelled = false;
+    let resumeInFlight = false;
+
+    async function resumeIfPermissionGranted() {
+      if (cancelled || resumeInFlight) {
+        return;
+      }
+
+      resumeInFlight = true;
+      try {
+        const granted = await invoke<boolean>("get_android_vpn_permission_status");
+        if (!granted || cancelled) {
+          return;
+        }
+
+        setIsAwaitingAndroidVpnPermission(false);
+        setIsStarting(true);
+        setLastError(null);
+        setLastUserMessage(
+          "Android VPN permission granted. Continuing protection start automatically.",
+        );
+        appendLog(
+          "[SYSTEM] Android VPN permission granted. Continuing protection start automatically.",
+        );
+
+        try {
+          await invoke("start_tunnel");
+          appendLog("[SYSTEM] Tunnel routing active.");
+        } catch (error) {
+          appendLog(`[ERROR] starting tunnel: ${error}`);
+          setIsStarting(false);
+        }
+      } finally {
+        resumeInFlight = false;
+      }
+    }
+
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        void resumeIfPermissionGranted();
+      }
+    };
+
+    const intervalId = window.setInterval(() => {
+      void resumeIfPermissionGranted();
+    }, 900);
+
+    window.addEventListener("focus", handleVisibility);
+    document.addEventListener("visibilitychange", handleVisibility);
+    void resumeIfPermissionGranted();
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", handleVisibility);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [isAndroidRuntime, isAwaitingAndroidVpnPermission]);
 
   useEffect(() => {
     const unlisten = listen<string>("tunnel-guard-state", (event) => {
@@ -631,12 +700,21 @@ export function useControlCenter() {
       await invoke("start_tunnel");
       appendLog("[SYSTEM] Tunnel routing active.");
     } catch (error) {
+      const message = String(error);
+      if (
+        isAndroidRuntime &&
+        message.includes("Android VPN permission requested.")
+      ) {
+        setIsAwaitingAndroidVpnPermission(true);
+      }
+
       appendLog(`[ERROR] starting tunnel: ${error}`);
       setIsStarting(false);
     }
   }
 
   async function stopTunnel() {
+    setIsAwaitingAndroidVpnPermission(false);
     setIsStopping(true);
     setLastUserMessage("Stopping the tunnel and removing local routing.");
 
@@ -1092,13 +1170,6 @@ export function useControlCenter() {
   }
 
   async function copyLogs() {
-    if (isAndroidRuntime) {
-      appendLog(
-        "[WARN] Copy Logs is not available on Android yet. Use the visible log stream on the phone for now.",
-      );
-      return;
-    }
-
     try {
       await copyTextToClipboard(logs.join("\n"));
       appendLog("[SYSTEM] Log stream copied to clipboard.");

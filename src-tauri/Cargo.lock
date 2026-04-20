@@ -3294,6 +3294,7 @@ name = "rkn"
 version = "0.1.6"
 dependencies = [
  "base64 0.22.1",
+ "getrandom 0.3.4",
  "jni",
  "ndk-context",
  "reqwest",

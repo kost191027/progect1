@@ -33,9 +33,6 @@ mod ssh;
 
 #[cfg(desktop)]
 const TRAY_ICON: Image<'_> = tauri::include_image!("./icons/tray-icon.png");
-#[cfg(target_os = "android")]
-const ANDROID_SINGBOX_BYTES: &[u8] = include_bytes!("../bins/sing-box-aarch64-linux-android");
-
 struct AppState {
     /// PID процесса sing-box, запущенного root-правами через osascript
     singbox_pid: Mutex<Option<u32>>,
@@ -578,9 +575,77 @@ fn recent_log_tail(log_path: &str, max_lines: usize) -> String {
     lines.join("\n")
 }
 
+#[cfg(target_os = "android")]
+fn classify_android_startup_blocker(log_tail: &str) -> Option<String> {
+    let lower = log_tail.to_lowercase();
+
+    if lower.contains("open /dev/tun: permission denied") {
+        return Some(
+            "Android core reached the real TUN startup path, but the current mobile runtime still lacks the platform-specific handoff from the VpnService-owned TUN interface into a sing-box-supported Android runtime path. The standalone CLI sidecar cannot open /dev/tun directly inside the app process."
+                .to_string(),
+        );
+    }
+
+    if lower.contains("netlink socket in android is banned by google") {
+        return Some(
+            "Android runtime still tried to initialize a banned netlink-based network monitor. This mobile config must stay Android-specific and avoid desktop route monitoring fields."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
 #[cfg(target_os = "windows")]
 fn trim_utf8_bom(value: &str) -> &str {
     value.strip_prefix('\u{feff}').unwrap_or(value)
+}
+
+#[cfg(target_os = "android")]
+fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Result<String, String> {
+    let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
+        format!(
+            "Failed to parse generated client config for Android runtime: {}",
+            e
+        )
+    })?;
+
+    cfg["log"]["output"] = serde_json::json!(log_path);
+    cfg["log"]["level"] = serde_json::json!("info");
+    cfg["log"]["timestamp"] = serde_json::json!(true);
+
+    if let Some(inbounds) = cfg
+        .get_mut("inbounds")
+        .and_then(|value| value.as_array_mut())
+    {
+        for inbound in inbounds {
+            let is_tun = inbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .map(|value| value == "tun")
+                .unwrap_or(false);
+
+            if !is_tun {
+                continue;
+            }
+
+            if let Some(object) = inbound.as_object_mut() {
+                object.remove("interface_name");
+                object.remove("strict_route");
+            }
+        }
+    }
+
+    if let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) {
+        route.remove("auto_detect_interface");
+        route.remove("default_interface");
+        route.remove("override_android_vpn");
+        route.remove("default_network_strategy");
+        route.remove("network_strategy");
+    }
+
+    serde_json::to_string_pretty(&cfg)
+        .map_err(|e| format!("Failed to serialize Android runtime client config: {}", e))
 }
 
 /// Extract the VPN server IP from the client config's outbound section.
@@ -845,7 +910,53 @@ fn write_clipboard_text(text: String) -> Result<(), String> {
         }
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "android")]
+    {
+        with_android_activity(|env, activity| {
+            let class_loader = env
+                .call_method(
+                    &activity,
+                    "getClassLoader",
+                    "()Ljava/lang/ClassLoader;",
+                    &[],
+                )
+                .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+            let class_name = env
+                .new_string("com.freedom.rkn.AndroidVpnBridge")
+                .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+            let bridge = env
+                .call_method(
+                    &class_loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[JValue::Object(&JObject::from(class_name))],
+                )
+                .map_err(|e| format!("Failed to load Android clipboard bridge class: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed to decode Android clipboard bridge class: {}", e))?;
+            let bridge = jni::objects::JClass::from(bridge);
+            let java_text = env
+                .new_string(text)
+                .map_err(|e| format!("Failed to allocate Android clipboard text: {}", e))?;
+
+            env.call_static_method(
+                bridge,
+                "writeClipboardText",
+                "(Landroid/content/Context;Ljava/lang/String;)V",
+                &[
+                    JValue::Object(&activity),
+                    JValue::Object(&JObject::from(java_text)),
+                ],
+            )
+            .map_err(|e| format!("Failed to write Android clipboard text: {}", e))?;
+
+            Ok(())
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
     {
         let _ = text;
         Err("Clipboard write is not implemented for this platform yet.".to_string())
@@ -881,9 +992,70 @@ fn read_clipboard_text() -> Result<String, String> {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "android")]
+    {
+        with_android_activity(|env, activity| {
+            let class_loader = env
+                .call_method(
+                    &activity,
+                    "getClassLoader",
+                    "()Ljava/lang/ClassLoader;",
+                    &[],
+                )
+                .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+            let class_name = env
+                .new_string("com.freedom.rkn.AndroidVpnBridge")
+                .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+            let bridge = env
+                .call_method(
+                    &class_loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[JValue::Object(&JObject::from(class_name))],
+                )
+                .map_err(|e| format!("Failed to load Android clipboard bridge class: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed to decode Android clipboard bridge class: {}", e))?;
+            let bridge = jni::objects::JClass::from(bridge);
+            let value = env
+                .call_static_method(
+                    bridge,
+                    "readClipboardText",
+                    "(Landroid/content/Context;)Ljava/lang/String;",
+                    &[JValue::Object(&activity)],
+                )
+                .map_err(|e| format!("Failed to read Android clipboard text: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed to decode Android clipboard text: {}", e))?;
+            let java_string = jni::objects::JString::from(value);
+            let resolved = env
+                .get_string(&java_string)
+                .map_err(|e| format!("Failed to unwrap Android clipboard text: {}", e))?
+                .to_string_lossy()
+                .into_owned();
+
+            Ok(resolved)
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
     {
         Err("Clipboard read is not implemented for this platform yet.".to_string())
+    }
+}
+
+#[tauri::command]
+fn get_android_vpn_permission_status() -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        android_vpn_permission_granted()
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(false)
     }
 }
 
@@ -1290,7 +1462,30 @@ fn resolve_android_singbox_path(app: &AppHandle) -> Result<String, String> {
     use std::os::unix::fs::PermissionsExt;
 
     let native_library_dir = with_android_activity(|env, activity| {
-        let bridge = find_android_app_class(env, &activity, "com.freedom.rkn.AndroidVpnBridge")?;
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
         let value = env
             .call_static_method(
                 bridge,
@@ -1328,40 +1523,18 @@ fn resolve_android_singbox_path(app: &AppHandle) -> Result<String, String> {
                 return Ok(path.to_string_lossy().to_string());
             }
         }
+
+        return Err(format!(
+            "Android native sidecar was not found in nativeLibraryDir {}. The APK did not expose an executable jniLib for sing-box. Rebuild with extracted native libs enabled.",
+            native_library_dir
+        ));
     }
 
-    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
-    let sidecar_dir = local_data.join("sidecars");
-    std::fs::create_dir_all(&sidecar_dir).map_err(|e| {
-        format!(
-            "Failed to create Android fallback sidecar directory {}: {}",
-            sidecar_dir.display(),
-            e
-        )
-    })?;
-
-    let extracted_path = sidecar_dir.join("sing-box-aarch64-linux-android");
-    std::fs::write(&extracted_path, ANDROID_SINGBOX_BYTES).map_err(|e| {
-        format!(
-            "Android native sidecar was not packaged, and the embedded fallback could not be written to {}: {}",
-            extracted_path.display(),
-            e
-        )
-    })?;
-
-    let mut perms = std::fs::metadata(&extracted_path)
-        .map_err(|e| {
-            format!(
-                "Failed to stat extracted Android fallback sidecar {}: {}",
-                extracted_path.display(),
-                e
-            )
-        })?
-        .permissions();
-    perms.set_mode(0o755);
-    let _ = std::fs::set_permissions(&extracted_path, perms);
-
-    Ok(extracted_path.to_string_lossy().to_string())
+    let _ = app;
+    Err(
+        "Android nativeLibraryDir is empty, so RKN cannot locate an executable sing-box sidecar on this device."
+            .to_string(),
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -1799,37 +1972,32 @@ fn android_files_dir_path() -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "android")]
-fn find_android_app_class<'a>(
-    env: &mut jni::JNIEnv<'a>,
-    activity: &JObject<'a>,
-    class_name: &str,
-) -> Result<jni::objects::JClass<'a>, String> {
-    let class_loader = env
-        .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-        .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
-    let class_name_java = env
-        .new_string(class_name)
-        .map_err(|e| format!("Failed to allocate Android class name string: {}", e))?;
-    let loaded_class = env
-        .call_method(
-            &class_loader,
-            "loadClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            &[JValue::Object(&JObject::from(class_name_java))],
-        )
-        .map_err(|e| format!("Failed to load Android app class {}: {}", class_name, e))?
-        .l()
-        .map_err(|e| format!("Failed to decode Android app class {}: {}", class_name, e))?;
-
-    Ok(jni::objects::JClass::from(loaded_class))
-}
-
-#[cfg(target_os = "android")]
 fn android_vpn_permission_granted() -> Result<bool, String> {
     with_android_activity(|env, activity| {
-        let bridge = find_android_app_class(env, &activity, "com.freedom.rkn.AndroidVpnBridge")?;
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
         let granted = env
             .call_static_method(
                 bridge,
@@ -1848,7 +2016,30 @@ fn android_vpn_permission_granted() -> Result<bool, String> {
 #[cfg(target_os = "android")]
 fn request_android_vpn_permission() -> Result<bool, String> {
     with_android_activity(|env, activity| {
-        let bridge = find_android_app_class(env, &activity, "com.freedom.rkn.AndroidVpnBridge")?;
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
         let already_granted = env
             .call_static_method(
                 bridge,
@@ -1867,7 +2058,30 @@ fn request_android_vpn_permission() -> Result<bool, String> {
 #[cfg(target_os = "android")]
 fn start_android_tunnel_service() -> Result<(), String> {
     with_android_activity(|env, activity| {
-        let bridge = find_android_app_class(env, &activity, "com.freedom.rkn.AndroidVpnBridge")?;
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
         env.call_static_method(
             bridge,
             "startTunnelService",
@@ -1883,7 +2097,30 @@ fn start_android_tunnel_service() -> Result<(), String> {
 #[cfg(target_os = "android")]
 fn stop_android_tunnel_service() -> Result<(), String> {
     with_android_activity(|env, activity| {
-        let bridge = find_android_app_class(env, &activity, "com.freedom.rkn.AndroidVpnBridge")?;
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
         env.call_static_method(
             bridge,
             "stopTunnelService",
@@ -1894,6 +2131,207 @@ fn stop_android_tunnel_service() -> Result<(), String> {
 
         Ok(())
     })
+}
+
+#[cfg(target_os = "android")]
+fn android_tun_interface_ready() -> Result<bool, String> {
+    with_android_activity(|env, activity| {
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
+        let ready = env
+            .call_static_method(
+                bridge,
+                "isTunnelInterfaceReady",
+                "(Landroid/content/Context;)Z",
+                &[JValue::Object(&activity)],
+            )
+            .map_err(|e| format!("Failed to query Android tunnel interface state: {}", e))?
+            .z()
+            .map_err(|e| format!("Failed to decode Android tunnel interface state: {}", e))?;
+
+        Ok(ready)
+    })
+}
+
+#[cfg(target_os = "android")]
+fn android_tunnel_debug_state() -> Result<String, String> {
+    with_android_activity(|env, activity| {
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
+        let value = env
+            .call_static_method(
+                bridge,
+                "getTunnelDebugState",
+                "(Landroid/content/Context;)Ljava/lang/String;",
+                &[JValue::Object(&activity)],
+            )
+            .map_err(|e| format!("Failed to query Android tunnel debug state: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android tunnel debug state: {}", e))?;
+        let java_string = jni::objects::JString::from(value);
+        let resolved = env
+            .get_string(&java_string)
+            .map_err(|e| format!("Failed to read Android tunnel debug state: {}", e))?
+            .to_string_lossy()
+            .into_owned();
+
+        Ok(resolved)
+    })
+}
+
+#[cfg(target_os = "android")]
+fn android_peek_tun_fd() -> Result<i32, String> {
+    with_android_activity(|env, activity| {
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
+        let fd = env
+            .call_static_method(
+                bridge,
+                "peekTunnelFd",
+                "(Landroid/content/Context;)I",
+                &[JValue::Object(&activity)],
+            )
+            .map_err(|e| format!("Failed to query Android TUN file descriptor: {}", e))?
+            .i()
+            .map_err(|e| format!("Failed to decode Android TUN file descriptor: {}", e))?;
+
+        Ok(fd)
+    })
+}
+
+#[cfg(target_os = "android")]
+#[allow(dead_code)]
+fn android_protect_socket_fd(fd: i32) -> Result<bool, String> {
+    with_android_activity(|env, activity| {
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
+        let protected = env
+            .call_static_method(
+                bridge,
+                "protectSocketFd",
+                "(Landroid/content/Context;I)Z",
+                &[JValue::Object(&activity), JValue::Int(fd)],
+            )
+            .map_err(|e| format!("Failed to protect Android socket fd: {}", e))?
+            .z()
+            .map_err(|e| format!("Failed to decode Android socket protect result: {}", e))?;
+
+        Ok(protected)
+    })
+}
+
+#[cfg(target_os = "android")]
+async fn wait_for_android_tun_interface(app: &AppHandle) -> Result<String, String> {
+    for _ in 0..20 {
+        match android_tun_interface_ready() {
+            Ok(true) => {
+                return android_tunnel_debug_state();
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!("[WARN] Android TUN interface check failed: {}", error),
+                );
+            }
+        }
+
+        sleep(Duration::from_millis(150)).await;
+    }
+
+    let state = android_tunnel_debug_state().unwrap_or_else(|_| "unknown".to_string());
+    Err(format!(
+        "Android VPN service started, but it did not expose a ready TUN interface in time. Last state: {}",
+        state
+    ))
 }
 
 #[cfg(target_os = "android")]
@@ -1916,7 +2354,59 @@ fn summarize_android_command_failure(prefix: &str, output: &std::process::Output
 }
 
 #[cfg(target_os = "android")]
+fn ensure_android_config_has_no_local_proxy_inbounds(config_path: &str) -> Result<(), String> {
+    let raw = std::fs::read_to_string(config_path).map_err(|e| {
+        format!(
+            "Failed to read Android client config for localhost proxy audit: {}",
+            e
+        )
+    })?;
+    let parsed = serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
+        format!(
+            "Failed to parse Android client config for localhost proxy audit: {}",
+            e
+        )
+    })?;
+
+    let Some(inbounds) = parsed.get("inbounds").and_then(|value| value.as_array()) else {
+        return Ok(());
+    };
+
+    for inbound in inbounds {
+        let inbound_type = inbound
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let listen = inbound
+            .get("listen")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        let is_local_proxy_inbound = matches!(inbound_type, "socks" | "mixed" | "http");
+        let is_localhost_listener = matches!(listen, "127.0.0.1" | "::1" | "localhost");
+
+        if is_local_proxy_inbound || is_localhost_listener {
+            let listen_port = inbound
+                .get("listen_port")
+                .and_then(|value| value.as_u64())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(format!(
+                "Android security policy blocked a localhost proxy inbound (type='{}', listen='{}', port={}). RKN mobile currently permits only VPN/TUN-style inbounds to avoid localhost proxy leaks across apps.",
+                inbound_type,
+                if listen.is_empty() { "default" } else { listen },
+                listen_port
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
 fn run_android_singbox_preflight(singbox_path: &str, config_path: &str) -> Result<(), String> {
+    ensure_android_config_has_no_local_proxy_inbounds(config_path)?;
+
     let singbox_dir = std::path::Path::new(singbox_path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -2064,7 +2554,23 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
     {
         #[cfg(target_os = "android")]
         {
-            let config_str = config_path.to_string_lossy().to_string();
+            let raw = std::fs::read_to_string(&config_path).map_err(|e| {
+                format!(
+                    "Failed to read base client config {}: {}",
+                    config_path.display(),
+                    e
+                )
+            })?;
+            let android_config_path = local_data.join("client_config_android.json");
+            let runtime_cfg = build_android_runtime_client_config(&raw, log_path)?;
+            std::fs::write(&android_config_path, runtime_cfg).map_err(|e| {
+                format!(
+                    "Failed to write Android runtime client config {}: {}",
+                    android_config_path.display(),
+                    e
+                )
+            })?;
+            let config_str = android_config_path.to_string_lossy().to_string();
 
             if announce_prompt {
                 let _ = app.emit(
@@ -2073,6 +2579,14 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                         .to_string(),
                 );
             }
+
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SYSTEM] Android launch paths: sing-box={} | config={} | log={}",
+                    singbox_path, config_str, log_path
+                ),
+            );
 
             run_android_singbox_preflight(&singbox_path, &config_str)?;
             return launch_tunnel_process_android(app, &singbox_path, &config_str, log_path).await;
@@ -2260,6 +2774,35 @@ async fn verify_tunnel_start(
     }
 
     sleep(Duration::from_millis(1200)).await;
+
+    #[cfg(target_os = "android")]
+    {
+        let log_tail = recent_log_tail(log_path, 20);
+        if let Some(blocker) = classify_android_startup_blocker(&log_tail) {
+            let _ = terminate_root_process(None, pid);
+            let _ = stop_android_tunnel_service();
+
+            {
+                let mut guard = state.singbox_pid.lock().unwrap();
+                if guard.as_ref() == Some(&pid) {
+                    *guard = None;
+                }
+            }
+
+            set_network_fingerprint(state, None);
+            clear_saved_tunnel_pid(app);
+            emit_tunnel_state(app, false);
+            emit_guard_state(app, "inactive");
+
+            let details = if log_tail.is_empty() {
+                blocker
+            } else {
+                format!("{}\nRecent logs:\n{}", blocker, log_tail)
+            };
+
+            return Err(format!("Android tunnel startup blocked. {}", details));
+        }
+    }
 
     if !process_exists(pid) {
         {
@@ -2663,6 +3206,28 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
             "[SYSTEM] Android VPN service anchor is active. Starting the local core next."
                 .to_string(),
         );
+
+        let tun_state = wait_for_android_tun_interface(&app)
+            .await
+            .inspect_err(|_| {
+                let _ = stop_android_tunnel_service();
+            })?;
+        let _ = app.emit(
+            "tunnel-log",
+            format!(
+                "[SYSTEM] Android VpnService established a real TUN interface. {}",
+                tun_state
+            ),
+        );
+        if let Ok(fd) = android_peek_tun_fd() {
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SYSTEM] Android TUN bridge foundation is ready. Service-owned TUN fd is currently visible as {}.",
+                    fd
+                ),
+            );
+        }
     }
 
     let _ = app.emit("tunnel-log", "[SYSTEM] Resolving core binary path...");
@@ -3118,6 +3683,7 @@ pub fn run() {
             restore_tunnel_session,
             write_clipboard_text,
             read_clipboard_text,
+            get_android_vpn_permission_status,
             ssh::deploy_server,
             ssh::generate_invite_link,
             ssh::import_invite_link,

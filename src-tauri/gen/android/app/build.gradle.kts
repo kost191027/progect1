@@ -18,6 +18,9 @@ val tauriProperties = Properties().apply {
 android {
     compileSdk = 36
     namespace = "com.freedom.rkn"
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "com.freedom.rkn"

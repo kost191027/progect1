@@ -264,7 +264,6 @@ export function HomePage({ controlCenter }: HomePageProps) {
           logs={controlCenter.logs}
           trimmedLogCount={controlCenter.trimmedLogCount}
           onCopyLogs={controlCenter.copyLogs}
-          canCopyLogs={!controlCenter.isAndroidRuntime}
           defaultOpen={false}
           storageKey={SETTINGS_PANEL_STORAGE_KEYS.activityLog}
         />
