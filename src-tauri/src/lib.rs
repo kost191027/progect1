@@ -668,6 +668,10 @@ struct AndroidRuntimeContextSnapshot {
     backend_hint: String,
     tun_fd: i32,
     tun_state: String,
+    tun_address: String,
+    tun_prefix_length: i32,
+    tun_route: String,
+    tun_mtu: i32,
     config_path: String,
     log_path: String,
     protect_api_available: bool,
@@ -2201,7 +2205,7 @@ fn android_tun_interface_ready() -> Result<bool, String> {
 }
 
 #[cfg(target_os = "android")]
-fn android_tunnel_debug_state() -> Result<String, String> {
+fn android_bridge_string(method: &str) -> Result<String, String> {
     with_android_activity(|env, activity| {
         let class_loader = env
             .call_method(
@@ -2230,17 +2234,27 @@ fn android_tunnel_debug_state() -> Result<String, String> {
         let value = env
             .call_static_method(
                 bridge,
-                "getTunnelDebugState",
+                method,
                 "(Landroid/content/Context;)Ljava/lang/String;",
                 &[JValue::Object(&activity)],
             )
-            .map_err(|e| format!("Failed to query Android tunnel debug state: {}", e))?
+            .map_err(|e| {
+                format!(
+                    "Failed to query Android bridge string via {}: {}",
+                    method, e
+                )
+            })?
             .l()
-            .map_err(|e| format!("Failed to decode Android tunnel debug state: {}", e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to decode Android bridge string via {}: {}",
+                    method, e
+                )
+            })?;
         let java_string = jni::objects::JString::from(value);
         let resolved = env
             .get_string(&java_string)
-            .map_err(|e| format!("Failed to read Android tunnel debug state: {}", e))?
+            .map_err(|e| format!("Failed to read Android bridge string via {}: {}", method, e))?
             .to_string_lossy()
             .into_owned();
 
@@ -2249,7 +2263,7 @@ fn android_tunnel_debug_state() -> Result<String, String> {
 }
 
 #[cfg(target_os = "android")]
-fn android_peek_tun_fd() -> Result<i32, String> {
+fn android_bridge_int(method: &str) -> Result<i32, String> {
     with_android_activity(|env, activity| {
         let class_loader = env
             .call_method(
@@ -2275,19 +2289,49 @@ fn android_peek_tun_fd() -> Result<i32, String> {
             .l()
             .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
         let bridge = jni::objects::JClass::from(bridge);
-        let fd = env
+        let value = env
             .call_static_method(
                 bridge,
-                "peekTunnelFd",
+                method,
                 "(Landroid/content/Context;)I",
                 &[JValue::Object(&activity)],
             )
-            .map_err(|e| format!("Failed to query Android TUN file descriptor: {}", e))?
+            .map_err(|e| format!("Failed to query Android bridge int via {}: {}", method, e))?
             .i()
-            .map_err(|e| format!("Failed to decode Android TUN file descriptor: {}", e))?;
+            .map_err(|e| format!("Failed to decode Android bridge int via {}: {}", method, e))?;
 
-        Ok(fd)
+        Ok(value)
     })
+}
+
+#[cfg(target_os = "android")]
+fn android_tunnel_debug_state() -> Result<String, String> {
+    android_bridge_string("getTunnelDebugState")
+}
+
+#[cfg(target_os = "android")]
+fn android_peek_tun_fd() -> Result<i32, String> {
+    android_bridge_int("peekTunnelFd")
+}
+
+#[cfg(target_os = "android")]
+fn android_tun_address() -> Result<String, String> {
+    android_bridge_string("getTunnelAddress")
+}
+
+#[cfg(target_os = "android")]
+fn android_tun_prefix_length() -> Result<i32, String> {
+    android_bridge_int("getTunnelPrefixLength")
+}
+
+#[cfg(target_os = "android")]
+fn android_tun_route() -> Result<String, String> {
+    android_bridge_string("getTunnelRoute")
+}
+
+#[cfg(target_os = "android")]
+fn android_tun_mtu() -> Result<i32, String> {
+    android_bridge_int("getTunnelMtu")
 }
 
 #[cfg(target_os = "android")]
@@ -2580,10 +2624,18 @@ fn prepare_android_runtime_launch(
     if android_runtime_uses_tun_inbound(&runtime_cfg)? {
         let tun_fd = android_peek_tun_fd().unwrap_or(-1);
         let tun_state = android_tunnel_debug_state().unwrap_or_else(|_| "unknown".to_string());
+        let tun_address = android_tun_address().unwrap_or_else(|_| "unknown".to_string());
+        let tun_prefix_length = android_tun_prefix_length().unwrap_or(-1);
+        let tun_route = android_tun_route().unwrap_or_else(|_| "unknown".to_string());
+        let tun_mtu = android_tun_mtu().unwrap_or(-1);
         let snapshot = AndroidRuntimeContextSnapshot {
             backend_hint: "android_native_handoff_required".to_string(),
             tun_fd,
             tun_state: tun_state.clone(),
+            tun_address: tun_address.clone(),
+            tun_prefix_length,
+            tun_route: tun_route.clone(),
+            tun_mtu,
             config_path: runtime_config_path.clone(),
             log_path: log_path.to_string(),
             protect_api_available: true,
@@ -2592,9 +2644,13 @@ fn prepare_android_runtime_launch(
         let _ = app.emit(
             "tunnel-log",
             format!(
-                "[SYSTEM] Android TUN handoff checkpoint reached: VpnService owns fd={}, state={}, config={}, log={}, context={}. The next backend for 6A.4.1 must consume this Android-owned interface instead of launching the standalone CLI path.",
+                "[SYSTEM] Android TUN handoff checkpoint reached: VpnService owns fd={}, state={}, addr={}/{}, route={}, mtu={}, config={}, log={}, context={}. The next backend for 6A.4.1 must consume this Android-owned interface instead of launching the standalone CLI path.",
                 tun_fd,
                 tun_state,
+                tun_address,
+                tun_prefix_length,
+                tun_route,
+                tun_mtu,
                 runtime_config_path,
                 log_path,
                 context_path.display()

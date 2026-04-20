@@ -93,6 +93,10 @@ type AndroidRuntimeContext = {
   backend_hint: string;
   tun_fd: number;
   tun_state: string;
+  tun_address: string;
+  tun_prefix_length: number;
+  tun_route: string;
+  tun_mtu: number;
   config_path: string;
   log_path: string;
   protect_api_available: boolean;
@@ -180,6 +184,10 @@ function latestLogMatching(logs: string[], marker: string) {
   }
 
   return null;
+}
+
+function isAndroidTunHandoffError(message: string) {
+  return message.includes("Android TUN handoff is not implemented in the current runtime");
 }
 
 export function useControlCenter() {
@@ -752,6 +760,12 @@ export function useControlCenter() {
         message.includes("Android VPN permission requested.")
       ) {
         setIsAwaitingAndroidVpnPermission(true);
+      }
+
+      if (isAndroidRuntime && isAndroidTunHandoffError(message)) {
+        setLastUserMessage(
+          "The phone already created a real VPN interface. The remaining blocker is the Android-native handoff backend that still has to consume this interface.",
+        );
       }
 
       appendLog(`[ERROR] starting tunnel: ${error}`);
@@ -1384,6 +1398,15 @@ export function useControlCenter() {
     }
 
     if (lastError && !isRunning) {
+      if (isAndroidRuntime && isAndroidTunHandoffError(lastError)) {
+        return {
+          state: "error",
+          title: "Android handoff required",
+          description:
+            "VpnService and the mobile TUN interface are ready. The remaining blocker is the Android-native backend that must take over this interface for real protected traffic.",
+        };
+      }
+
       return {
         state: "error",
         title: "Attention needed",
@@ -1524,6 +1547,9 @@ export function useControlCenter() {
         details: [
           `TUN state: ${androidRuntimeContext.tun_state}`,
           `TUN fd: ${androidRuntimeContext.tun_fd}`,
+          `TUN address: ${androidRuntimeContext.tun_address}/${androidRuntimeContext.tun_prefix_length}`,
+          `TUN route: ${androidRuntimeContext.tun_route}`,
+          `TUN mtu: ${androidRuntimeContext.tun_mtu}`,
           `Config: ${androidRuntimeContext.config_path}`,
           `Log: ${androidRuntimeContext.log_path}`,
           `Protect API: ${androidRuntimeContext.protect_api_available ? "available" : "unavailable"}`,

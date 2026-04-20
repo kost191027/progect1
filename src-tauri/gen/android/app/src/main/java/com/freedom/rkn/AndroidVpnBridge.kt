@@ -58,6 +58,26 @@ object AndroidVpnBridge {
     }
 
     @JvmStatic
+    fun getTunnelAddress(context: Context): String {
+        return AndroidTunnelService.getTunnelAddress()
+    }
+
+    @JvmStatic
+    fun getTunnelPrefixLength(context: Context): Int {
+        return AndroidTunnelService.getTunnelPrefixLength()
+    }
+
+    @JvmStatic
+    fun getTunnelRoute(context: Context): String {
+        return AndroidTunnelService.getTunnelRoute()
+    }
+
+    @JvmStatic
+    fun getTunnelMtu(context: Context): Int {
+        return AndroidTunnelService.getTunnelMtu()
+    }
+
+    @JvmStatic
     fun protectSocketFd(context: Context, fd: Int): Boolean {
         return AndroidTunnelService.protectSocketFd(fd)
     }

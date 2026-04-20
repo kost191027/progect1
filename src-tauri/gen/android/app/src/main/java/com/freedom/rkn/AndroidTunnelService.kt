@@ -220,6 +220,22 @@ class AndroidTunnelService : VpnService() {
             return activeTunnelInterface?.fd ?: -1
         }
 
+        fun getTunnelAddress(): String {
+            return TUN_ADDRESS
+        }
+
+        fun getTunnelPrefixLength(): Int {
+            return TUN_PREFIX_LENGTH
+        }
+
+        fun getTunnelRoute(): String {
+            return "0.0.0.0/0"
+        }
+
+        fun getTunnelMtu(): Int {
+            return TUN_MTU
+        }
+
         fun protectSocketFd(fd: Int): Boolean {
             val service = activeInstance ?: return false
             return runCatching { service.protect(fd) }.getOrDefault(false)
