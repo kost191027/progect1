@@ -648,6 +648,20 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         .map_err(|e| format!("Failed to serialize Android runtime client config: {}", e))
 }
 
+#[cfg(target_os = "android")]
+enum AndroidRuntimeLaunchPlan {
+    StandaloneCli {
+        singbox_path: String,
+        config_path: String,
+        log_path: String,
+    },
+    TunHandoffRequired {
+        tun_fd: i32,
+        config_path: String,
+        log_path: String,
+    },
+}
+
 /// Extract the VPN server IP from the client config's outbound section.
 #[cfg(target_os = "windows")]
 fn extract_server_ip_from_config(cfg: &serde_json::Value) -> Option<String> {
@@ -2335,6 +2349,32 @@ async fn wait_for_android_tun_interface(app: &AppHandle) -> Result<String, Strin
 }
 
 #[cfg(target_os = "android")]
+fn android_runtime_uses_tun_inbound(raw_config: &str) -> Result<bool, String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
+        format!(
+            "Failed to parse Android runtime config while checking TUN handoff readiness: {}",
+            e
+        )
+    })?;
+
+    let uses_tun = parsed
+        .get("inbounds")
+        .and_then(|value| value.as_array())
+        .map(|inbounds| {
+            inbounds.iter().any(|inbound| {
+                inbound
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value == "tun")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+
+    Ok(uses_tun)
+}
+
+#[cfg(target_os = "android")]
 fn summarize_android_command_failure(prefix: &str, output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2438,6 +2478,73 @@ fn run_android_singbox_preflight(singbox_path: &str, config_path: &str) -> Resul
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn prepare_android_runtime_launch(
+    app: &AppHandle,
+    local_data: &std::path::Path,
+    config_path: &std::path::Path,
+    log_path: &str,
+    announce_prompt: bool,
+) -> Result<AndroidRuntimeLaunchPlan, String> {
+    let singbox_path = resolve_singbox_path(app)?;
+    let raw = std::fs::read_to_string(config_path).map_err(|e| {
+        format!(
+            "Failed to read base client config {}: {}",
+            config_path.display(),
+            e
+        )
+    })?;
+    let android_config_path = local_data.join("client_config_android.json");
+    let runtime_cfg = build_android_runtime_client_config(&raw, log_path)?;
+    std::fs::write(&android_config_path, &runtime_cfg).map_err(|e| {
+        format!(
+            "Failed to write Android runtime client config {}: {}",
+            android_config_path.display(),
+            e
+        )
+    })?;
+    let runtime_config_path = android_config_path.to_string_lossy().to_string();
+
+    if announce_prompt {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Starting Android runtime negotiation without desktop elevation..."
+                .to_string(),
+        );
+    }
+
+    if android_runtime_uses_tun_inbound(&runtime_cfg)? {
+        let tun_fd = android_peek_tun_fd().unwrap_or(-1);
+        let _ = app.emit(
+            "tunnel-log",
+            format!(
+                "[SYSTEM] Android TUN handoff checkpoint reached: VpnService owns fd={}, config={}, log={}. The next backend for 6A.4.1 must consume this Android-owned interface instead of launching the standalone CLI path.",
+                tun_fd, runtime_config_path, log_path
+            ),
+        );
+
+        return Ok(AndroidRuntimeLaunchPlan::TunHandoffRequired {
+            tun_fd,
+            config_path: runtime_config_path,
+            log_path: log_path.to_string(),
+        });
+    }
+
+    let _ = app.emit(
+        "tunnel-log",
+        format!(
+            "[SYSTEM] Android launch paths: sing-box={} | config={} | log={}",
+            singbox_path, runtime_config_path, log_path
+        ),
+    );
+
+    Ok(AndroidRuntimeLaunchPlan::StandaloneCli {
+        singbox_path,
+        config_path: runtime_config_path,
+        log_path: log_path.to_string(),
+    })
 }
 
 #[cfg(target_os = "android")]
@@ -2554,42 +2661,38 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
     {
         #[cfg(target_os = "android")]
         {
-            let raw = std::fs::read_to_string(&config_path).map_err(|e| {
-                format!(
-                    "Failed to read base client config {}: {}",
-                    config_path.display(),
-                    e
-                )
-            })?;
-            let android_config_path = local_data.join("client_config_android.json");
-            let runtime_cfg = build_android_runtime_client_config(&raw, log_path)?;
-            std::fs::write(&android_config_path, runtime_cfg).map_err(|e| {
-                format!(
-                    "Failed to write Android runtime client config {}: {}",
-                    android_config_path.display(),
-                    e
-                )
-            })?;
-            let config_str = android_config_path.to_string_lossy().to_string();
-
-            if announce_prompt {
-                let _ = app.emit(
-                    "tunnel-log",
-                    "[SYSTEM] Starting Android sidecar runtime without desktop elevation..."
-                        .to_string(),
-                );
+            match prepare_android_runtime_launch(
+                app,
+                &local_data,
+                &config_path,
+                log_path,
+                announce_prompt,
+            )? {
+                AndroidRuntimeLaunchPlan::StandaloneCli {
+                    singbox_path,
+                    config_path,
+                    log_path,
+                } => {
+                    run_android_singbox_preflight(&singbox_path, &config_path)?;
+                    return launch_tunnel_process_android(
+                        app,
+                        &singbox_path,
+                        &config_path,
+                        &log_path,
+                    )
+                    .await;
+                }
+                AndroidRuntimeLaunchPlan::TunHandoffRequired {
+                    tun_fd,
+                    config_path,
+                    log_path,
+                } => {
+                    return Err(format!(
+                        "Android TUN handoff is not implemented in the current runtime. VpnService is ready with fd={}, config={}, log={}. The next 6A.4.1 backend must consume this Android-owned interface instead of launching the standalone sing-box CLI.",
+                        tun_fd, config_path, log_path
+                    ));
+                }
             }
-
-            let _ = app.emit(
-                "tunnel-log",
-                format!(
-                    "[SYSTEM] Android launch paths: sing-box={} | config={} | log={}",
-                    singbox_path, config_str, log_path
-                ),
-            );
-
-            run_android_singbox_preflight(&singbox_path, &config_str)?;
-            return launch_tunnel_process_android(app, &singbox_path, &config_str, log_path).await;
         }
 
         #[cfg(not(target_os = "android"))]
@@ -2709,9 +2812,32 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
         {
             let _ = terminate_root_process(Some(app), old_pid);
             sleep(Duration::from_secs(1)).await;
-            let config_str = config_path.to_string_lossy().to_string();
-            run_android_singbox_preflight(&singbox_path, &config_str)?;
-            return launch_tunnel_process_android(app, &singbox_path, &config_str, log_path).await;
+            match prepare_android_runtime_launch(app, &local_data, &config_path, log_path, false)? {
+                AndroidRuntimeLaunchPlan::StandaloneCli {
+                    singbox_path,
+                    config_path,
+                    log_path,
+                } => {
+                    run_android_singbox_preflight(&singbox_path, &config_path)?;
+                    return launch_tunnel_process_android(
+                        app,
+                        &singbox_path,
+                        &config_path,
+                        &log_path,
+                    )
+                    .await;
+                }
+                AndroidRuntimeLaunchPlan::TunHandoffRequired {
+                    tun_fd,
+                    config_path,
+                    log_path,
+                } => {
+                    return Err(format!(
+                        "Android TUN handoff is not implemented in the current runtime. Restart reached the same checkpoint with fd={}, config={}, log={}. A libbox/SFA-style Android backend is required before mobile protection can restart for real.",
+                        tun_fd, config_path, log_path
+                    ));
+                }
+            }
         }
 
         #[cfg(not(target_os = "android"))]
