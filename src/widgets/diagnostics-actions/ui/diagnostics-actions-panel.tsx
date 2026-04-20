@@ -11,6 +11,7 @@ type DiagnosticsActionsPanelProps = {
   diagnosticsTitle: string;
   diagnosticsDescription: string;
   diagnosticsTone: "neutral" | "ready" | "attention";
+  diagnosticsDetails?: string[];
   currentCoverDomain: string | null;
   availableCoverDomains: string[];
   collapsible?: boolean;
@@ -27,6 +28,7 @@ export function DiagnosticsActionsPanel({
   diagnosticsTitle,
   diagnosticsDescription,
   diagnosticsTone,
+  diagnosticsDetails,
   currentCoverDomain,
   availableCoverDomains,
   collapsible,
@@ -101,6 +103,18 @@ export function DiagnosticsActionsPanel({
           </div>
           <div className="mt-2 text-sm font-semibold text-zinc-100">{diagnosticsTitle}</div>
           <p className="mt-2 text-sm leading-6 text-zinc-400">{diagnosticsDescription}</p>
+          {diagnosticsDetails && diagnosticsDetails.length > 0 ? (
+            <div className="mt-3 space-y-2">
+              {diagnosticsDetails.map((detail) => (
+                <div
+                  key={detail}
+                  className="rounded-xl border border-zinc-800/80 bg-black/10 px-3 py-2 text-xs leading-5 text-zinc-300"
+                >
+                  {detail}
+                </div>
+              ))}
+            </div>
+          ) : null}
         </div>
 
         <Button

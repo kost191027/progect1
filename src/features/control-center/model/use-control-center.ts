@@ -28,6 +28,7 @@ export type DiagnosticsSummary = {
   title: string;
   description: string;
   tone: "neutral" | "ready" | "attention";
+  details?: string[];
 };
 
 export type SavedServerProfile = {
@@ -86,6 +87,15 @@ type InviteRemoteSyncEvent = {
   invite_id: string;
   status: "started" | "completed" | "failed";
   message: string;
+};
+
+type AndroidRuntimeContext = {
+  backend_hint: string;
+  tun_fd: number;
+  tun_state: string;
+  config_path: string;
+  log_path: string;
+  protect_api_available: boolean;
 };
 
 const MAX_LOG_BUFFER = 800;
@@ -225,6 +235,8 @@ export function useControlCenter() {
   const [isSavingWindowsRuntimeMode, setIsSavingWindowsRuntimeMode] = useState(false);
   const [isAwaitingAndroidVpnPermission, setIsAwaitingAndroidVpnPermission] =
     useState(false);
+  const [androidRuntimeContext, setAndroidRuntimeContext] =
+    useState<AndroidRuntimeContext | null>(null);
   const [warpProfileInput, setWarpProfileInput] = useState("");
   const [warpProfileMessage, setWarpProfileMessage] = useState<string | null>(null);
   const [isCreatingWarpProfile, setIsCreatingWarpProfile] = useState(false);
@@ -269,6 +281,20 @@ export function useControlCenter() {
       message.startsWith("---")
     ) {
       setLastUserMessage(stripLogPrefix(message));
+    }
+  }
+
+  async function refreshAndroidRuntimeContext() {
+    if (!isAndroidRuntime) {
+      setAndroidRuntimeContext(null);
+      return;
+    }
+
+    try {
+      const snapshot = await invoke<AndroidRuntimeContext | null>("get_android_runtime_context");
+      setAndroidRuntimeContext(snapshot);
+    } catch {
+      // Android runtime context is best-effort diagnostics only.
     }
   }
 
@@ -390,6 +416,25 @@ export function useControlCenter() {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    void refreshAndroidRuntimeContext();
+  }, [isAndroidRuntime]);
+
+  useEffect(() => {
+    if (!isAndroidRuntime || logs.length === 0) {
+      return;
+    }
+
+    const latestLine = logs[logs.length - 1] ?? "";
+    if (
+      latestLine.includes("Android TUN handoff checkpoint reached") ||
+      latestLine.includes("Android VpnService established a real TUN interface") ||
+      latestLine.includes("Android launch paths:")
+    ) {
+      void refreshAndroidRuntimeContext();
+    }
+  }, [isAndroidRuntime, logs]);
 
   useEffect(() => {
     let isMounted = true;
@@ -699,6 +744,7 @@ export function useControlCenter() {
     try {
       await invoke("start_tunnel");
       appendLog("[SYSTEM] Tunnel routing active.");
+      await refreshAndroidRuntimeContext();
     } catch (error) {
       const message = String(error);
       if (
@@ -709,6 +755,7 @@ export function useControlCenter() {
       }
 
       appendLog(`[ERROR] starting tunnel: ${error}`);
+      await refreshAndroidRuntimeContext();
       setIsStarting(false);
     }
   }
@@ -721,6 +768,7 @@ export function useControlCenter() {
     try {
       await invoke("stop_tunnel");
       appendLog("[SYSTEM] Tunnel routing stopped.");
+      await refreshAndroidRuntimeContext();
     } catch (error) {
       appendLog(`[ERROR] stopping tunnel: ${error}`);
       setIsStopping(false);
@@ -1464,6 +1512,25 @@ export function useControlCenter() {
     const shadowTlsNoise = latestLogMatching(logs, "ShadowTLS noise:");
     const coexistenceSnapshot = latestLogMatching(logs, "Coexistence snapshot:");
 
+    if (
+      isAndroidRuntime &&
+      androidRuntimeContext?.backend_hint === "android_native_handoff_required"
+    ) {
+      return {
+        title: "Android handoff checkpoint",
+        description:
+          "VpnService already owns the mobile TUN interface. The remaining blocker is the next 6A.4.1 backend that must consume this Android-owned interface instead of the standalone CLI path.",
+        tone: "attention",
+        details: [
+          `TUN state: ${androidRuntimeContext.tun_state}`,
+          `TUN fd: ${androidRuntimeContext.tun_fd}`,
+          `Config: ${androidRuntimeContext.config_path}`,
+          `Log: ${androidRuntimeContext.log_path}`,
+          `Protect API: ${androidRuntimeContext.protect_api_available ? "available" : "unavailable"}`,
+        ],
+      };
+    }
+
     if (!runtimeHealth && !warpRouting && !shadowTlsNoise && !coexistenceSnapshot) {
       return {
         title: "Awaiting server diagnostics",
@@ -1498,7 +1565,7 @@ export function useControlCenter() {
           .join(" "),
       tone: "ready",
     };
-  }, [logs]);
+  }, [androidRuntimeContext, isAndroidRuntime, logs]);
 
   const powerQuickStatus = useMemo(() => {
     if (isDeploying) {

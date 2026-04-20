@@ -662,6 +662,17 @@ enum AndroidRuntimeLaunchPlan {
     },
 }
 
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AndroidRuntimeContextSnapshot {
+    backend_hint: String,
+    tun_fd: i32,
+    tun_state: String,
+    config_path: String,
+    log_path: String,
+    protect_api_available: bool,
+}
+
 /// Extract the VPN server IP from the client config's outbound section.
 #[cfg(target_os = "windows")]
 fn extract_server_ip_from_config(cfg: &serde_json::Value) -> Option<String> {
@@ -2375,6 +2386,57 @@ fn android_runtime_uses_tun_inbound(raw_config: &str) -> Result<bool, String> {
 }
 
 #[cfg(target_os = "android")]
+fn android_runtime_context_path(local_data: &std::path::Path) -> std::path::PathBuf {
+    local_data.join("android_runtime_context.json")
+}
+
+#[cfg(target_os = "android")]
+fn persist_android_runtime_context(
+    local_data: &std::path::Path,
+    snapshot: &AndroidRuntimeContextSnapshot,
+) -> Result<std::path::PathBuf, String> {
+    let context_path = android_runtime_context_path(local_data);
+    let payload = serde_json::to_string_pretty(snapshot)
+        .map_err(|e| format!("Failed to serialize Android runtime context: {}", e))?;
+    std::fs::write(&context_path, payload).map_err(|e| {
+        format!(
+            "Failed to write Android runtime context {}: {}",
+            context_path.display(),
+            e
+        )
+    })?;
+    Ok(context_path)
+}
+
+#[cfg(target_os = "android")]
+fn load_android_runtime_context(
+    local_data: &std::path::Path,
+) -> Result<Option<AndroidRuntimeContextSnapshot>, String> {
+    let context_path = android_runtime_context_path(local_data);
+    if !context_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(&context_path).map_err(|e| {
+        format!(
+            "Failed to read Android runtime context {}: {}",
+            context_path.display(),
+            e
+        )
+    })?;
+
+    let snapshot = serde_json::from_str::<AndroidRuntimeContextSnapshot>(&raw).map_err(|e| {
+        format!(
+            "Failed to parse Android runtime context {}: {}",
+            context_path.display(),
+            e
+        )
+    })?;
+
+    Ok(Some(snapshot))
+}
+
+#[cfg(target_os = "android")]
 fn summarize_android_command_failure(prefix: &str, output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2517,11 +2579,25 @@ fn prepare_android_runtime_launch(
 
     if android_runtime_uses_tun_inbound(&runtime_cfg)? {
         let tun_fd = android_peek_tun_fd().unwrap_or(-1);
+        let tun_state = android_tunnel_debug_state().unwrap_or_else(|_| "unknown".to_string());
+        let snapshot = AndroidRuntimeContextSnapshot {
+            backend_hint: "android_native_handoff_required".to_string(),
+            tun_fd,
+            tun_state: tun_state.clone(),
+            config_path: runtime_config_path.clone(),
+            log_path: log_path.to_string(),
+            protect_api_available: true,
+        };
+        let context_path = persist_android_runtime_context(local_data, &snapshot)?;
         let _ = app.emit(
             "tunnel-log",
             format!(
-                "[SYSTEM] Android TUN handoff checkpoint reached: VpnService owns fd={}, config={}, log={}. The next backend for 6A.4.1 must consume this Android-owned interface instead of launching the standalone CLI path.",
-                tun_fd, runtime_config_path, log_path
+                "[SYSTEM] Android TUN handoff checkpoint reached: VpnService owns fd={}, state={}, config={}, log={}, context={}. The next backend for 6A.4.1 must consume this Android-owned interface instead of launching the standalone CLI path.",
+                tun_fd,
+                tun_state,
+                runtime_config_path,
+                log_path,
+                context_path.display()
             ),
         );
 
@@ -3542,6 +3618,24 @@ async fn get_windows_runtime_mode(app: AppHandle) -> Result<WindowsRuntimeModeSt
 }
 
 #[tauri::command]
+async fn get_android_runtime_context(app: AppHandle) -> Result<Option<serde_json::Value>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        let snapshot = load_android_runtime_context(&local_data)?;
+        let value = serde_json::to_value(snapshot)
+            .map_err(|e| format!("Failed to encode Android runtime context: {}", e))?;
+        Ok(Some(value))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(None)
+    }
+}
+
+#[tauri::command]
 async fn set_windows_runtime_mode(
     app: AppHandle,
     mode: WindowsRuntimeMode,
@@ -3804,6 +3898,7 @@ pub fn run() {
             start_tunnel,
             stop_tunnel,
             get_windows_runtime_mode,
+            get_android_runtime_context,
             set_windows_runtime_mode,
             reset_local_data,
             restore_tunnel_session,

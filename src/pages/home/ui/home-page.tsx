@@ -212,6 +212,7 @@ export function HomePage({ controlCenter }: HomePageProps) {
         diagnosticsTitle={controlCenter.diagnosticsSummary.title}
         diagnosticsDescription={controlCenter.diagnosticsSummary.description}
         diagnosticsTone={controlCenter.diagnosticsSummary.tone}
+        diagnosticsDetails={controlCenter.diagnosticsSummary.details}
         currentCoverDomain={controlCenter.currentCoverDomain}
         availableCoverDomains={controlCenter.availableCoverDomains}
         onCheckStatus={controlCenter.checkServerStatus}
