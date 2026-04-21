@@ -631,6 +631,11 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
 
             if let Some(object) = inbound.as_object_mut() {
                 object.remove("interface_name");
+                object.remove("address");
+                object.remove("inet4_address");
+                object.remove("inet6_address");
+                object.remove("mtu");
+                object.remove("gso");
                 object.remove("strict_route");
             }
         }
@@ -649,12 +654,37 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
 }
 
 #[cfg(target_os = "android")]
+fn build_android_handoff_backend_config(runtime_config: &str) -> Result<String, String> {
+    let mut cfg = serde_json::from_str::<serde_json::Value>(runtime_config).map_err(|e| {
+        format!(
+            "Failed to parse Android runtime config while building handoff backend payload: {}",
+            e
+        )
+    })?;
+
+    if let Some(inbounds) = cfg
+        .get_mut("inbounds")
+        .and_then(|value| value.as_array_mut())
+    {
+        inbounds.retain(|inbound| {
+            inbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .map(|value| value != "tun")
+                .unwrap_or(true)
+        });
+    }
+
+    serde_json::to_string_pretty(&cfg).map_err(|e| {
+        format!(
+            "Failed to serialize Android handoff backend config payload: {}",
+            e
+        )
+    })
+}
+
+#[cfg(target_os = "android")]
 enum AndroidRuntimeLaunchPlan {
-    StandaloneCli {
-        singbox_path: String,
-        config_path: String,
-        log_path: String,
-    },
     TunHandoffRequired {
         tun_fd: i32,
         config_path: String,
@@ -666,6 +696,7 @@ enum AndroidRuntimeLaunchPlan {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct AndroidRuntimeContextSnapshot {
     backend_hint: String,
+    session_id: String,
     tun_fd: i32,
     tun_state: String,
     tun_address: String,
@@ -673,7 +704,79 @@ struct AndroidRuntimeContextSnapshot {
     tun_route: String,
     tun_mtu: i32,
     config_path: String,
+    backend_config_path: String,
     log_path: String,
+    protect_api_available: bool,
+    backend_session_state: String,
+    backend_session_id: String,
+    backend_session_context_path: String,
+    backend_session_config_path: String,
+    backend_session_log_path: String,
+    consumer_tag: String,
+    consumer_claim_state: String,
+    consumer_claim_path: String,
+    consumer_launch_state: String,
+    consumer_launch_path: String,
+    consumer_launch_runtime: String,
+    consumer_launch_selection: String,
+    consumer_launch_summary: String,
+    consumer_session_dir: String,
+    tun_fd_ownership: String,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AndroidBackendConsumerClaimSnapshot {
+    session_id: String,
+    consumer_tag: String,
+    claim_state: String,
+    tun_fd: i32,
+    tun_state: String,
+    tun_address: String,
+    tun_prefix_length: i32,
+    tun_route: String,
+    tun_mtu: i32,
+    context_path: String,
+    backend_config_path: String,
+    log_path: String,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AndroidNativeBackendLaunchSnapshot {
+    session_id: String,
+    consumer_tag: String,
+    launch_state: String,
+    detail: String,
+    claim_path: String,
+    launch_bundle_path: String,
+    status_path: String,
+    runtime_name: String,
+    runtime_selection: String,
+    backend_config_summary: String,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AndroidNativeBackendLaunchBundle {
+    session_id: String,
+    consumer_tag: String,
+    backend_hint: String,
+    tun_fd: i32,
+    tun_state: String,
+    tun_address: String,
+    tun_prefix_length: i32,
+    tun_route: String,
+    tun_mtu: i32,
+    config_path: String,
+    backend_config_path: String,
+    context_path: String,
+    claim_path: String,
+    log_path: String,
+    session_dir: String,
+    runtime_log_path: String,
+    runtime_status_path: String,
+    tun_fd_ownership: String,
     protect_api_available: bool,
 }
 
@@ -2305,6 +2408,11 @@ fn android_bridge_int(method: &str) -> Result<i32, String> {
 }
 
 #[cfg(target_os = "android")]
+fn android_bridge_plain_string(method: &str) -> Result<String, String> {
+    android_bridge_string(method)
+}
+
+#[cfg(target_os = "android")]
 fn android_tunnel_debug_state() -> Result<String, String> {
     android_bridge_string("getTunnelDebugState")
 }
@@ -2332,6 +2440,300 @@ fn android_tun_route() -> Result<String, String> {
 #[cfg(target_os = "android")]
 fn android_tun_mtu() -> Result<i32, String> {
     android_bridge_int("getTunnelMtu")
+}
+
+#[cfg(target_os = "android")]
+fn android_register_backend_handoff_session(
+    session_id: &str,
+    context_path: &str,
+    backend_config_path: &str,
+    log_path: &str,
+    tun_fd: i32,
+) -> Result<String, String> {
+    with_android_activity(|env, activity| {
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
+        let java_context_path = env
+            .new_string(context_path)
+            .map_err(|e| format!("Failed to allocate Android backend context path: {}", e))?;
+        let java_session_id = env
+            .new_string(session_id)
+            .map_err(|e| format!("Failed to allocate Android backend session id: {}", e))?;
+        let java_backend_config_path = env
+            .new_string(backend_config_path)
+            .map_err(|e| format!("Failed to allocate Android backend config path: {}", e))?;
+        let java_log_path = env
+            .new_string(log_path)
+            .map_err(|e| format!("Failed to allocate Android backend log path: {}", e))?;
+        let value = env
+            .call_static_method(
+                bridge,
+                "registerBackendHandoffSession",
+                "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;",
+                &[
+                    JValue::Object(&activity),
+                    JValue::Object(&JObject::from(java_session_id)),
+                    JValue::Object(&JObject::from(java_context_path)),
+                    JValue::Object(&JObject::from(java_backend_config_path)),
+                    JValue::Object(&JObject::from(java_log_path)),
+                    JValue::Int(tun_fd),
+                ],
+            )
+            .map_err(|e| format!("Failed to register Android backend handoff session: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android backend handoff session result: {}", e))?;
+        let java_string = jni::objects::JString::from(value);
+        let resolved = env
+            .get_string(&java_string)
+            .map_err(|e| {
+                format!(
+                    "Failed to read Android backend handoff session result: {}",
+                    e
+                )
+            })?
+            .to_string_lossy()
+            .into_owned();
+
+        Ok(resolved)
+    })
+}
+
+#[cfg(target_os = "android")]
+fn android_backend_handoff_state() -> Result<String, String> {
+    android_bridge_string("getBackendHandoffState")
+}
+
+#[cfg(target_os = "android")]
+fn android_backend_handoff_session_id() -> Result<String, String> {
+    android_bridge_plain_string("getBackendHandoffSessionId")
+}
+
+#[cfg(target_os = "android")]
+fn android_native_backend_status_path() -> Result<String, String> {
+    android_bridge_plain_string("getNativeBackendStatusPath")
+}
+
+#[cfg(target_os = "android")]
+fn android_native_backend_status_state() -> Result<String, String> {
+    android_bridge_plain_string("getNativeBackendStatusState")
+}
+
+#[cfg(target_os = "android")]
+fn android_claim_backend_handoff_session(
+    session_id: &str,
+    consumer_tag: &str,
+) -> Result<String, String> {
+    with_android_activity(|env, activity| {
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
+        let java_session_id = env
+            .new_string(session_id)
+            .map_err(|e| format!("Failed to allocate Android claim session id: {}", e))?;
+        let java_consumer_tag = env
+            .new_string(consumer_tag)
+            .map_err(|e| format!("Failed to allocate Android claim consumer tag: {}", e))?;
+        let value = env
+            .call_static_method(
+                bridge,
+                "claimBackendHandoffSession",
+                "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &[
+                    JValue::Object(&activity),
+                    JValue::Object(&JObject::from(java_session_id)),
+                    JValue::Object(&JObject::from(java_consumer_tag)),
+                ],
+            )
+            .map_err(|e| format!("Failed to claim Android backend handoff session: {}", e))?
+            .l()
+            .map_err(|e| {
+                format!(
+                    "Failed to decode Android backend handoff claim result: {}",
+                    e
+                )
+            })?;
+        let java_string = jni::objects::JString::from(value);
+        let resolved = env
+            .get_string(&java_string)
+            .map_err(|e| format!("Failed to read Android backend handoff claim result: {}", e))?
+            .to_string_lossy()
+            .into_owned();
+
+        Ok(resolved)
+    })
+}
+
+#[cfg(target_os = "android")]
+fn android_update_backend_handoff_session_state(
+    session_id: &str,
+    consumer_tag: &str,
+    phase: &str,
+    detail: &str,
+) -> Result<String, String> {
+    with_android_activity(|env, activity| {
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
+        let java_session_id = env
+            .new_string(session_id)
+            .map_err(|e| format!("Failed to allocate Android update session id: {}", e))?;
+        let java_consumer_tag = env
+            .new_string(consumer_tag)
+            .map_err(|e| format!("Failed to allocate Android update consumer tag: {}", e))?;
+        let java_phase = env
+            .new_string(phase)
+            .map_err(|e| format!("Failed to allocate Android update phase: {}", e))?;
+        let java_detail = env
+            .new_string(detail)
+            .map_err(|e| format!("Failed to allocate Android update detail: {}", e))?;
+        let value = env
+            .call_static_method(
+                bridge,
+                "updateBackendHandoffSessionState",
+                "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &[
+                    JValue::Object(&activity),
+                    JValue::Object(&JObject::from(java_session_id)),
+                    JValue::Object(&JObject::from(java_consumer_tag)),
+                    JValue::Object(&JObject::from(java_phase)),
+                    JValue::Object(&JObject::from(java_detail)),
+                ],
+            )
+            .map_err(|e| format!("Failed to update Android backend handoff session state: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android backend handoff state update result: {}", e))?;
+        let java_string = jni::objects::JString::from(value);
+        let resolved = env
+            .get_string(&java_string)
+            .map_err(|e| {
+                format!(
+                    "Failed to read Android backend handoff state update result: {}",
+                    e
+                )
+            })?
+            .to_string_lossy()
+            .into_owned();
+
+        Ok(resolved)
+    })
+}
+
+#[cfg(target_os = "android")]
+fn android_start_native_backend_seam(claim_path: &str) -> Result<String, String> {
+    with_android_activity(|env, activity| {
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
+        let java_claim_path = env
+            .new_string(claim_path)
+            .map_err(|e| format!("Failed to allocate Android seam claim path: {}", e))?;
+        let value = env
+            .call_static_method(
+                bridge,
+                "startNativeBackendSeam",
+                "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;",
+                &[
+                    JValue::Object(&activity),
+                    JValue::Object(&JObject::from(java_claim_path)),
+                ],
+            )
+            .map_err(|e| format!("Failed to start Android native backend seam: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android native backend seam result: {}", e))?;
+        let java_string = jni::objects::JString::from(value);
+        let resolved = env
+            .get_string(&java_string)
+            .map_err(|e| format!("Failed to read Android native backend seam result: {}", e))?
+            .to_string_lossy()
+            .into_owned();
+
+        Ok(resolved)
+    })
 }
 
 #[cfg(target_os = "android")]
@@ -2435,6 +2837,38 @@ fn android_runtime_context_path(local_data: &std::path::Path) -> std::path::Path
 }
 
 #[cfg(target_os = "android")]
+fn android_backend_consumer_claim_path(local_data: &std::path::Path) -> std::path::PathBuf {
+    local_data.join("android_backend_consumer_claim.json")
+}
+
+#[cfg(target_os = "android")]
+fn android_native_backend_launch_bundle_path(local_data: &std::path::Path) -> std::path::PathBuf {
+    local_data.join("android_native_backend_launch.json")
+}
+
+#[cfg(target_os = "android")]
+fn android_native_backend_session_root(local_data: &std::path::Path) -> std::path::PathBuf {
+    local_data.join("android_native_backend")
+}
+
+#[cfg(target_os = "android")]
+fn android_native_backend_session_dir(
+    local_data: &std::path::Path,
+    session_id: &str,
+) -> std::path::PathBuf {
+    android_native_backend_session_root(local_data).join(session_id)
+}
+
+#[cfg(target_os = "android")]
+fn create_android_handoff_session_id(tun_fd: i32) -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("android-handoff-{}-{}", millis, tun_fd)
+}
+
+#[cfg(target_os = "android")]
 fn persist_android_runtime_context(
     local_data: &std::path::Path,
     snapshot: &AndroidRuntimeContextSnapshot,
@@ -2450,6 +2884,55 @@ fn persist_android_runtime_context(
         )
     })?;
     Ok(context_path)
+}
+
+#[cfg(target_os = "android")]
+fn persist_android_backend_consumer_claim(
+    local_data: &std::path::Path,
+    snapshot: &AndroidBackendConsumerClaimSnapshot,
+) -> Result<std::path::PathBuf, String> {
+    let claim_path = android_backend_consumer_claim_path(local_data);
+    let payload = serde_json::to_string_pretty(snapshot)
+        .map_err(|e| format!("Failed to serialize Android backend consumer claim: {}", e))?;
+    std::fs::write(&claim_path, payload).map_err(|e| {
+        format!(
+            "Failed to write Android backend consumer claim {}: {}",
+            claim_path.display(),
+            e
+        )
+    })?;
+    Ok(claim_path)
+}
+
+#[cfg(target_os = "android")]
+fn persist_android_native_backend_launch_bundle(
+    local_data: &std::path::Path,
+    snapshot: &AndroidNativeBackendLaunchBundle,
+) -> Result<std::path::PathBuf, String> {
+    let launch_bundle_path = android_native_backend_launch_bundle_path(local_data);
+    if let Some(parent) = launch_bundle_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create Android native backend launch bundle directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+    let payload = serde_json::to_string_pretty(snapshot).map_err(|e| {
+        format!(
+            "Failed to serialize Android native backend launch bundle: {}",
+            e
+        )
+    })?;
+    std::fs::write(&launch_bundle_path, payload).map_err(|e| {
+        format!(
+            "Failed to write Android native backend launch bundle {}: {}",
+            launch_bundle_path.display(),
+            e
+        )
+    })?;
+    Ok(launch_bundle_path)
 }
 
 #[cfg(target_os = "android")]
@@ -2481,6 +2964,196 @@ fn load_android_runtime_context(
 }
 
 #[cfg(target_os = "android")]
+fn prepare_android_backend_consumer_handoff_inner(
+    app: Option<&AppHandle>,
+    local_data: &std::path::Path,
+    consumer_tag: &str,
+) -> Result<AndroidBackendConsumerClaimSnapshot, String> {
+    let mut runtime_context = load_android_runtime_context(local_data)?
+        .ok_or_else(|| "Android runtime handoff context is not available yet.".to_string())?;
+
+    if runtime_context.backend_hint != "android_native_handoff_required" {
+        return Err(format!(
+            "Android runtime context is not in handoff mode. Current backend hint: {}",
+            runtime_context.backend_hint
+        ));
+    }
+
+    let claim_state =
+        android_claim_backend_handoff_session(&runtime_context.session_id, consumer_tag)?;
+
+    runtime_context.backend_session_state = claim_state.clone();
+    runtime_context.consumer_tag = consumer_tag.to_string();
+    runtime_context.consumer_claim_state = claim_state.clone();
+
+    let claim_snapshot = AndroidBackendConsumerClaimSnapshot {
+        session_id: runtime_context.session_id.clone(),
+        consumer_tag: consumer_tag.to_string(),
+        claim_state: claim_state.clone(),
+        tun_fd: runtime_context.tun_fd,
+        tun_state: runtime_context.tun_state.clone(),
+        tun_address: runtime_context.tun_address.clone(),
+        tun_prefix_length: runtime_context.tun_prefix_length,
+        tun_route: runtime_context.tun_route.clone(),
+        tun_mtu: runtime_context.tun_mtu,
+        context_path: runtime_context.backend_session_context_path.clone(),
+        backend_config_path: runtime_context.backend_config_path.clone(),
+        log_path: runtime_context.log_path.clone(),
+    };
+    let claim_path = persist_android_backend_consumer_claim(local_data, &claim_snapshot)?;
+    runtime_context.consumer_claim_path = claim_path.to_string_lossy().to_string();
+    let _ = persist_android_runtime_context(local_data, &runtime_context)?;
+
+    if let Some(app) = app {
+        let _ = app.emit(
+            "tunnel-log",
+            format!(
+                "[SYSTEM] Android backend consumer handoff prepared: session={}, consumer={}, claim_state={}, claim_path={}",
+                claim_snapshot.session_id,
+                claim_snapshot.consumer_tag,
+                claim_snapshot.claim_state,
+                claim_path.display(),
+            ),
+        );
+    }
+
+    Ok(claim_snapshot)
+}
+
+#[cfg(target_os = "android")]
+fn start_android_native_backend_consumer_seam_inner(
+    app: Option<&AppHandle>,
+    local_data: &std::path::Path,
+    consumer_tag: &str,
+) -> Result<AndroidNativeBackendLaunchSnapshot, String> {
+    let mut runtime_context = load_android_runtime_context(local_data)?
+        .ok_or_else(|| "Android runtime handoff context is not available yet.".to_string())?;
+
+    let claim_path = if runtime_context.consumer_claim_path.is_empty() {
+        let claim_snapshot =
+            prepare_android_backend_consumer_handoff_inner(app, local_data, consumer_tag)?;
+        let claim_path = android_backend_consumer_claim_path(local_data);
+        runtime_context.consumer_tag = claim_snapshot.consumer_tag;
+        runtime_context.consumer_claim_state = claim_snapshot.claim_state;
+        runtime_context.consumer_claim_path = claim_path.to_string_lossy().to_string();
+        let _ = persist_android_runtime_context(local_data, &runtime_context)?;
+        claim_path
+    } else {
+        std::path::PathBuf::from(&runtime_context.consumer_claim_path)
+    };
+
+    let session_dir = android_native_backend_session_dir(local_data, &runtime_context.session_id);
+    std::fs::create_dir_all(&session_dir).map_err(|e| {
+        format!(
+            "Failed to create Android native backend session directory {}: {}",
+            session_dir.display(),
+            e
+        )
+    })?;
+    let runtime_log_path = session_dir.join("runtime.log");
+    let runtime_status_path = session_dir.join("status.json");
+    let launch_bundle = AndroidNativeBackendLaunchBundle {
+        session_id: runtime_context.session_id.clone(),
+        consumer_tag: runtime_context.consumer_tag.clone(),
+        backend_hint: runtime_context.backend_hint.clone(),
+        tun_fd: runtime_context.tun_fd,
+        tun_state: runtime_context.tun_state.clone(),
+        tun_address: runtime_context.tun_address.clone(),
+        tun_prefix_length: runtime_context.tun_prefix_length,
+        tun_route: runtime_context.tun_route.clone(),
+        tun_mtu: runtime_context.tun_mtu,
+        config_path: runtime_context.config_path.clone(),
+        backend_config_path: runtime_context.backend_config_path.clone(),
+        context_path: runtime_context.backend_session_context_path.clone(),
+        claim_path: claim_path.to_string_lossy().to_string(),
+        log_path: runtime_context.log_path.clone(),
+        session_dir: session_dir.to_string_lossy().to_string(),
+        runtime_log_path: runtime_log_path.to_string_lossy().to_string(),
+        runtime_status_path: runtime_status_path.to_string_lossy().to_string(),
+        tun_fd_ownership: "caller_retains_original".to_string(),
+        protect_api_available: runtime_context.protect_api_available,
+    };
+    let launch_bundle_path =
+        persist_android_native_backend_launch_bundle(local_data, &launch_bundle)?;
+
+    let raw = android_start_native_backend_seam(&launch_bundle_path.to_string_lossy())?;
+    let payload = serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
+        format!(
+            "Failed to parse Android native backend seam launch result: {}",
+            e
+        )
+    })?;
+
+    let launch_state = payload
+        .get("launch_state")
+        .and_then(|value| value.as_str())
+        .or_else(|| payload.get("phase").and_then(|value| value.as_str()))
+        .unwrap_or("unknown")
+        .to_string();
+    let detail = payload
+        .get("detail")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Android native backend seam did not return a detail string.")
+        .to_string();
+    let runtime_name = payload
+        .get("runtime_name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let runtime_selection = payload
+        .get("runtime_selection")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let backend_config_summary = payload
+        .get("backend_config_summary")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let status_path = payload
+        .get("status_path")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .or_else(|| android_native_backend_status_path().ok())
+        .unwrap_or_default();
+
+    runtime_context.consumer_launch_state = launch_state.clone();
+    runtime_context.consumer_launch_path = status_path.clone();
+    runtime_context.consumer_launch_runtime = runtime_name.clone();
+    runtime_context.consumer_launch_selection = runtime_selection.clone();
+    runtime_context.consumer_launch_summary = backend_config_summary.clone();
+    runtime_context.consumer_session_dir = session_dir.to_string_lossy().to_string();
+    runtime_context.tun_fd_ownership = launch_bundle.tun_fd_ownership.clone();
+    let _ = persist_android_runtime_context(local_data, &runtime_context)?;
+
+    if let Some(app) = app {
+        let _ = app.emit(
+            "tunnel-log",
+            format!(
+                "[SYSTEM] Android native backend seam processed the launch bundle: state={}, bundle_path={}, status_path={}",
+                launch_state,
+                launch_bundle_path.display(),
+                status_path
+            ),
+        );
+    }
+
+    Ok(AndroidNativeBackendLaunchSnapshot {
+        session_id: runtime_context.session_id,
+        consumer_tag: runtime_context.consumer_tag,
+        launch_state,
+        detail,
+        claim_path: claim_path.to_string_lossy().to_string(),
+        launch_bundle_path: launch_bundle_path.to_string_lossy().to_string(),
+        status_path,
+        runtime_name,
+        runtime_selection,
+        backend_config_summary,
+    })
+}
+
+#[cfg(target_os = "android")]
+#[allow(dead_code)]
 fn summarize_android_command_failure(prefix: &str, output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2550,6 +3223,7 @@ fn ensure_android_config_has_no_local_proxy_inbounds(config_path: &str) -> Resul
 }
 
 #[cfg(target_os = "android")]
+#[allow(dead_code)]
 fn run_android_singbox_preflight(singbox_path: &str, config_path: &str) -> Result<(), String> {
     ensure_android_config_has_no_local_proxy_inbounds(config_path)?;
 
@@ -2594,7 +3268,6 @@ fn prepare_android_runtime_launch(
     log_path: &str,
     announce_prompt: bool,
 ) -> Result<AndroidRuntimeLaunchPlan, String> {
-    let singbox_path = resolve_singbox_path(app)?;
     let raw = std::fs::read_to_string(config_path).map_err(|e| {
         format!(
             "Failed to read base client config {}: {}",
@@ -2612,6 +3285,16 @@ fn prepare_android_runtime_launch(
         )
     })?;
     let runtime_config_path = android_config_path.to_string_lossy().to_string();
+    let android_backend_config_path = local_data.join("client_config_android_backend.json");
+    let backend_cfg = build_android_handoff_backend_config(&runtime_cfg)?;
+    std::fs::write(&android_backend_config_path, &backend_cfg).map_err(|e| {
+        format!(
+            "Failed to write Android handoff backend config {}: {}",
+            android_backend_config_path.display(),
+            e
+        )
+    })?;
+    let backend_config_path = android_backend_config_path.to_string_lossy().to_string();
 
     if announce_prompt {
         let _ = app.emit(
@@ -2623,13 +3306,15 @@ fn prepare_android_runtime_launch(
 
     if android_runtime_uses_tun_inbound(&runtime_cfg)? {
         let tun_fd = android_peek_tun_fd().unwrap_or(-1);
+        let session_id = create_android_handoff_session_id(tun_fd);
         let tun_state = android_tunnel_debug_state().unwrap_or_else(|_| "unknown".to_string());
         let tun_address = android_tun_address().unwrap_or_else(|_| "unknown".to_string());
         let tun_prefix_length = android_tun_prefix_length().unwrap_or(-1);
         let tun_route = android_tun_route().unwrap_or_else(|_| "unknown".to_string());
         let tun_mtu = android_tun_mtu().unwrap_or(-1);
-        let snapshot = AndroidRuntimeContextSnapshot {
+        let placeholder_snapshot = AndroidRuntimeContextSnapshot {
             backend_hint: "android_native_handoff_required".to_string(),
+            session_id: session_id.clone(),
             tun_fd,
             tun_state: tun_state.clone(),
             tun_address: tun_address.clone(),
@@ -2637,14 +3322,47 @@ fn prepare_android_runtime_launch(
             tun_route: tun_route.clone(),
             tun_mtu,
             config_path: runtime_config_path.clone(),
+            backend_config_path: backend_config_path.clone(),
             log_path: log_path.to_string(),
             protect_api_available: true,
+            backend_session_state: "pending-registration".to_string(),
+            backend_session_id: session_id.clone(),
+            backend_session_context_path: String::new(),
+            backend_session_config_path: backend_config_path.clone(),
+            backend_session_log_path: log_path.to_string(),
+            consumer_tag: String::new(),
+            consumer_claim_state: "idle".to_string(),
+            consumer_claim_path: String::new(),
+            consumer_launch_state: "idle".to_string(),
+            consumer_launch_path: String::new(),
+            consumer_launch_runtime: String::new(),
+            consumer_launch_selection: String::new(),
+            consumer_launch_summary: String::new(),
+            consumer_session_dir: String::new(),
+            tun_fd_ownership: "caller_retains_original".to_string(),
         };
-        let context_path = persist_android_runtime_context(local_data, &snapshot)?;
+        let context_path = persist_android_runtime_context(local_data, &placeholder_snapshot)?;
+        let backend_session_state = android_register_backend_handoff_session(
+            &session_id,
+            &context_path.to_string_lossy(),
+            &backend_config_path,
+            log_path,
+            tun_fd,
+        )
+        .unwrap_or_else(|error| format!("registration_failed({})", error));
+        let snapshot = AndroidRuntimeContextSnapshot {
+            backend_session_state: backend_session_state.clone(),
+            backend_session_id: android_backend_handoff_session_id()
+                .unwrap_or_else(|_| session_id.clone()),
+            backend_session_context_path: context_path.to_string_lossy().to_string(),
+            ..placeholder_snapshot
+        };
+        let _ = persist_android_runtime_context(local_data, &snapshot)?;
         let _ = app.emit(
             "tunnel-log",
             format!(
-                "[SYSTEM] Android TUN handoff checkpoint reached: VpnService owns fd={}, state={}, addr={}/{}, route={}, mtu={}, config={}, log={}, context={}. The next backend for 6A.4.1 must consume this Android-owned interface instead of launching the standalone CLI path.",
+                "[SYSTEM] Android TUN handoff checkpoint reached: session={}, VpnService owns fd={}, state={}, addr={}/{}, route={}, mtu={}, config={}, backend_config={}, log={}, context={}, backend_session={}. The next backend for 6A.4.1 must consume this Android-owned interface instead of launching the standalone CLI path.",
+                session_id,
                 tun_fd,
                 tun_state,
                 tun_address,
@@ -2652,8 +3370,10 @@ fn prepare_android_runtime_launch(
                 tun_route,
                 tun_mtu,
                 runtime_config_path,
+                backend_config_path,
                 log_path,
-                context_path.display()
+                context_path.display(),
+                backend_session_state,
             ),
         );
 
@@ -2664,22 +3384,14 @@ fn prepare_android_runtime_launch(
         });
     }
 
-    let _ = app.emit(
-        "tunnel-log",
-        format!(
-            "[SYSTEM] Android launch paths: sing-box={} | config={} | log={}",
-            singbox_path, runtime_config_path, log_path
-        ),
-    );
-
-    Ok(AndroidRuntimeLaunchPlan::StandaloneCli {
-        singbox_path,
-        config_path: runtime_config_path,
-        log_path: log_path.to_string(),
-    })
+    Err(format!(
+        "Android runtime config did not contain a TUN inbound after normalization. The mobile path no longer falls back to standalone CLI because /dev/tun is not usable inside the app process. Config={}, backend_config={}",
+        runtime_config_path, backend_config_path
+    ))
 }
 
 #[cfg(target_os = "android")]
+#[allow(dead_code)]
 async fn launch_tunnel_process_android(
     _app: &AppHandle,
     singbox_path: &str,
@@ -2712,6 +3424,7 @@ async fn launch_tunnel_process_android(
 }
 
 async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result<u32, String> {
+    #[cfg(not(target_os = "android"))]
     let singbox_path = resolve_singbox_path(app)?;
 
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
@@ -2800,28 +3513,36 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                 log_path,
                 announce_prompt,
             )? {
-                AndroidRuntimeLaunchPlan::StandaloneCli {
-                    singbox_path,
-                    config_path,
-                    log_path,
-                } => {
-                    run_android_singbox_preflight(&singbox_path, &config_path)?;
-                    return launch_tunnel_process_android(
-                        app,
-                        &singbox_path,
-                        &config_path,
-                        &log_path,
-                    )
-                    .await;
-                }
                 AndroidRuntimeLaunchPlan::TunHandoffRequired {
                     tun_fd,
                     config_path,
                     log_path,
                 } => {
+                    let consumer_claim = prepare_android_backend_consumer_handoff_inner(
+                        Some(app),
+                        &local_data,
+                        "rkn_android_native_backend_seam",
+                    )
+                    .ok();
+                    let consumer_launch = start_android_native_backend_consumer_seam_inner(
+                        Some(app),
+                        &local_data,
+                        "rkn_android_native_backend_seam",
+                    )
+                    .ok();
                     return Err(format!(
-                        "Android TUN handoff is not implemented in the current runtime. VpnService is ready with fd={}, config={}, log={}. The next 6A.4.1 backend must consume this Android-owned interface instead of launching the standalone sing-box CLI.",
-                        tun_fd, config_path, log_path
+                        "Android TUN handoff is not implemented in the current runtime. VpnService is ready with fd={}, config={}, log={}. Consumer handoff has been prepared for rkn_android_native_backend_seam{}{}. The next 6A.4.1 backend must consume this Android-owned interface instead of launching the standalone sing-box CLI.",
+                        tun_fd,
+                        config_path,
+                        log_path,
+                        consumer_claim
+                            .as_ref()
+                            .map(|claim| format!(", session={}, claim_state={}, backend_config={}", claim.session_id, claim.claim_state, claim.backend_config_path))
+                            .unwrap_or_default(),
+                        consumer_launch
+                            .as_ref()
+                            .map(|launch| format!(", seam_state={}, seam_status_path={}", launch.launch_state, launch.status_path))
+                            .unwrap_or_default()
                     ));
                 }
             }
@@ -2884,6 +3605,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
 }
 
 async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, String> {
+    #[cfg(not(target_os = "android"))]
     let singbox_path = resolve_singbox_path(app)?;
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     let config_path = local_data.join("client_config.json");
@@ -2945,28 +3667,36 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
             let _ = terminate_root_process(Some(app), old_pid);
             sleep(Duration::from_secs(1)).await;
             match prepare_android_runtime_launch(app, &local_data, &config_path, log_path, false)? {
-                AndroidRuntimeLaunchPlan::StandaloneCli {
-                    singbox_path,
-                    config_path,
-                    log_path,
-                } => {
-                    run_android_singbox_preflight(&singbox_path, &config_path)?;
-                    return launch_tunnel_process_android(
-                        app,
-                        &singbox_path,
-                        &config_path,
-                        &log_path,
-                    )
-                    .await;
-                }
                 AndroidRuntimeLaunchPlan::TunHandoffRequired {
                     tun_fd,
                     config_path,
                     log_path,
                 } => {
+                    let consumer_claim = prepare_android_backend_consumer_handoff_inner(
+                        Some(app),
+                        &local_data,
+                        "rkn_android_native_backend_seam",
+                    )
+                    .ok();
+                    let consumer_launch = start_android_native_backend_consumer_seam_inner(
+                        Some(app),
+                        &local_data,
+                        "rkn_android_native_backend_seam",
+                    )
+                    .ok();
                     return Err(format!(
-                        "Android TUN handoff is not implemented in the current runtime. Restart reached the same checkpoint with fd={}, config={}, log={}. A libbox/SFA-style Android backend is required before mobile protection can restart for real.",
-                        tun_fd, config_path, log_path
+                        "Android TUN handoff is not implemented in the current runtime. Restart reached the same checkpoint with fd={}, config={}, log={}. Consumer handoff has been prepared for rkn_android_native_backend_seam{}{}. A libbox/SFA-style Android backend is required before mobile protection can restart for real.",
+                        tun_fd,
+                        config_path,
+                        log_path,
+                        consumer_claim
+                            .as_ref()
+                            .map(|claim| format!(", session={}, claim_state={}, backend_config={}", claim.session_id, claim.claim_state, claim.backend_config_path))
+                            .unwrap_or_default(),
+                        consumer_launch
+                            .as_ref()
+                            .map(|launch| format!(", seam_state={}, seam_status_path={}", launch.launch_state, launch.status_path))
+                            .unwrap_or_default()
                     ));
                 }
             }
@@ -3678,7 +4408,23 @@ async fn get_android_runtime_context(app: AppHandle) -> Result<Option<serde_json
     #[cfg(target_os = "android")]
     {
         let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
-        let snapshot = load_android_runtime_context(&local_data)?;
+        let snapshot = load_android_runtime_context(&local_data)?.map(|mut snapshot| {
+            if let Ok(live_backend_state) = android_backend_handoff_state() {
+                snapshot.backend_session_state = live_backend_state;
+            }
+            if let Ok(live_backend_session_id) = android_backend_handoff_session_id() {
+                if !live_backend_session_id.is_empty() {
+                    snapshot.backend_session_id = live_backend_session_id;
+                }
+            }
+            if let Ok(live_consumer_launch_state) = android_native_backend_status_state() {
+                snapshot.consumer_launch_state = live_consumer_launch_state;
+            }
+            if let Ok(live_consumer_launch_path) = android_native_backend_status_path() {
+                snapshot.consumer_launch_path = live_consumer_launch_path;
+            }
+            snapshot
+        });
         let value = serde_json::to_value(snapshot)
             .map_err(|e| format!("Failed to encode Android runtime context: {}", e))?;
         Ok(Some(value))
@@ -3687,6 +4433,127 @@ async fn get_android_runtime_context(app: AppHandle) -> Result<Option<serde_json
     #[cfg(not(target_os = "android"))]
     {
         let _ = app;
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn claim_android_backend_session(
+    session_id: String,
+    consumer_tag: String,
+) -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = android_claim_backend_handoff_session(&session_id, &consumer_tag)?;
+        Ok(Some(state))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = session_id;
+        let _ = consumer_tag;
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn prepare_android_backend_consumer_handoff(
+    app: AppHandle,
+    consumer_tag: String,
+) -> Result<Option<serde_json::Value>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        let claim_snapshot =
+            prepare_android_backend_consumer_handoff_inner(Some(&app), &local_data, &consumer_tag)?;
+        let claim_path = android_backend_consumer_claim_path(&local_data);
+        let response = serde_json::json!({
+            "session_id": claim_snapshot.session_id,
+            "consumer_tag": claim_snapshot.consumer_tag,
+            "claim_state": claim_snapshot.claim_state,
+            "claim_path": claim_path.to_string_lossy().to_string(),
+            "context_path": claim_snapshot.context_path,
+            "backend_config_path": claim_snapshot.backend_config_path,
+            "log_path": claim_snapshot.log_path,
+            "tun_fd": claim_snapshot.tun_fd,
+            "tun_state": claim_snapshot.tun_state,
+            "tun_address": claim_snapshot.tun_address,
+            "tun_prefix_length": claim_snapshot.tun_prefix_length,
+            "tun_route": claim_snapshot.tun_route,
+            "tun_mtu": claim_snapshot.tun_mtu,
+        });
+
+        Ok(Some(response))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = consumer_tag;
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn start_android_native_backend_consumer_seam(
+    app: AppHandle,
+    consumer_tag: String,
+) -> Result<Option<serde_json::Value>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        let launch_snapshot = start_android_native_backend_consumer_seam_inner(
+            Some(&app),
+            &local_data,
+            &consumer_tag,
+        )?;
+        let response = serde_json::json!({
+            "session_id": launch_snapshot.session_id,
+            "consumer_tag": launch_snapshot.consumer_tag,
+            "launch_state": launch_snapshot.launch_state,
+            "detail": launch_snapshot.detail,
+            "claim_path": launch_snapshot.claim_path,
+            "launch_bundle_path": launch_snapshot.launch_bundle_path,
+            "status_path": launch_snapshot.status_path,
+            "runtime_name": launch_snapshot.runtime_name,
+            "runtime_selection": launch_snapshot.runtime_selection,
+            "backend_config_summary": launch_snapshot.backend_config_summary,
+        });
+        Ok(Some(response))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = consumer_tag;
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn update_android_backend_consumer_state(
+    session_id: String,
+    consumer_tag: String,
+    phase: String,
+    detail: String,
+) -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = android_update_backend_handoff_session_state(
+            &session_id,
+            &consumer_tag,
+            &phase,
+            &detail,
+        )?;
+        Ok(Some(state))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = session_id;
+        let _ = consumer_tag;
+        let _ = phase;
+        let _ = detail;
         Ok(None)
     }
 }
@@ -3955,6 +4822,10 @@ pub fn run() {
             stop_tunnel,
             get_windows_runtime_mode,
             get_android_runtime_context,
+            claim_android_backend_session,
+            prepare_android_backend_consumer_handoff,
+            start_android_native_backend_consumer_seam,
+            update_android_backend_consumer_state,
             set_windows_runtime_mode,
             reset_local_data,
             restore_tunnel_session,

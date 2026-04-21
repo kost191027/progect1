@@ -16,6 +16,8 @@
     "tauri:android:build:apk": "node scripts/run-android-tauri.mjs build --apk --target aarch64",
     "tauri:android:build:aab": "node scripts/run-android-tauri.mjs build --aab --target aarch64",
     "android:doctor": "node scripts/android-doctor.mjs",
+    "android:libbox:prepare": "node scripts/android-libbox-prepare.mjs",
+    "android:libbox:inspect": "node scripts/android-libbox-inspect.mjs",
     "android:install:debug": "node scripts/android-install-debug.mjs",
     "version:sync": "node scripts/version-manager.mjs sync",
     "version:check": "node scripts/version-manager.mjs check",

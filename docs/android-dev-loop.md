@@ -24,6 +24,49 @@ Expected critical checks:
 - `NDK_HOME`
 - Android scaffold in `src-tauri/gen/android`
 - Android `llvm-ranlib` availability for cross-compiling crates like `openssl-sys`
+- local `libbox.aar` presence at `src-tauri/gen/android/app/libs/libbox.aar` for the preferred Android-native runtime path
+
+## Preferred runtime path
+
+The preferred Android runtime path is now `libbox`, not the old standalone CLI fallback.
+
+Place the local AAR here:
+
+```text
+src-tauri/gen/android/app/libs/libbox.aar
+```
+
+Notes:
+
+- This file is intentionally ignored by git.
+- The repo keeps only `src-tauri/gen/android/app/libs/.gitkeep`.
+- If `libbox.aar` is missing, the Android runtime selection falls back to the stub backend and tunnel traffic still will not start for real.
+
+Prepare the AAR through the official upstream build path:
+
+```bash
+npm run android:libbox:prepare
+```
+
+What this does:
+
+- clones or updates `SagerNet/sing-box`
+- clones or updates `SagerNet/sing-box-for-android`
+- runs upstream `go run ./cmd/internal/build_libbox -target android`
+- copies `libbox.aar` and `libbox-legacy.aar` into `src-tauri/gen/android/app/libs`
+- runs the local inspect step afterwards
+
+Inspect the dropped AAR before wiring the bridge:
+
+```bash
+npm run android:libbox:inspect
+```
+
+This prints:
+
+- whether `classes.jar` is present
+- which `jni/arm64-v8a/*.so` entries exist
+- which package/class paths look relevant for the future libbox bridge
 
 ## Fast local loop
 

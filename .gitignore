@@ -42,6 +42,8 @@ sing-box*.json
 tmp
 temp
 src-tauri/gen/android/app/src/main/assets/
+src-tauri/gen/android/app/libs/*.aar
+!src-tauri/gen/android/app/libs/.gitkeep
 
 # Editor directories and files
 .vscode/*

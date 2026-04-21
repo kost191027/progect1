@@ -91,6 +91,7 @@ type InviteRemoteSyncEvent = {
 
 type AndroidRuntimeContext = {
   backend_hint: string;
+  session_id: string;
   tun_fd: number;
   tun_state: string;
   tun_address: string;
@@ -98,8 +99,24 @@ type AndroidRuntimeContext = {
   tun_route: string;
   tun_mtu: number;
   config_path: string;
+  backend_config_path: string;
   log_path: string;
   protect_api_available: boolean;
+  backend_session_state: string;
+  backend_session_id: string;
+  backend_session_context_path: string;
+  backend_session_config_path: string;
+  backend_session_log_path: string;
+  consumer_tag: string;
+  consumer_claim_state: string;
+  consumer_claim_path: string;
+  consumer_launch_state: string;
+  consumer_launch_path: string;
+  consumer_launch_runtime: string;
+  consumer_launch_selection: string;
+  consumer_launch_summary: string;
+  consumer_session_dir: string;
+  tun_fd_ownership: string;
 };
 
 const MAX_LOG_BUFFER = 800;
@@ -1545,14 +1562,29 @@ export function useControlCenter() {
           "VpnService already owns the mobile TUN interface. The remaining blocker is the next 6A.4.1 backend that must consume this Android-owned interface instead of the standalone CLI path.",
         tone: "attention",
         details: [
+          `Handoff session: ${androidRuntimeContext.session_id}`,
           `TUN state: ${androidRuntimeContext.tun_state}`,
           `TUN fd: ${androidRuntimeContext.tun_fd}`,
           `TUN address: ${androidRuntimeContext.tun_address}/${androidRuntimeContext.tun_prefix_length}`,
           `TUN route: ${androidRuntimeContext.tun_route}`,
           `TUN mtu: ${androidRuntimeContext.tun_mtu}`,
           `Config: ${androidRuntimeContext.config_path}`,
+          `Backend config: ${androidRuntimeContext.backend_config_path}`,
           `Log: ${androidRuntimeContext.log_path}`,
           `Protect API: ${androidRuntimeContext.protect_api_available ? "available" : "unavailable"}`,
+          `Backend session: ${androidRuntimeContext.backend_session_state}`,
+          `Backend session id: ${androidRuntimeContext.backend_session_id}`,
+          `Backend session context: ${androidRuntimeContext.backend_session_context_path}`,
+          `Consumer tag: ${androidRuntimeContext.consumer_tag || "not prepared"}`,
+          `Consumer claim: ${androidRuntimeContext.consumer_claim_state}`,
+          `Consumer claim path: ${androidRuntimeContext.consumer_claim_path || "not created"}`,
+          `Consumer seam: ${androidRuntimeContext.consumer_launch_state || "idle"}`,
+          `Consumer runtime: ${androidRuntimeContext.consumer_launch_runtime || "unknown"}`,
+          `Consumer selection: ${androidRuntimeContext.consumer_launch_selection || "not resolved"}`,
+          `Consumer summary: ${androidRuntimeContext.consumer_launch_summary || "not available"}`,
+          `Consumer session dir: ${androidRuntimeContext.consumer_session_dir || "not created"}`,
+          `TUN fd ownership: ${androidRuntimeContext.tun_fd_ownership || "not specified"}`,
+          `Consumer seam status: ${androidRuntimeContext.consumer_launch_path || "not created"}`,
         ],
       };
     }

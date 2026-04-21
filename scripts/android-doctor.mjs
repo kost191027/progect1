@@ -1,8 +1,10 @@
 import { accessSync, constants, existsSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-const cwd = process.cwd();
+const scriptDir = fileURLToPath(new URL(".", import.meta.url));
+const projectRoot = join(scriptDir, "..");
 const checks = [];
 
 const fallbackJavaHomes = [
@@ -121,15 +123,39 @@ pushCheck(
   androidRanlib || "not set",
 );
 
-const androidScaffoldRoot = join(cwd, "src-tauri", "gen", "android");
+const androidScaffoldRoot = join(projectRoot, "src-tauri", "gen", "android");
 pushCheck(
   "Android scaffold",
   existsSync(androidScaffoldRoot),
   androidScaffoldRoot,
 );
 
+const androidNativeBackendRuntime = "libbox";
+pushCheck(
+  "Android native backend runtime",
+  true,
+  androidNativeBackendRuntime,
+);
+
+const androidLibboxAar = join(
+  projectRoot,
+  "src-tauri",
+  "gen",
+  "android",
+  "app",
+  "libs",
+  "libbox.aar",
+);
+pushCheck(
+  "Android libbox AAR",
+  existsSync(androidLibboxAar),
+  existsSync(androidLibboxAar)
+    ? `${androidLibboxAar} (present)`
+    : `${androidLibboxAar} (missing; required for the preferred libbox runtime path)`,
+);
+
 const androidSidecar = join(
-  cwd,
+  projectRoot,
   "src-tauri",
   "bins",
   "sing-box-aarch64-linux-android",

@@ -22,8 +22,10 @@ class AndroidTunnelService : VpnService() {
 
         when (intent?.action) {
             ACTION_STOP -> {
+                stopRunningBackend()
                 stopManagedCoreProcess()
                 closeTunnelInterface()
+                clearBackendHandoffSession()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
@@ -50,8 +52,10 @@ class AndroidTunnelService : VpnService() {
     }
 
     override fun onRevoke() {
+        stopRunningBackend()
         stopManagedCoreProcess()
         closeTunnelInterface()
+        clearBackendHandoffSession()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         super.onRevoke()
@@ -61,7 +65,9 @@ class AndroidTunnelService : VpnService() {
         if (activeInstance === this) {
             activeInstance = null
         }
+        stopRunningBackend()
         closeTunnelInterface()
+        clearBackendHandoffSession()
         super.onDestroy()
     }
 
@@ -189,6 +195,20 @@ class AndroidTunnelService : VpnService() {
         private var lastTunnelError: String? = null
         @Volatile
         private var lastTunnelState: String = "idle"
+        @Volatile
+        private var backendHandoffState: String = "idle"
+        @Volatile
+        private var backendHandoffSessionId: String = ""
+        @Volatile
+        private var backendHandoffConsumerTag: String = ""
+        @Volatile
+        private var backendHandoffContextPath: String = ""
+        @Volatile
+        private var backendHandoffConfigPath: String = ""
+        @Volatile
+        private var backendHandoffLogPath: String = ""
+        @Volatile
+        private var activeBackendRunningHandle: AndroidNativeBackendRunningHandle? = null
 
         const val ACTION_START = "com.freedom.rkn.action.START_TUNNEL_SERVICE"
         const val ACTION_STOP = "com.freedom.rkn.action.STOP_TUNNEL_SERVICE"
@@ -236,9 +256,109 @@ class AndroidTunnelService : VpnService() {
             return TUN_MTU
         }
 
+        fun registerBackendHandoffSession(
+            sessionId: String,
+            contextPath: String,
+            backendConfigPath: String,
+            logPath: String,
+            tunFd: Int,
+        ): String {
+            synchronized(STATE_LOCK) {
+                backendHandoffSessionId = sessionId
+                backendHandoffContextPath = contextPath
+                backendHandoffConfigPath = backendConfigPath
+                backendHandoffLogPath = logPath
+                backendHandoffState =
+                    "pending(session=$sessionId, fd=$tunFd, context=$contextPath, backend_config=$backendConfigPath, log=$logPath)"
+                return backendHandoffState
+            }
+        }
+
+        fun claimBackendHandoffSession(sessionId: String, consumerTag: String): String {
+            synchronized(STATE_LOCK) {
+                if (backendHandoffSessionId.isEmpty()) {
+                    return "missing"
+                }
+
+                if (backendHandoffSessionId != sessionId) {
+                    return "session-mismatch(current=$backendHandoffSessionId, requested=$sessionId)"
+                }
+
+                backendHandoffConsumerTag = consumerTag
+                backendHandoffState = "claimed(session=$sessionId, consumer=$consumerTag)"
+                return backendHandoffState
+            }
+        }
+
+        fun updateBackendHandoffSessionState(
+            sessionId: String,
+            consumerTag: String,
+            phase: String,
+            detail: String?,
+        ): String {
+            synchronized(STATE_LOCK) {
+                if (backendHandoffSessionId.isEmpty()) {
+                    return "missing"
+                }
+
+                if (backendHandoffSessionId != sessionId) {
+                    return "session-mismatch(current=$backendHandoffSessionId, requested=$sessionId)"
+                }
+
+                if (backendHandoffConsumerTag.isNotEmpty() && backendHandoffConsumerTag != consumerTag) {
+                    return "consumer-mismatch(current=$backendHandoffConsumerTag, requested=$consumerTag)"
+                }
+
+                backendHandoffConsumerTag = consumerTag
+                backendHandoffState = if (detail.isNullOrBlank()) {
+                    "$phase(session=$sessionId, consumer=$consumerTag)"
+                } else {
+                    "$phase(session=$sessionId, consumer=$consumerTag, detail=$detail)"
+                }
+                return backendHandoffState
+            }
+        }
+
+        fun getBackendHandoffState(): String {
+            return backendHandoffState
+        }
+
+        fun getBackendHandoffSessionId(): String {
+            return backendHandoffSessionId
+        }
+
+        fun getBackendHandoffContextPath(): String {
+            return backendHandoffContextPath
+        }
+
+        fun getBackendHandoffConfigPath(): String {
+            return backendHandoffConfigPath
+        }
+
+        fun getBackendHandoffLogPath(): String {
+            return backendHandoffLogPath
+        }
+
         fun protectSocketFd(fd: Int): Boolean {
             val service = activeInstance ?: return false
             return runCatching { service.protect(fd) }.getOrDefault(false)
+        }
+
+        fun registerRunningBackend(handle: AndroidNativeBackendRunningHandle) {
+            synchronized(STATE_LOCK) {
+                activeBackendRunningHandle = handle
+            }
+        }
+
+        fun stopRunningBackend(): String {
+            synchronized(STATE_LOCK) {
+                val handle = activeBackendRunningHandle ?: return "idle"
+                val runtime = AndroidNativeBackendRuntimeRegistry.byId(handle.runtimeId)
+                    ?: return "missing(runtime=${handle.runtimeId}, session=${handle.sessionId})"
+                val state = runtime.stop(handle)
+                activeBackendRunningHandle = null
+                return state
+            }
         }
 
         private fun buildTunnelStateSummary(descriptor: ParcelFileDescriptor?): String {
@@ -255,6 +375,18 @@ class AndroidTunnelService : VpnService() {
                 if (lastTunnelError == null) {
                     lastTunnelState = "idle"
                 }
+            }
+        }
+
+        private fun clearBackendHandoffSession() {
+            synchronized(STATE_LOCK) {
+                activeBackendRunningHandle = null
+                backendHandoffState = "idle"
+                backendHandoffSessionId = ""
+                backendHandoffConsumerTag = ""
+                backendHandoffContextPath = ""
+                backendHandoffConfigPath = ""
+                backendHandoffLogPath = ""
             }
         }
     }

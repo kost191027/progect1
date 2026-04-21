@@ -15,6 +15,9 @@ val tauriProperties = Properties().apply {
     }
 }
 
+val androidLibboxAar = file("libs/libbox.aar")
+val hasLocalLibboxAar = androidLibboxAar.exists()
+
 android {
     compileSdk = 36
     namespace = "com.freedom.rkn"
@@ -31,6 +34,17 @@ android {
         }
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        buildConfigField("String", "ANDROID_NATIVE_BACKEND_RUNTIME", "\"libbox\"")
+        buildConfigField(
+            "boolean",
+            "ANDROID_NATIVE_BACKEND_LIBBOX_AAR_PRESENT",
+            hasLocalLibboxAar.toString(),
+        )
+        buildConfigField(
+            "String",
+            "ANDROID_NATIVE_BACKEND_LIBBOX_AAR_PATH",
+            "\"${androidLibboxAar.absolutePath}\"",
+        )
     }
     buildTypes {
         getByName("debug") {
@@ -94,6 +108,9 @@ tasks.named("preBuild").configure {
 }
 
 dependencies {
+    if (hasLocalLibboxAar) {
+        implementation(files(androidLibboxAar))
+    }
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")
