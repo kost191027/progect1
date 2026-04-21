@@ -240,6 +240,15 @@ class AndroidTunnelService : VpnService() {
             return activeTunnelInterface?.fd ?: -1
         }
 
+        fun duplicateTunnelInterface(): ParcelFileDescriptor? {
+            synchronized(STATE_LOCK) {
+                val descriptor = activeTunnelInterface ?: return null
+                return runCatching {
+                    ParcelFileDescriptor.dup(descriptor.fileDescriptor)
+                }.getOrNull()
+            }
+        }
+
         fun getTunnelAddress(): String {
             return TUN_ADDRESS
         }

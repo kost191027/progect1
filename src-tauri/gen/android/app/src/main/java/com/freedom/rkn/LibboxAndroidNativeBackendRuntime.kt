@@ -80,6 +80,8 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
         val backendSummary = readBackendConfigSummary(bundle.backendConfigPath)
 
         return runCatching {
+            // configPath is the full Android runtime config with tun inbound intact.
+            // backendConfigPath remains the stripped diagnostic/handoff payload for other adapters.
             val configFile = File(bundle.configPath)
             require(configFile.exists()) {
                 "libbox runtime could not find the Android runtime config at ${bundle.configPath}."
@@ -105,6 +107,9 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             val handler = RknLibboxCommandServerHandler(context.applicationContext, bundle)
             val commandServer = Libbox.newCommandServer(handler, platformInterface)
             val configContent = configFile.readText()
+            require(configContainsTunInbound(configContent)) {
+                "libbox runtime expected configPath=${bundle.configPath} to contain a tun inbound, but it did not. backendConfigPath=${bundle.backendConfigPath} stays diagnostic-only and cannot replace the full runtime config."
+            }
 
             try {
                 commandServer.start()
@@ -247,6 +252,20 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
         }
     }
 
+    private fun configContainsTunInbound(raw: String): Boolean {
+        return runCatching {
+            val payload = JSONObject(raw)
+            val inbounds = payload.optJSONArray("inbounds") ?: return false
+            for (index in 0 until inbounds.length()) {
+                val type = inbounds.optJSONObject(index)?.optString("type")
+                if (type == "tun") {
+                    return true
+                }
+            }
+            false
+        }.getOrDefault(false)
+    }
+
     private fun JSONArray?.toTagList(): String {
         if (this == null || length() == 0) {
             return "none"
@@ -378,12 +397,15 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
                     runCatching { descriptor.close() }
                 }
 
-                val duplicated = ParcelFileDescriptor.fromFd(bundle.tunFd)
+                val duplicated = AndroidTunnelService.duplicateTunnelInterface()
+                    ?: throw IllegalStateException(
+                        "AndroidTunnelService could not duplicate the active VpnService TUN interface for libbox.",
+                    )
                 duplicatedTunDescriptor = duplicated
                 writeRuntimeLog(
                     bundle.runtimeLogPath,
                     "openTun() duplicated the VpnService-owned TUN fd",
-                    "original_fd=${bundle.tunFd}",
+                    "handoff_trace_fd=${bundle.tunFd}",
                     "dup_fd=${duplicated.fd}",
                     "ownership=${bundle.tunFdOwnership}",
                     "options: mtu=${runCatching { options.mtu }.getOrDefault(-1)}, autoRoute=${runCatching { options.autoRoute }.getOrDefault(false)}, strictRoute=${runCatching { options.strictRoute }.getOrDefault(false)}",
