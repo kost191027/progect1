@@ -3,6 +3,8 @@ package com.freedom.rkn
 import android.content.Context
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.content.Context.CONNECTIVITY_SERVICE
+import android.net.ConnectivityManager
 import android.util.Log
 import io.nekohasekai.libbox.CommandServer
 import io.nekohasekai.libbox.CommandServerHandler
@@ -24,6 +26,9 @@ import org.json.JSONObject
 import java.io.File
 import java.net.NetworkInterface as JNetworkInterface
 import java.security.KeyStore
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
     override val runtimeId: String = "libbox"
@@ -96,15 +101,40 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
                 "backend summary: $backendSummary",
             )
 
+            // 6A.4.1 DoD #3: before we touch libbox again, synchronously drain any
+            // runtime state left over from a previous session. Without this, the
+            // previous CommandServer may still be alive inside the Go runtime, and
+            // reloadSetupOptions / startOrReloadService below will deadlock on the
+            // libbox JNI side, leaving the launch thread stuck forever.
+            drainLingeringRuntimeStates(bundle.runtimeLogPath, bundle.sessionId)
+
+            writeRuntimeLog(bundle.runtimeLogPath, "step: ensureLibboxSetup begin")
             ensureLibboxSetup(context, bundle)
+            writeRuntimeLog(bundle.runtimeLogPath, "step: ensureLibboxSetup done")
 
-            val existing = synchronized(runtimeStates) {
-                runtimeStates.remove(bundle.sessionId)
+            writeRuntimeLog(bundle.runtimeLogPath, "step: create platform interface")
+            val tunOpened = AtomicBoolean(false)
+            val platformInterface = RknLibboxPlatformInterface(
+                context.applicationContext,
+                bundle,
+            ) { detail ->
+                if (tunOpened.compareAndSet(false, true)) {
+                    persistRuntimePhase(
+                        bundle = bundle,
+                        phase = "ready",
+                        detail = detail,
+                        runtimeName = runtimeName,
+                        runtimeSelection = "preferred=${BuildConfig.ANDROID_NATIVE_BACKEND_RUNTIME}, selected=$runtimeId",
+                        backendConfigSummary = backendSummary,
+                    )
+                }
             }
-            existing?.close("replace-existing-session")
-
-            val platformInterface = RknLibboxPlatformInterface(context.applicationContext, bundle)
+            writeRuntimeLog(bundle.runtimeLogPath, "step: create command server")
             val handler = RknLibboxCommandServerHandler(context.applicationContext, bundle)
+            // This libbox AAR exposes the CommandServer-driven startup flow that SFA wraps
+            // inside its own BoxService layer. There is no Libbox.newService()/BoxService
+            // symbol in the current binary, so the native runtime must bootstrap through
+            // CommandServer.startOrReloadService().
             val commandServer = Libbox.newCommandServer(handler, platformInterface)
             val configContent = configFile.readText()
             require(configContainsTunInbound(configContent)) {
@@ -112,8 +142,16 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             }
 
             try {
+                writeRuntimeLog(bundle.runtimeLogPath, "step: commandServer.start begin")
                 commandServer.start()
+                writeRuntimeLog(bundle.runtimeLogPath, "step: commandServer.start done")
+                writeRuntimeLog(
+                    bundle.runtimeLogPath,
+                    "step: commandServer.startOrReloadService begin",
+                    "config_size=${configContent.length}",
+                )
                 commandServer.startOrReloadService(configContent, OverrideOptions())
+                writeRuntimeLog(bundle.runtimeLogPath, "step: commandServer.startOrReloadService done")
             } catch (error: Throwable) {
                 runCatching { commandServer.close() }
                 platformInterface.close()
@@ -132,14 +170,18 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
 
             writeRuntimeLog(
                 bundle.runtimeLogPath,
-                "libbox runtime is ready",
+                if (tunOpened.get()) "libbox runtime is ready" else "libbox runtime is starting and waiting for openTun()",
                 "libbox version: ${runCatching { Libbox.version() }.getOrDefault("unknown")}",
                 "launch config: ${bundle.configPath}",
             )
 
             AndroidNativeBackendLaunchResult(
-                phase = "ready",
-                detail = "libbox runtime started and consumed the Android handoff session with a duplicated VpnService-owned TUN fd.",
+                phase = if (tunOpened.get()) "ready" else "starting",
+                detail = if (tunOpened.get()) {
+                    "libbox runtime started and consumed the Android handoff session with a duplicated VpnService-owned TUN fd."
+                } else {
+                    "libbox runtime started and is waiting for the first openTun callback before marking the tunnel ready."
+                },
                 runtimeName = runtimeName,
                 backendConfigSummary = backendSummary,
                 runningHandle = AndroidNativeBackendRunningHandle(
@@ -194,25 +236,74 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             crashReportSource = TAG
         }
 
+        // Platform helpers are process-scoped and do not need setupLock.
+        writeRuntimeLog(bundle.runtimeLogPath, "step: AndroidLocalResolver.init begin")
+        AndroidLocalResolver.init(context.applicationContext)
+        writeRuntimeLog(bundle.runtimeLogPath, "step: AndroidLocalResolver.init done")
+
+        writeRuntimeLog(bundle.runtimeLogPath, "step: AndroidDefaultNetworkMonitor.ensureStarted begin")
+        AndroidDefaultNetworkMonitor.ensureStarted(context.applicationContext)
+        writeRuntimeLog(bundle.runtimeLogPath, "step: AndroidDefaultNetworkMonitor.ensureStarted done")
+
         synchronized(setupLock) {
             if (setupInitialized) {
-                Libbox.reloadSetupOptions(options)
                 writeRuntimeLog(
                     bundle.runtimeLogPath,
-                    "libbox setup options reloaded",
+                    "step: Libbox.reloadSetupOptions begin",
                     "base=${baseDir.absolutePath}",
                     "working=${workingDir.absolutePath}",
                     "temp=${tempDir.absolutePath}",
                 )
+                Libbox.reloadSetupOptions(options)
+                writeRuntimeLog(bundle.runtimeLogPath, "step: Libbox.reloadSetupOptions done")
             } else {
-                Libbox.setup(options)
-                setupInitialized = true
                 writeRuntimeLog(
                     bundle.runtimeLogPath,
-                    "libbox global setup complete",
+                    "step: Libbox.setup begin",
                     "base=${baseDir.absolutePath}",
                     "working=${workingDir.absolutePath}",
                     "temp=${tempDir.absolutePath}",
+                )
+                Libbox.setup(options)
+                setupInitialized = true
+                writeRuntimeLog(bundle.runtimeLogPath, "step: Libbox.setup done")
+            }
+        }
+    }
+
+    /**
+     * Synchronously close any runtime states left in the registry from previous sessions.
+     *
+     * Per 6A.4.1 DoD #3, Stop must drain both the VPN-service anchor and the local runtime
+     * without hanging state. The stop path itself has a bounded wait for responsiveness, so
+     * state can occasionally outlive a user-initiated Stop. Before we bootstrap a new libbox
+     * session we must make sure no previous CommandServer is still alive inside the Go
+     * runtime — otherwise `Libbox.reloadSetupOptions` and `startOrReloadService` deadlock
+     * and the launch thread is stuck forever, which is exactly the
+     * "stayed in a pending launch state" failure the Rust side reports.
+     */
+    private fun drainLingeringRuntimeStates(runtimeLogPath: String, newSessionId: String) {
+        val lingering = synchronized(runtimeStates) {
+            if (runtimeStates.isEmpty()) {
+                return
+            }
+            val snapshot = runtimeStates.values.toList()
+            runtimeStates.clear()
+            snapshot
+        }
+
+        writeRuntimeLog(
+            runtimeLogPath,
+            "draining ${lingering.size} lingering libbox runtime state(s) before new session $newSessionId",
+        )
+        for (state in lingering) {
+            runCatching {
+                val detail = state.close("new-session-$newSessionId")
+                writeRuntimeLog(runtimeLogPath, "drained previous session ${state.sessionId}: $detail")
+            }.onFailure { error ->
+                writeRuntimeLog(
+                    runtimeLogPath,
+                    "drain of previous session ${state.sessionId} reported error: ${error.message ?: error::class.java.simpleName}",
                 )
             }
         }
@@ -291,6 +382,57 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
         }
     }
 
+    private fun persistRuntimePhase(
+        bundle: AndroidNativeBackendLaunchBundlePayload,
+        phase: String,
+        detail: String,
+        runtimeName: String,
+        runtimeSelection: String,
+        backendConfigSummary: String,
+    ) {
+        val launchState = AndroidTunnelService.updateBackendHandoffSessionState(
+            sessionId = bundle.sessionId,
+            consumerTag = bundle.consumerTag,
+            phase = phase,
+            detail = detail,
+        )
+        val payload = JSONObject().apply {
+            put("phase", phase)
+            put("detail", detail)
+            put("runtime_name", runtimeName)
+            put("backend_config_summary", backendConfigSummary)
+            put("runtime_selection", runtimeSelection)
+            put("session_id", bundle.sessionId)
+            put("consumer_tag", bundle.consumerTag)
+            put("launch_bundle_path", bundle.claimPath)
+            put("claim_path", bundle.claimPath)
+            put("status_path", bundle.runtimeStatusPath)
+            put("tun_fd", bundle.tunFd)
+            put("tun_state", bundle.tunState)
+            put("context_path", bundle.contextPath)
+            put("backend_config_path", bundle.backendConfigPath)
+            put("log_path", bundle.logPath)
+            put("session_dir", bundle.sessionDir)
+            put("runtime_log_path", bundle.runtimeLogPath)
+            put("runtime_status_path", bundle.runtimeStatusPath)
+            put("tun_fd_ownership", bundle.tunFdOwnership)
+            put("launch_state", launchState)
+        }
+
+        runCatching {
+            val statusFile = File(bundle.runtimeStatusPath)
+            statusFile.parentFile?.mkdirs()
+            statusFile.writeText(payload.toString(2))
+
+            val global = File(bundle.logPath).parentFile?.let { logDir ->
+                File(logDir.parentFile ?: logDir, "android_native_backend_status.json")
+            }
+            if (global != null && global.absolutePath != statusFile.absolutePath) {
+                global.writeText(payload.toString(2))
+            }
+        }
+    }
+
     private data class LibboxRuntimeState(
         val sessionId: String,
         val commandServer: CommandServer,
@@ -301,23 +443,47 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
         fun close(reason: String): String {
             stopping = true
             val details = mutableListOf<String>()
-            runCatching {
-                commandServer.closeService()
-                details += "closeService=ok"
-            }.onFailure { error ->
-                details += "closeService=${error.message ?: error::class.java.simpleName}"
+            val finished = CountDownLatch(1)
+
+            Thread({
+                try {
+                    runCatching {
+                        commandServer.closeService()
+                        details += "closeService=ok"
+                    }.onFailure { error ->
+                        details += "closeService=${error.message ?: error::class.java.simpleName}"
+                    }
+                    runCatching {
+                        commandServer.close()
+                        details += "close=ok"
+                    }.onFailure { error ->
+                        details += "close=${error.message ?: error::class.java.simpleName}"
+                    }
+                } finally {
+                    platformInterface.close()
+                    finished.countDown()
+                }
+            }, "rkn-libbox-stop-$sessionId").start()
+
+            // 6A.4.1 DoD #3: we must not return from Stop while libbox is still live.
+            // The previous 1500ms window was not enough on real devices and caused the
+            // next Start to collide with a still-running CommandServer. Five seconds
+            // keeps UX responsive while letting libbox actually drain on slow devices.
+            val settled = finished.await(5000, TimeUnit.MILLISECONDS)
+            val finalDetail = if (settled) {
+                details.joinToString(",")
+            } else {
+                (details + "close=background").joinToString(",")
             }
-            runCatching {
-                commandServer.close()
-                details += "close=ok"
-            }.onFailure { error ->
-                details += "close=${error.message ?: error::class.java.simpleName}"
-            }
-            platformInterface.close()
+
             File(runtimeLogPath).appendText(
-                "libbox runtime stopped for session $sessionId, reason=$reason, detail=${details.joinToString(",")}\n",
+                "libbox runtime stop requested for session $sessionId, reason=$reason, settled=$settled, detail=$finalDetail\n",
             )
-            return "stopped(runtime=libbox, session=$sessionId, reason=$reason, detail=${details.joinToString(",")})"
+            return if (settled) {
+                "stopped(runtime=libbox, session=$sessionId, reason=$reason, detail=$finalDetail)"
+            } else {
+                "stopping(runtime=libbox, session=$sessionId, reason=$reason, detail=$finalDetail)"
+            }
         }
     }
 
@@ -343,9 +509,16 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             if (markSessionStopping(bundle.sessionId, "native-service-stop")) {
                 writeRuntimeLog(
                     bundle.runtimeLogPath,
-                    "forwarding native serviceStop() into AndroidTunnelService stop intent",
+                    "libbox requested serviceStop(); marking runtime stopped and letting the app-level monitor drain the VPN service anchor",
                 )
-                AndroidVpnBridge.stopTunnelService(appContext)
+                persistRuntimePhase(
+                    bundle = bundle,
+                    phase = "stopped",
+                    detail = "libbox requested serviceStop()",
+                    runtimeName = runtimeName,
+                    runtimeSelection = "",
+                    backendConfigSummary = "",
+                )
             }
         }
 
@@ -373,12 +546,13 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
     private class RknLibboxPlatformInterface(
         private val appContext: Context,
         private val bundle: AndroidNativeBackendLaunchBundlePayload,
+        private val onTunReady: (String) -> Unit,
     ) : PlatformInterface {
         private val tunLock = Any()
         @Volatile
         private var duplicatedTunDescriptor: ParcelFileDescriptor? = null
 
-        override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
+        override fun usePlatformAutoDetectInterfaceControl(): Boolean = false
 
         override fun autoDetectInterfaceControl(fd: Int) {
             val protected = AndroidVpnBridge.protectSocketFd(appContext, fd)
@@ -397,18 +571,23 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
                     runCatching { descriptor.close() }
                 }
 
-                val duplicated = AndroidTunnelService.duplicateTunnelInterface()
+                val duplicated = AndroidTunnelService.openTunnelInterface(options)
                     ?: throw IllegalStateException(
-                        "AndroidTunnelService could not duplicate the active VpnService TUN interface for libbox.",
+                        "AndroidTunnelService could not establish and duplicate the active VpnService TUN interface for libbox.",
                     )
                 duplicatedTunDescriptor = duplicated
+                val dnsServer =
+                    runCatching { options.dnsServerAddress.value }.getOrDefault("unavailable")
                 writeRuntimeLog(
                     bundle.runtimeLogPath,
-                    "openTun() duplicated the VpnService-owned TUN fd",
+                    "openTun() established and duplicated the VpnService-owned TUN fd",
                     "handoff_trace_fd=${bundle.tunFd}",
                     "dup_fd=${duplicated.fd}",
                     "ownership=${bundle.tunFdOwnership}",
-                    "options: mtu=${runCatching { options.mtu }.getOrDefault(-1)}, autoRoute=${runCatching { options.autoRoute }.getOrDefault(false)}, strictRoute=${runCatching { options.strictRoute }.getOrDefault(false)}",
+                    "options: mtu=${runCatching { options.mtu }.getOrDefault(-1)}, autoRoute=${runCatching { options.autoRoute }.getOrDefault(false)}, strictRoute=${runCatching { options.strictRoute }.getOrDefault(false)}, dns=$dnsServer",
+                )
+                onTunReady(
+                    "libbox runtime opened the Android TUN interface and consumed the VpnService-owned handoff session.",
                 )
                 return duplicated.fd
             }
@@ -434,7 +613,7 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
         override fun startDefaultInterfaceMonitor(listener: io.nekohasekai.libbox.InterfaceUpdateListener) {
             writeRuntimeLog(
                 bundle.runtimeLogPath,
-                "libbox requested default interface monitor; current RKN runtime keeps this as a no-op first iteration.",
+                "libbox requested default interface monitor; RKN keeps this disabled for the current Android smoke path to avoid forbidden interface-bound forwarders.",
             )
         }
 
@@ -443,6 +622,9 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
 
         override fun getInterfaces(): NetworkInterfaceIterator {
             val interfaces = mutableListOf<NetworkInterface>()
+            val connectivity =
+                appContext.getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            val defaultNetwork = AndroidDefaultNetworkMonitor.currentNetwork(appContext)
             val enumeration = JNetworkInterface.getNetworkInterfaces()
             while (enumeration != null && enumeration.hasMoreElements()) {
                 val current = enumeration.nextElement()
@@ -453,15 +635,26 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
                     }
                     .orEmpty()
 
+                if (!AndroidDefaultNetworkMonitor.isUsableInterfaceName(current.name) || addresses.isEmpty()) {
+                    continue
+                }
+
                 val iface = NetworkInterface().apply {
-                    index = current.index
+                    index = runCatching { current.index }.getOrDefault(0)
                     name = current.name ?: ""
                     mtu = runCatching { current.mtu }.getOrDefault(0)
                     setAddresses(SimpleStringIterator(addresses))
-                    flags = 0
-                    type = Libbox.InterfaceTypeOther
-                    setDNSServer(SimpleStringIterator(emptyList()))
-                    metered = false
+                    flags = AndroidDefaultNetworkMonitor.interfaceFlags(appContext, name)
+                    type = AndroidDefaultNetworkMonitor.interfaceType(appContext, defaultNetwork)
+                    setDNSServer(
+                        SimpleStringIterator(
+                            AndroidDefaultNetworkMonitor.interfaceDnsServers(appContext, name),
+                        ),
+                    )
+                    val capabilities =
+                        defaultNetwork?.let { connectivity.getNetworkCapabilities(it) }
+                    metered =
+                        capabilities?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
                 }
                 interfaces += iface
             }
@@ -477,7 +670,7 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
 
         override fun readWIFIState(): WIFIState? = null
 
-        override fun localDNSTransport(): LocalDNSTransport? = null
+        override fun localDNSTransport(): LocalDNSTransport? = AndroidLocalResolver
 
         override fun systemCertificates(): StringIterator {
             val certificates = mutableListOf<String>()

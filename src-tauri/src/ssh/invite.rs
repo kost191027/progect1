@@ -283,7 +283,11 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
     let synced_invites = build_remote_invites_from_records(&records, &remote_bootstrap)?;
     let (ss_server_password, master_ss_user_password, master_combined_password) =
         resolve_master_ss_transport(app, &remote_bootstrap)?;
-    let warp_config = ensure_remote_warp_config(app, &sess)?;
+    let warp_config = if remote_bootstrap.routing_mode == "warp" {
+        Some(ensure_remote_warp_config(app, &sess)?)
+    } else {
+        None
+    };
     let server_cfg =
         crate::generator::build_server_config_with_invites(crate::generator::ServerConfigParams {
             master_shadow_pass: &remote_bootstrap.shadow_pass,
@@ -291,14 +295,16 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
             master_ss_user_password: &master_ss_user_password,
             external_port: remote_bootstrap.external_port,
             internal_ss_port: remote_bootstrap.internal_ss_port,
+            routing_mode: &remote_bootstrap.routing_mode,
             cover_domain: &remote_bootstrap.cover_domain,
             fallback_cover_domains: &remote_bootstrap.fallback_cover_domains,
             issued_invites: &synced_invites,
-            warp: &warp_config,
+            warp: warp_config.as_ref(),
         });
     let bootstrap_cfg = json!({
         "external_port": remote_bootstrap.external_port,
         "internal_ss_port": remote_bootstrap.internal_ss_port,
+        "routing_mode": remote_bootstrap.routing_mode,
         "cover_domain": remote_bootstrap.cover_domain,
         "fallback_cover_domains": remote_bootstrap.fallback_cover_domains,
         "shadow_pass": remote_bootstrap.shadow_pass,

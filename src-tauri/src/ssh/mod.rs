@@ -81,6 +81,8 @@ pub(crate) struct RemoteTransportBootstrap {
     pub(crate) external_port: u16,
     #[serde(default = "default_internal_ss_port")]
     pub(crate) internal_ss_port: u16,
+    #[serde(default = "default_remote_routing_mode")]
+    pub(crate) routing_mode: String,
     pub(crate) cover_domain: String,
     #[serde(default)]
     pub(crate) fallback_cover_domains: Vec<String>,
@@ -107,6 +109,10 @@ pub(crate) struct RemoteWarpConfig {
     pub(crate) endpoint: String,
     pub(crate) endpoint_port: u16,
     pub(crate) peer_public_key: String,
+}
+
+fn default_remote_routing_mode() -> String {
+    "warp".to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -327,6 +333,36 @@ pub(crate) fn server_profile_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(local_data.join("server_profile.json"))
 }
 
+fn server_profile_archive_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    Ok(local_data.join("server_profiles"))
+}
+
+fn sanitize_profile_key_segment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|char| match char {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => char,
+            _ => '_',
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn archived_server_profile_path(
+    app: &AppHandle,
+    profile: &SavedServerProfile,
+) -> Result<PathBuf, String> {
+    let archive_dir = server_profile_archive_dir(app)?;
+    let host = sanitize_profile_key_segment(&profile.host);
+    let user = sanitize_profile_key_segment(&profile.user);
+    Ok(archive_dir.join(format!("{host}__{user}.json")))
+}
+
 fn backend_app_role_path(app: &AppHandle) -> Result<PathBuf, String> {
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     Ok(local_data.join("app_role.json"))
@@ -337,13 +373,18 @@ pub(crate) fn save_server_profile(
     profile: &SavedServerProfile,
 ) -> Result<(), String> {
     let profile_path = server_profile_path(app)?;
+    let archived_profile_path = archived_server_profile_path(app, profile)?;
 
     if let Some(parent) = profile_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    if let Some(parent) = archived_profile_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
 
     let profile_json = serde_json::to_vec_pretty(profile).map_err(|e| e.to_string())?;
-    std::fs::write(profile_path, profile_json).map_err(|e| e.to_string())
+    std::fs::write(&profile_path, &profile_json).map_err(|e| e.to_string())?;
+    std::fs::write(archived_profile_path, profile_json).map_err(|e| e.to_string())
 }
 
 pub(crate) fn remove_saved_server_profile(app: &AppHandle) -> Result<(), String> {
@@ -568,10 +609,16 @@ fn parse_remote_bootstrap_from_server_config(
         .and_then(Value::as_u64)
         .map(|port| port as u16)
         .unwrap_or_else(default_internal_ss_port);
+    let routing_mode = if remote_runtime_uses_warp_from_config(&parsed) {
+        "warp"
+    } else {
+        "direct"
+    };
 
     Ok(RemoteTransportBootstrap {
         external_port,
         internal_ss_port,
+        routing_mode: routing_mode.to_string(),
         cover_domain,
         fallback_cover_domains,
         shadow_pass,
@@ -677,6 +724,35 @@ fi
     }
 
     Ok(stdout.lines().any(|line| line.trim() == "enabled=true"))
+}
+
+pub(crate) fn remote_runtime_uses_warp_from_config(parsed: &Value) -> bool {
+    parsed
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .map(|outbounds| {
+            outbounds.iter().any(|outbound| {
+                outbound.get("tag").and_then(Value::as_str) == Some("warp")
+                    && outbound.get("type").and_then(Value::as_str) == Some("wireguard")
+            })
+        })
+        .unwrap_or(false)
+        && parsed
+            .get("route")
+            .and_then(Value::as_object)
+            .map(|route| {
+                route.get("final").and_then(Value::as_str) == Some("warp")
+                    || route
+                        .get("rules")
+                        .and_then(Value::as_array)
+                        .map(|rules| {
+                            rules.iter().any(|rule| {
+                                rule.get("outbound").and_then(Value::as_str) == Some("warp")
+                            })
+                        })
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false)
 }
 
 pub(crate) fn build_container_name(short_id: &str) -> String {

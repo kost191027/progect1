@@ -29,6 +29,10 @@ fn load_local_warp_config_sync(app: &AppHandle) -> Result<Option<RemoteWarpConfi
     Ok(Some(config))
 }
 
+pub(crate) fn has_local_warp_profile_sync(app: &AppHandle) -> Result<bool, String> {
+    Ok(load_local_warp_config_sync(app)?.is_some())
+}
+
 fn save_local_warp_config_sync(app: &AppHandle, config: &RemoteWarpConfig) -> Result<(), String> {
     validate_warp_config(config)?;
 

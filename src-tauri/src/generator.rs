@@ -251,18 +251,15 @@ pub struct ServerConfigParams<'a> {
     pub master_ss_user_password: &'a str,
     pub external_port: u16,
     pub internal_ss_port: u16,
+    pub routing_mode: &'a str,
     pub cover_domain: &'a str,
     pub fallback_cover_domains: &'a [String],
     pub issued_invites: &'a [crate::ssh::RemoteInviteRecord],
-    pub warp: &'a crate::ssh::RemoteWarpConfig,
+    pub warp: Option<&'a crate::ssh::RemoteWarpConfig>,
 }
 
 pub fn build_server_config_with_invites(params: ServerConfigParams<'_>) -> String {
     let listen_host = "0.0.0.0";
-    let mut warp_local_addresses = vec![params.warp.address_v4.clone()];
-    if !params.warp.address_v6.trim().is_empty() {
-        warp_local_addresses.push(params.warp.address_v6.clone());
-    }
 
     let mut shadowtls_users = vec![json!({
       "name": "master",
@@ -325,6 +322,46 @@ pub fn build_server_config_with_invites(params: ServerConfigParams<'_>) -> Strin
             );
     }
 
+    let outbounds = if params.routing_mode == "warp" {
+        let warp = params
+            .warp
+            .expect("warp config must be present when routing_mode is warp");
+        let mut warp_local_addresses = vec![warp.address_v4.clone()];
+        if !warp.address_v6.trim().is_empty() {
+            warp_local_addresses.push(warp.address_v6.clone());
+        }
+
+        json!([
+          {
+            "type": "direct",
+            "tag": "direct"
+          },
+          {
+            "type": "wireguard",
+            "tag": "warp",
+            "local_address": warp_local_addresses,
+            "private_key": warp.private_key,
+            "server": warp.endpoint,
+            "server_port": warp.endpoint_port,
+            "peer_public_key": warp.peer_public_key,
+            "mtu": 1280
+          }
+        ])
+    } else {
+        json!([
+          {
+            "type": "direct",
+            "tag": "direct"
+          }
+        ])
+    };
+
+    let final_outbound = if params.routing_mode == "warp" {
+        "warp"
+    } else {
+        "direct"
+    };
+
     let config = json!({
       "log": {
         "disabled": false,
@@ -348,26 +385,11 @@ pub fn build_server_config_with_invites(params: ServerConfigParams<'_>) -> Strin
           }
         }
       ],
-      "outbounds": [
-        {
-          "type": "direct",
-          "tag": "direct"
-        },
-        {
-          "type": "wireguard",
-          "tag": "warp",
-          "local_address": warp_local_addresses,
-          "private_key": params.warp.private_key,
-          "server": params.warp.endpoint,
-          "server_port": params.warp.endpoint_port,
-          "peer_public_key": params.warp.peer_public_key,
-          "mtu": 1280
-        }
-      ],
+      "outbounds": outbounds,
       "route": {
         "rules": [
           {
-            "outbound": "warp"
+            "outbound": final_outbound
           }
         ]
       }
@@ -400,6 +422,11 @@ pub fn build_client_config(
         .filter(|rule_set| DIRECT_ROUTE_RULE_SET_TAGS.contains(&rule_set.tag))
         .map(|rule_set| rule_set.tag)
         .collect::<Vec<_>>();
+    let available_direct_dns_rule_tags = available_direct_rule_tags
+        .iter()
+        .copied()
+        .filter(|tag| !tag.starts_with("geoip-"))
+        .collect::<Vec<_>>();
     let google_rule_set_available = local_rule_sets
         .iter()
         .any(|rule_set| rule_set.tag == GOOGLE_RULE_SET_TAG);
@@ -410,7 +437,8 @@ pub fn build_client_config(
       "address": ["172.19.0.1/30"],
       "auto_route": true,
       "strict_route": true,
-      "stack": "system"
+      "stack": "system",
+      "endpoint_independent_nat": true
     });
 
     if !cfg!(target_os = "macos") {
@@ -500,9 +528,12 @@ pub fn build_client_config(
       "route": {
         "rules": [
           {
-            "action": "sniff"
+            "inbound": "tun-in",
+            "action": "sniff",
+            "timeout": "1s"
           },
           {
+            "inbound": "tun-in",
             "protocol": "dns",
             "action": "hijack-dns"
           },
@@ -560,15 +591,17 @@ pub fn build_client_config(
             );
     }
 
-    if !available_direct_rule_tags.is_empty() {
+    if !available_direct_dns_rule_tags.is_empty() {
         config["dns"]["rules"]
             .as_array_mut()
             .expect("dns rules must be an array")
             .push(json!({
-              "rule_set": available_direct_rule_tags,
+              "rule_set": available_direct_dns_rule_tags,
               "server": "local-dns"
             }));
+    }
 
+    if !available_direct_rule_tags.is_empty() {
         config["route"]["rules"]
             .as_array_mut()
             .expect("route rules must be an array")

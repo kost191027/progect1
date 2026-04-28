@@ -10,6 +10,7 @@ if (args.length === 0) {
 }
 
 const cwd = process.cwd();
+const androidDevConfig = join(cwd, "src-tauri", "tauri.android-dev.conf.json");
 
 const fallbackJavaHomes = [
   "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home",
@@ -123,7 +124,17 @@ const env = {
   ].join(":"),
 };
 
-const result = spawnSync("tauri", ["android", ...args], {
+const androidArgs = [...args];
+const passthroughIndex = androidArgs.indexOf("--");
+const configArgs = ["--config", androidDevConfig];
+
+if (passthroughIndex === -1) {
+  androidArgs.push(...configArgs);
+} else {
+  androidArgs.splice(passthroughIndex, 0, ...configArgs);
+}
+
+const result = spawnSync("tauri", ["android", ...androidArgs], {
   cwd,
   env,
   stdio: "inherit",

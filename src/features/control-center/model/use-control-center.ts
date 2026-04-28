@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getLocalDeviceReference, isAndroidClient } from "../../../shared/lib/runtime-platform";
 
 export type GuardState = "inactive" | "active" | "engaged";
@@ -120,6 +120,7 @@ type AndroidRuntimeContext = {
 };
 
 const MAX_LOG_BUFFER = 800;
+const LOG_FLUSH_INTERVAL_MS = 120;
 const HAS_COMPLETED_FIRST_START_KEY = "rkn.has-completed-first-start";
 const LAST_DEPLOYED_AT_KEY = "rkn.last-deployed-at";
 const APP_ROLE_KEY = "rkn.app-role";
@@ -165,6 +166,13 @@ function profilesMatch(
     left.user === right.user &&
     left.password === right.password
   );
+}
+
+function shouldConfirmProfileReplacement(
+  currentProfile: SavedServerProfile | null,
+  nextProfile: SavedServerProfile,
+) {
+  return currentProfile !== null && !profilesMatch(currentProfile, nextProfile);
 }
 
 function stripLogPrefix(message: string) {
@@ -282,10 +290,16 @@ export function useControlCenter() {
       ? "subordinate"
       : "master";
   });
+  const pendingLogsRef = useRef<string[]>([]);
+  const logFlushTimerRef = useRef<number | null>(null);
 
-  function appendLog(message: string) {
+  function commitLogs(messages: string[]) {
+    if (messages.length === 0) {
+      return;
+    }
+
     setLogs((prev) => {
-      const nextLogs = [...prev, message];
+      const nextLogs = [...prev, ...messages];
 
       if (nextLogs.length <= MAX_LOG_BUFFER) {
         return nextLogs;
@@ -295,18 +309,46 @@ export function useControlCenter() {
       return nextLogs.slice(-MAX_LOG_BUFFER);
     });
 
-    if (isErrorLog(message)) {
-      setLastError(stripLogPrefix(message));
+    for (const message of messages) {
+      if (isErrorLog(message)) {
+        setLastError(stripLogPrefix(message));
+        continue;
+      }
+
+      if (
+        message.startsWith("[SYSTEM]") ||
+        message.startsWith("[WARN]") ||
+        message.startsWith("---")
+      ) {
+        setLastUserMessage(stripLogPrefix(message));
+      }
+    }
+  }
+
+  function flushPendingLogs() {
+    if (logFlushTimerRef.current !== null) {
+      window.clearTimeout(logFlushTimerRef.current);
+      logFlushTimerRef.current = null;
+    }
+
+    if (pendingLogsRef.current.length === 0) {
       return;
     }
 
-    if (
-      message.startsWith("[SYSTEM]") ||
-      message.startsWith("[WARN]") ||
-      message.startsWith("---")
-    ) {
-      setLastUserMessage(stripLogPrefix(message));
+    const messages = pendingLogsRef.current;
+    pendingLogsRef.current = [];
+    commitLogs(messages);
+  }
+
+  function appendLog(message: string) {
+    pendingLogsRef.current.push(message);
+    if (logFlushTimerRef.current !== null) {
+      return;
     }
+
+    logFlushTimerRef.current = window.setTimeout(() => {
+      flushPendingLogs();
+    }, LOG_FLUSH_INTERVAL_MS);
   }
 
   async function refreshAndroidRuntimeContext() {
@@ -329,7 +371,31 @@ export function useControlCenter() {
     });
 
     return () => {
+      flushPendingLogs();
       unlisten.then((cleanup) => cleanup());
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadExistingLogTail() {
+      try {
+        const tail = await invoke<string[]>("get_tunnel_log_tail", { maxLines: 180 });
+        if (!isMounted || tail.length === 0) {
+          return;
+        }
+
+        commitLogs(tail);
+      } catch {
+        // Log history is best-effort only.
+      }
+    }
+
+    void loadExistingLogTail();
+
+    return () => {
+      isMounted = false;
     };
   }, []);
 
@@ -828,6 +894,25 @@ export function useControlCenter() {
       userMessage: string;
     },
   ) {
+    if (shouldConfirmProfileReplacement(savedProfile, profile)) {
+      const confirmed = window.confirm(
+        [
+          `This will replace the active server profile on this device.`,
+          `Current: ${savedProfile?.host ?? "unknown"}`,
+          `Next: ${profile.host}`,
+          `The previous local profile is backed up before deploy.`,
+          `Continue?`,
+        ].join("\n"),
+      );
+
+      if (!confirmed) {
+        appendLog(
+          `[SYSTEM] Deploy cancelled. The active local server profile remains ${savedProfile?.host ?? "unchanged"}.`,
+        );
+        return;
+      }
+    }
+
     setIsDeploying(true);
     setLastError(null);
     setLocalDataResetMessage(null);

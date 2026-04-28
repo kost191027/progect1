@@ -6,13 +6,21 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager.NameNotFoundException
+import android.net.IpPrefix
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import java.io.File
+import java.net.InetAddress
+import io.nekohasekai.libbox.RoutePrefix
+import io.nekohasekai.libbox.RoutePrefixIterator
+import io.nekohasekai.libbox.StringIterator
+import io.nekohasekai.libbox.TunOptions
 
 class AndroidTunnelService : VpnService() {
     override fun onBind(intent: Intent?): IBinder? = null
@@ -22,7 +30,7 @@ class AndroidTunnelService : VpnService() {
 
         when (intent?.action) {
             ACTION_STOP -> {
-                stopRunningBackend()
+                stopRunningBackendAndDrain()
                 stopManagedCoreProcess()
                 closeTunnelInterface()
                 clearBackendHandoffSession()
@@ -34,13 +42,11 @@ class AndroidTunnelService : VpnService() {
             null -> {
                 ensureNotificationChannel()
                 startForeground(NOTIFICATION_ID, buildNotification())
-                ensureTunnelInterface()
                 return START_STICKY
             }
             else -> {
                 ensureNotificationChannel()
                 startForeground(NOTIFICATION_ID, buildNotification())
-                ensureTunnelInterface()
                 return START_STICKY
             }
         }
@@ -52,7 +58,7 @@ class AndroidTunnelService : VpnService() {
     }
 
     override fun onRevoke() {
-        stopRunningBackend()
+        stopRunningBackendAndDrain()
         stopManagedCoreProcess()
         closeTunnelInterface()
         clearBackendHandoffSession()
@@ -65,7 +71,7 @@ class AndroidTunnelService : VpnService() {
         if (activeInstance === this) {
             activeInstance = null
         }
-        stopRunningBackend()
+        stopRunningBackendAndDrain()
         closeTunnelInterface()
         clearBackendHandoffSession()
         super.onDestroy()
@@ -147,36 +153,10 @@ class AndroidTunnelService : VpnService() {
         runCatching { pidFile.delete() }
     }
 
-    private fun ensureTunnelInterface() {
-        synchronized(STATE_LOCK) {
-            if (activeTunnelInterface != null) {
-                lastTunnelState = buildTunnelStateSummary(activeTunnelInterface)
-                lastTunnelError = null
-                return
-            }
-
-            try {
-                val descriptor = Builder()
-                    .setSession(getString(R.string.app_name))
-                    .setMtu(TUN_MTU)
-                    .addAddress(TUN_ADDRESS, TUN_PREFIX_LENGTH)
-                    .addRoute("0.0.0.0", 0)
-                    .apply {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            setMetered(false)
-                        }
-                    }
-                    .establish()
-                    ?: throw IllegalStateException("VpnService.Builder.establish() returned null")
-
-                activeTunnelInterface = descriptor
-                lastTunnelState = buildTunnelStateSummary(descriptor)
-                lastTunnelError = null
-            } catch (error: Throwable) {
-                lastTunnelError = error.message ?: error::class.java.simpleName
-                lastTunnelState = "failed(${lastTunnelError})"
-                closeTunnelInterface()
-            }
+    private fun stopRunningBackendAndDrain() {
+        val state = stopRunningBackend()
+        if (!state.startsWith("idle") && !state.startsWith("missing")) {
+            SystemClock.sleep(150)
         }
     }
 
@@ -209,6 +189,14 @@ class AndroidTunnelService : VpnService() {
         private var backendHandoffLogPath: String = ""
         @Volatile
         private var activeBackendRunningHandle: AndroidNativeBackendRunningHandle? = null
+        @Volatile
+        private var currentTunAddress: String = TUN_ADDRESS
+        @Volatile
+        private var currentTunPrefixLength: Int = TUN_PREFIX_LENGTH
+        @Volatile
+        private var currentTunRouteSummary: String = "0.0.0.0/0"
+        @Volatile
+        private var currentTunMtu: Int = TUN_MTU
 
         const val ACTION_START = "com.freedom.rkn.action.START_TUNNEL_SERVICE"
         const val ACTION_STOP = "com.freedom.rkn.action.STOP_TUNNEL_SERVICE"
@@ -240,29 +228,37 @@ class AndroidTunnelService : VpnService() {
             return activeTunnelInterface?.fd ?: -1
         }
 
-        fun duplicateTunnelInterface(): ParcelFileDescriptor? {
+        fun openTunnelInterface(options: TunOptions): ParcelFileDescriptor? {
             synchronized(STATE_LOCK) {
-                val descriptor = activeTunnelInterface ?: return null
+                val service = activeInstance ?: return null
                 return runCatching {
+                    activeTunnelInterface?.let { existing ->
+                        runCatching { existing.close() }
+                        activeTunnelInterface = null
+                    }
+                    val descriptor = service.establishTunnelInterfaceLocked(options)
+                    activeTunnelInterface = descriptor
+                    lastTunnelState = buildTunnelStateSummary(descriptor)
+                    lastTunnelError = null
                     ParcelFileDescriptor.dup(descriptor.fileDescriptor)
                 }.getOrNull()
             }
         }
 
         fun getTunnelAddress(): String {
-            return TUN_ADDRESS
+            return currentTunAddress
         }
 
         fun getTunnelPrefixLength(): Int {
-            return TUN_PREFIX_LENGTH
+            return currentTunPrefixLength
         }
 
         fun getTunnelRoute(): String {
-            return "0.0.0.0/0"
+            return currentTunRouteSummary
         }
 
         fun getTunnelMtu(): Int {
-            return TUN_MTU
+            return currentTunMtu
         }
 
         fun registerBackendHandoffSession(
@@ -360,19 +356,30 @@ class AndroidTunnelService : VpnService() {
         }
 
         fun stopRunningBackend(): String {
-            synchronized(STATE_LOCK) {
-                val handle = activeBackendRunningHandle ?: return "idle"
-                val runtime = AndroidNativeBackendRuntimeRegistry.byId(handle.runtimeId)
-                    ?: return "missing(runtime=${handle.runtimeId}, session=${handle.sessionId})"
-                val state = runtime.stop(handle)
-                activeBackendRunningHandle = null
-                return state
+            val (handle, runtime) = synchronized(STATE_LOCK) {
+                val currentHandle = activeBackendRunningHandle ?: return "idle"
+                val currentRuntime = AndroidNativeBackendRuntimeRegistry.byId(currentHandle.runtimeId)
+                if (currentRuntime == null) {
+                    activeBackendRunningHandle = null
+                    return "missing(runtime=${currentHandle.runtimeId}, session=${currentHandle.sessionId})"
+                }
+                currentHandle to currentRuntime
             }
+
+            val state = runtime.stop(handle)
+
+            synchronized(STATE_LOCK) {
+                if (activeBackendRunningHandle == handle) {
+                    activeBackendRunningHandle = null
+                }
+            }
+
+            return state
         }
 
         private fun buildTunnelStateSummary(descriptor: ParcelFileDescriptor?): String {
             val fd = descriptor?.fd ?: -1
-            return "ready(fd=$fd, addr=$TUN_ADDRESS/$TUN_PREFIX_LENGTH, route=0.0.0.0/0, mtu=$TUN_MTU)"
+            return "ready(fd=$fd, addr=$currentTunAddress/$currentTunPrefixLength, route=$currentTunRouteSummary, mtu=$currentTunMtu)"
         }
 
         private fun closeTunnelInterface() {
@@ -381,6 +388,10 @@ class AndroidTunnelService : VpnService() {
                     runCatching { descriptor.close() }
                 }
                 activeTunnelInterface = null
+                currentTunAddress = TUN_ADDRESS
+                currentTunPrefixLength = TUN_PREFIX_LENGTH
+                currentTunRouteSummary = "0.0.0.0/0"
+                currentTunMtu = TUN_MTU
                 if (lastTunnelError == null) {
                     lastTunnelState = "idle"
                 }
@@ -398,5 +409,130 @@ class AndroidTunnelService : VpnService() {
                 backendHandoffLogPath = ""
             }
         }
+    }
+
+    private fun establishTunnelInterfaceLocked(options: TunOptions?): ParcelFileDescriptor {
+        val mtu = options?.getMTU()?.takeIf { it > 0 } ?: TUN_MTU
+        val inet4Address = options?.getInet4Address().toRoutePrefixList()
+        val inet6Address = options?.getInet6Address().toRoutePrefixList()
+        val inet4RouteAddress = options?.getInet4RouteAddress().toRoutePrefixList()
+        val inet6RouteAddress = options?.getInet6RouteAddress().toRoutePrefixList()
+        val inet4RouteExcludeAddress = options?.getInet4RouteExcludeAddress().toRoutePrefixList()
+        val inet6RouteExcludeAddress = options?.getInet6RouteExcludeAddress().toRoutePrefixList()
+        val inet4RouteRange = options?.getInet4RouteRange().toRoutePrefixList()
+        val inet6RouteRange = options?.getInet6RouteRange().toRoutePrefixList()
+        val includePackages = options?.getIncludePackage().toStringList()
+        val excludePackages = options?.getExcludePackage().toStringList()
+        val dnsServer = runCatching { options?.getDNSServerAddress()?.value }.getOrNull()?.takeIf { !it.isNullOrBlank() }
+        val autoRoute = options?.getAutoRoute() ?: true
+
+        val builder = Builder()
+            .setSession(getString(R.string.app_name))
+            .setMtu(mtu)
+            .apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    setMetered(false)
+                }
+                allowBypass()
+            }
+
+        if (inet4Address.isEmpty() && inet6Address.isEmpty()) {
+            builder.addAddress(TUN_ADDRESS, TUN_PREFIX_LENGTH)
+        } else {
+            inet4Address.forEach { builder.addAddress(it.address(), it.prefix()) }
+            inet6Address.forEach { builder.addAddress(it.address(), it.prefix()) }
+        }
+
+        if (autoRoute) {
+            dnsServer?.let { builder.addDnsServer(it) }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (inet4RouteAddress.isNotEmpty()) {
+                    inet4RouteAddress.forEach { builder.addRoute(it.toIpPrefix()) }
+                } else if (inet4Address.isNotEmpty()) {
+                    builder.addRoute("0.0.0.0", 0)
+                }
+
+                if (inet6RouteAddress.isNotEmpty()) {
+                    inet6RouteAddress.forEach { builder.addRoute(it.toIpPrefix()) }
+                } else if (inet6Address.isNotEmpty()) {
+                    builder.addRoute("::", 0)
+                }
+
+                inet4RouteExcludeAddress.forEach { builder.excludeRoute(it.toIpPrefix()) }
+                inet6RouteExcludeAddress.forEach { builder.excludeRoute(it.toIpPrefix()) }
+            } else {
+                if (inet4RouteRange.isNotEmpty()) {
+                    inet4RouteRange.forEach { builder.addRoute(it.address(), it.prefix()) }
+                } else if (inet4Address.isNotEmpty()) {
+                    builder.addRoute("0.0.0.0", 0)
+                }
+
+                if (inet6RouteRange.isNotEmpty()) {
+                    inet6RouteRange.forEach { builder.addRoute(it.address(), it.prefix()) }
+                } else if (inet6Address.isNotEmpty()) {
+                    builder.addRoute("::", 0)
+                }
+            }
+
+            includePackages.forEach { packageName ->
+                try {
+                    builder.addAllowedApplication(packageName)
+                } catch (_: NameNotFoundException) {
+                }
+            }
+
+            (excludePackages + packageName).distinct().forEach { blockedPackage ->
+                try {
+                    builder.addDisallowedApplication(blockedPackage)
+                } catch (_: NameNotFoundException) {
+                }
+            }
+        } else {
+            builder.addRoute("0.0.0.0", 0)
+        }
+
+        val descriptor = builder.establish()
+            ?: throw IllegalStateException("VpnService.Builder.establish() returned null")
+
+        val firstAddress = inet4Address.firstOrNull() ?: inet6Address.firstOrNull()
+        currentTunAddress = firstAddress?.address() ?: TUN_ADDRESS
+        currentTunPrefixLength = firstAddress?.prefix() ?: TUN_PREFIX_LENGTH
+        currentTunRouteSummary = inet4RouteAddress.firstOrNull()?.string()
+            ?: inet4RouteRange.firstOrNull()?.string()
+            ?: inet6RouteAddress.firstOrNull()?.string()
+            ?: inet6RouteRange.firstOrNull()?.string()
+            ?: "0.0.0.0/0"
+        currentTunMtu = mtu
+
+        return descriptor
+    }
+
+    private fun RoutePrefix.toIpPrefix(): IpPrefix {
+        return IpPrefix(InetAddress.getByName(address()), prefix())
+    }
+
+    private fun RoutePrefixIterator?.toRoutePrefixList(): List<RoutePrefix> {
+        if (this == null) {
+            return emptyList()
+        }
+
+        val values = mutableListOf<RoutePrefix>()
+        while (hasNext()) {
+            values += next()
+        }
+        return values
+    }
+
+    private fun StringIterator?.toStringList(): List<String> {
+        if (this == null) {
+            return emptyList()
+        }
+
+        val values = mutableListOf<String>()
+        while (hasNext()) {
+            values += next()
+        }
+        return values
     }
 }

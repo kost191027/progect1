@@ -395,7 +395,15 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
 
         let (ss_server_password, master_ss_user_password, master_combined_password) =
             resolve_master_ss_transport(&rotate_app, &remote_bootstrap)?;
-        let warp_config = ensure_remote_warp_config(&rotate_app, &sess)?;
+        let warp_config = if remote_bootstrap.routing_mode == "warp" {
+            Some(ensure_remote_warp_config(&rotate_app, &sess)?)
+        } else {
+            let _ = rotate_app.emit(
+                "tunnel-log",
+                "[SYSTEM] Remote server currently uses direct egress. Preserving that mode during cover-domain rotation.".to_string(),
+            );
+            None
+        };
         let server_cfg = crate::generator::build_server_config_with_invites(
             crate::generator::ServerConfigParams {
                 master_shadow_pass: &remote_bootstrap.shadow_pass,
@@ -403,10 +411,11 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
                 master_ss_user_password: &master_ss_user_password,
                 external_port: remote_bootstrap.external_port,
                 internal_ss_port: remote_bootstrap.internal_ss_port,
+                routing_mode: &remote_bootstrap.routing_mode,
                 cover_domain,
                 fallback_cover_domains: &fallback_cover_domains,
                 issued_invites: &remote_bootstrap.issued_invites,
-                warp: &warp_config,
+                warp: warp_config.as_ref(),
             },
         );
         let local_rule_sets = ensure_local_client_rule_sets_sync(&rotate_app)?;
@@ -421,6 +430,7 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
         let bootstrap_cfg = json!({
             "external_port": remote_bootstrap.external_port,
             "internal_ss_port": remote_bootstrap.internal_ss_port,
+            "routing_mode": remote_bootstrap.routing_mode,
             "cover_domain": cover_domain,
             "fallback_cover_domains": fallback_cover_domains,
             "shadow_pass": remote_bootstrap.shadow_pass,
@@ -454,6 +464,7 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
         let rotated_bootstrap = super::RemoteTransportBootstrap {
             external_port: remote_bootstrap.external_port,
             internal_ss_port: remote_bootstrap.internal_ss_port,
+            routing_mode: remote_bootstrap.routing_mode,
             cover_domain: cover_domain.to_string(),
             fallback_cover_domains,
             shadow_pass: remote_bootstrap.shadow_pass,

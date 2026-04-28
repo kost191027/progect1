@@ -3,7 +3,8 @@ use ssh2::Session;
 use std::io::Write;
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::warp::ensure_remote_warp_config;
+use super::invite::resolve_master_ss_transport;
+use super::warp::{ensure_remote_warp_config, has_local_warp_profile_sync};
 use super::{
     acquire_remote_mutation_lock, build_container_name, connect_ssh_session, emit_ssh_stage,
     ensure_local_client_rule_sets_sync, ensure_master_role, load_remote_container_image,
@@ -17,6 +18,28 @@ use super::{
 
 fn compose_multi_user_ss_password(server_password: &str, user_password: &str) -> String {
     format!("{}:{}", server_password, user_password)
+}
+
+fn backup_local_file_if_exists(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis();
+    let backup_path = path.with_extension(format!("bak.{}", millis));
+    std::fs::copy(path, &backup_path).map_err(|e| {
+        format!(
+            "Failed to create local backup {} from {}: {}",
+            backup_path.display(),
+            path.display(),
+            e
+        )
+    })?;
+
+    Ok(())
 }
 
 pub(crate) struct RemoteDeployExecution<'a> {
@@ -289,6 +312,13 @@ pub(crate) fn execute_remote_deploy(
 mkdir -p /opt/rkn
 export RKN_IMAGE='{}'
 export RKN_CONTAINER_NAME='{}'
+STAMP="$(date +%s)"
+if [ -f /opt/rkn/config.json ]; then
+  cp /opt/rkn/config.json "/opt/rkn/config.json.bak.${{STAMP}}"
+fi
+if [ -f /opt/rkn/bootstrap.json ]; then
+  cp /opt/rkn/bootstrap.json "/opt/rkn/bootstrap.json.bak.${{STAMP}}"
+fi
 cat << 'CONFIGEOF' > /opt/rkn/config.candidate.json
 {}
 CONFIGEOF
@@ -383,6 +413,17 @@ pub async fn deploy_server(
         let pass = pass.clone();
         let local_data = local_data.clone();
         move || -> Result<Option<super::RemoteTransportBootstrap>, String> {
+            if let Ok(Some(existing_profile)) = super::load_saved_server_profile(app.clone()) {
+                if existing_profile.host != host {
+                    let _ = app.emit(
+                        "tunnel-log",
+                        format!(
+                            "[WARN] Deploy target switched from saved server {} to {}. This deploy will update the local active profile for this device only.",
+                            existing_profile.host, host
+                        ),
+                    );
+                }
+            }
             let _mutation_guard = acquire_remote_mutation_lock()?;
             let _ = app.emit(
                 "tunnel-log",
@@ -440,19 +481,6 @@ pub async fn deploy_server(
                 ),
             );
 
-            if crate::generator::is_legacy_cover_domain_requiring_refresh(
-                &remote_bootstrap.cover_domain,
-            ) {
-                let _ = app.emit(
-                    "tunnel-log",
-                    format!(
-                        "[SYSTEM] Existing RKN runtime still uses the legacy cover domain {}. Refreshing it now so this server moves to a currently supported transport domain.",
-                        remote_bootstrap.cover_domain
-                    ),
-                );
-                return Ok(None);
-            }
-
             if let Some(remote_image) = load_remote_container_image(&sess, &container_name)? {
                 if remote_image != PINNED_SING_BOX_IMAGE {
                     let _ = app.emit(
@@ -466,12 +494,19 @@ pub async fn deploy_server(
                 }
             }
 
-            if !remote_runtime_uses_warp(&sess)? {
+            let effective_routing_mode = if remote_runtime_uses_warp(&sess)? {
+                "warp"
+            } else {
+                "direct"
+            };
+            if remote_bootstrap.routing_mode != effective_routing_mode {
                 let _ = app.emit(
                     "tunnel-log",
-                    "[SYSTEM] Existing RKN runtime still uses the previous server routing. Refreshing it now so this server matches the current WARP-backed transport.".to_string(),
+                    format!(
+                        "[SYSTEM] Existing RKN runtime is currently using {} routing. Preserving that server mode for this device instead of forcing a transport migration.",
+                        effective_routing_mode
+                    ),
                 );
-                return Ok(None);
             }
 
             if let Err(error) =
@@ -505,22 +540,28 @@ pub async fn deploy_server(
                 return Ok(None);
             }
 
+            let effective_bootstrap = super::RemoteTransportBootstrap {
+                routing_mode: effective_routing_mode.to_string(),
+                ..remote_bootstrap.clone()
+            };
             let local_rule_sets = ensure_local_client_rule_sets_sync(&app)?;
             let client_cfg = crate::generator::build_client_config(
                 &host,
-                &remote_bootstrap.shadow_pass,
-                &remote_bootstrap.ss_password,
-                remote_bootstrap.external_port,
-                &remote_bootstrap.cover_domain,
+                &effective_bootstrap.shadow_pass,
+                &effective_bootstrap.ss_password,
+                effective_bootstrap.external_port,
+                &effective_bootstrap.cover_domain,
                 &local_rule_sets,
             );
 
             std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
             let client_cfg_path = local_data.join("client_config.json");
+            backup_local_file_if_exists(&client_cfg_path)?;
+            backup_local_file_if_exists(&super::server_profile_path(&app)?)?;
             std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
             save_server_profile(&app, &attach_saved_profile)?;
             save_backend_app_role(&app, BackendAppRole::Master)?;
-            let _ = save_cached_transport_bootstrap(&app, &remote_bootstrap);
+            let _ = save_cached_transport_bootstrap(&app, &effective_bootstrap);
             crate::refresh_tray_toggle_item(&app);
 
             let _ = app.emit(
@@ -542,7 +583,7 @@ pub async fn deploy_server(
                 "[SYSTEM] Server credentials saved locally for next launch.".to_string(),
             );
 
-            Ok(Some(remote_bootstrap))
+            Ok(Some(effective_bootstrap))
         }
     })
     .await
@@ -565,23 +606,10 @@ pub async fn deploy_server(
     let short_id = crate::generator::generate_short_id(&app)
         .await
         .map_err(|e| format!("Transport secret error: {}", e))?;
-    let shadow_pass = crate::generator::generate_shadowtls_password(&app)
-        .await
-        .map_err(|e| format!("ShadowTLS password error: {}", e))?;
-    let ss_server_password = crate::generator::generate_ss_password(&app)
-        .await
-        .map_err(|e| format!("Shadowsocks server password error: {}", e))?;
-    let ss_user_password = crate::generator::generate_ss_password(&app)
-        .await
-        .map_err(|e| format!("Shadowsocks user password error: {}", e))?;
-    let ss_password = compose_multi_user_ss_password(&ss_server_password, &ss_user_password);
 
     let _ = app.emit(
         "tunnel-log",
-        format!(
-            "[SYSTEM] Transport stack: ShadowTLS v3 + Shadowsocks-2022. ShadowTLS secret length: {} chars.",
-            shadow_pass.len()
-        ),
+        "[SYSTEM] Preparing the transport stack for this server deploy...".to_string(),
     );
 
     let deploy_app = app.clone();
@@ -640,23 +668,94 @@ pub async fn deploy_server(
             ),
         );
 
-        let cover_domain = crate::generator::select_cover_domain(&short_id);
+        let existing_bootstrap = load_remote_transport_bootstrap(&sess)?;
+        let (shadow_pass, ss_server_password, master_ss_user_password, ss_password, routing_mode, cover_domain, fallback_cover_domains, issued_invites) =
+            if let Some(existing_bootstrap) = existing_bootstrap.clone() {
+                let _ = deploy_app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Existing transport bootstrap found on this server. Preserving transport credentials and cover domain for multi-device compatibility while refreshing the runtime.".to_string(),
+                );
+                let (ss_server_password, master_ss_user_password, master_combined_password) =
+                    resolve_master_ss_transport(&deploy_app, &existing_bootstrap)?;
+                (
+                    existing_bootstrap.shadow_pass.clone(),
+                    ss_server_password,
+                    master_ss_user_password,
+                    master_combined_password,
+                    existing_bootstrap.routing_mode.clone(),
+                    existing_bootstrap.cover_domain.clone(),
+                    existing_bootstrap.fallback_cover_domains.clone(),
+                    existing_bootstrap.issued_invites.clone(),
+                )
+            } else {
+                let default_routing_mode = if has_local_warp_profile_sync(&deploy_app)? {
+                    "warp"
+                } else {
+                    "direct"
+                };
+                let _ = deploy_app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SYSTEM] No existing transport bootstrap found. Defaulting this fresh server deploy to {} egress for this device.",
+                        default_routing_mode
+                    ),
+                );
+                let shadow_pass = tauri::async_runtime::block_on(
+                    crate::generator::generate_shadowtls_password(&deploy_app),
+                )
+                    .map_err(|e| format!("ShadowTLS password error: {}", e))?;
+                let ss_server_password = tauri::async_runtime::block_on(
+                    crate::generator::generate_ss_password(&deploy_app),
+                )
+                    .map_err(|e| format!("Shadowsocks server password error: {}", e))?;
+                let ss_user_password = tauri::async_runtime::block_on(
+                    crate::generator::generate_ss_password(&deploy_app),
+                )
+                    .map_err(|e| format!("Shadowsocks user password error: {}", e))?;
+                let ss_password = compose_multi_user_ss_password(&ss_server_password, &ss_user_password);
+                (
+                    shadow_pass,
+                    ss_server_password,
+                    ss_user_password,
+                    ss_password,
+                    default_routing_mode.to_string(),
+                    crate::generator::select_cover_domain(&short_id).to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+        let _ = deploy_app.emit(
+            "tunnel-log",
+            format!(
+                "[SYSTEM] Transport stack: ShadowTLS v3 + Shadowsocks-2022. ShadowTLS secret length: {} chars.",
+                shadow_pass.len()
+            ),
+        );
         let _ = deploy_app.emit(
             "tunnel-log",
             format!("[SSH] ShadowTLS cover domain: {}", cover_domain),
         );
-        let warp_config = ensure_remote_warp_config(&deploy_app, &sess)?;
+        let warp_config = if routing_mode == "warp" {
+            Some(ensure_remote_warp_config(&deploy_app, &sess)?)
+        } else {
+            let _ = deploy_app.emit(
+                "tunnel-log",
+                "[SSH] Existing server runtime is configured for direct egress. Preserving that mode and skipping WARP provisioning.".to_string(),
+            );
+            None
+        };
         let server_cfg = crate::generator::build_server_config_with_invites(
             crate::generator::ServerConfigParams {
                 master_shadow_pass: &shadow_pass,
                 ss_server_password: &ss_server_password,
-                master_ss_user_password: &ss_user_password,
+                master_ss_user_password: &master_ss_user_password,
                 external_port,
                 internal_ss_port,
-                cover_domain,
-                fallback_cover_domains: &[],
-                issued_invites: &[],
-                warp: &warp_config,
+                routing_mode: &routing_mode,
+                cover_domain: &cover_domain,
+                fallback_cover_domains: &fallback_cover_domains,
+                issued_invites: &issued_invites,
+                warp: warp_config.as_ref(),
             },
         );
         let local_rule_sets = ensure_local_client_rule_sets_sync(&deploy_app)?;
@@ -665,18 +764,19 @@ pub async fn deploy_server(
             &shadow_pass,
             &ss_password,
             external_port,
-            cover_domain,
+            &cover_domain,
             &local_rule_sets,
         );
         let bootstrap_cfg = json!({
             "external_port": external_port,
             "internal_ss_port": internal_ss_port,
+            "routing_mode": routing_mode,
             "cover_domain": cover_domain,
-            "fallback_cover_domains": [],
+            "fallback_cover_domains": fallback_cover_domains,
             "shadow_pass": shadow_pass,
             "ss_password": ss_password,
             "ss_server_password": ss_server_password,
-            "issued_invites": []
+            "issued_invites": issued_invites
         })
         .to_string();
 
@@ -715,18 +815,21 @@ pub async fn deploy_server(
 
         std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
         let client_cfg_path = local_data.join("client_config.json");
+        backup_local_file_if_exists(&client_cfg_path)?;
+        backup_local_file_if_exists(&super::server_profile_path(&deploy_app)?)?;
         std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
         save_server_profile(&deploy_app, &saved_profile)?;
         save_backend_app_role(&deploy_app, BackendAppRole::Master)?;
         let fresh_bootstrap = RemoteTransportBootstrap {
             external_port,
             internal_ss_port,
+            routing_mode,
             cover_domain: cover_domain.to_string(),
-            fallback_cover_domains: Vec::new(),
+            fallback_cover_domains,
             shadow_pass: shadow_pass.clone(),
             ss_password: ss_password.clone(),
             ss_server_password: ss_server_password.clone(),
-            issued_invites: Vec::new(),
+            issued_invites,
         };
         let _ = save_cached_transport_bootstrap(&deploy_app, &fresh_bootstrap);
         crate::refresh_tray_toggle_item(&deploy_app);

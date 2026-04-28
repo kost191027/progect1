@@ -46,6 +46,9 @@ struct AppState {
     windows_tray_notice_shown: Mutex<bool>,
 }
 
+#[cfg(target_os = "android")]
+const ANDROID_NATIVE_BACKEND_SENTINEL_PID: u32 = u32::MAX - 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WindowsRuntimeMode {
@@ -576,6 +579,16 @@ fn recent_log_tail(log_path: &str, max_lines: usize) -> String {
 }
 
 #[cfg(target_os = "android")]
+fn is_android_native_backend_pid(pid: u32) -> bool {
+    pid == ANDROID_NATIVE_BACKEND_SENTINEL_PID
+}
+
+#[cfg(not(target_os = "android"))]
+fn is_android_native_backend_pid(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(target_os = "android")]
 fn classify_android_startup_blocker(log_tail: &str) -> Option<String> {
     let lower = log_tail.to_lowercase();
 
@@ -609,6 +622,9 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             e
         )
     })?;
+    let server_ip = extract_server_ip_from_config(&cfg).ok_or_else(|| {
+        "Android runtime config could not determine the upstream server IP from the generated client config.".to_string()
+    })?;
 
     cfg["log"]["output"] = serde_json::json!(log_path);
     cfg["log"]["level"] = serde_json::json!("info");
@@ -631,26 +647,134 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
 
             if let Some(object) = inbound.as_object_mut() {
                 object.remove("interface_name");
-                object.remove("address");
-                object.remove("inet4_address");
-                object.remove("inet6_address");
-                object.remove("mtu");
                 object.remove("gso");
-                object.remove("strict_route");
+                // Newer libbox/sing-box rejects legacy sniff fields on inbounds.
+                // Android relies on route rule actions for sniffing instead.
+                object.remove("sniff");
+                object.remove("sniff_override_destination");
             }
         }
     }
 
     if let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) {
-        route.remove("auto_detect_interface");
+        route.insert(
+            "auto_detect_interface".to_string(),
+            serde_json::json!(false),
+        );
         route.remove("default_interface");
         route.remove("override_android_vpn");
         route.remove("default_network_strategy");
         route.remove("network_strategy");
+        route.insert(
+            "default_domain_resolver".to_string(),
+            serde_json::json!("remote-dns"),
+        );
+
+        if let Some(rule_sets) = route.get("rule_set").and_then(|value| value.as_array()) {
+            for rule_set in rule_sets {
+                let rule_type = rule_set
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let path = rule_set
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+
+                if rule_type != "local" {
+                    return Err(format!(
+                        "Android runtime config requires local rule-set entries, but found type='{}' in route.rule_set.",
+                        rule_type
+                    ));
+                }
+
+                if path.is_empty() || !std::path::Path::new(path).is_absolute() {
+                    return Err(format!(
+                        "Android runtime config requires absolute rule-set paths, but found '{}'.",
+                        path
+                    ));
+                }
+
+                validate_android_rule_set_file(path)?;
+            }
+        }
+        route.insert(
+            "rules".to_string(),
+            serde_json::json!([
+                {
+                    "inbound": "tun-in",
+                    "protocol": "dns",
+                    "action": "hijack-dns"
+                },
+                {
+                    "network": "udp",
+                    "action": "reject",
+                    "method": "default"
+                },
+                {
+                    "ip_cidr": [format!("{}/32", server_ip)],
+                    "action": "route",
+                    "outbound": "direct"
+                }
+            ]),
+        );
+        route.remove("rule_set");
+        route.insert("final".to_string(), serde_json::json!("proxy"));
+    }
+
+    if let Some(dns) = cfg.get_mut("dns").and_then(|value| value.as_object_mut()) {
+        dns.insert(
+            "servers".to_string(),
+            serde_json::json!([
+                {
+                    "type": "tcp",
+                    "tag": "remote-dns",
+                    "server": "8.8.8.8",
+                    "server_port": 53,
+                    "detour": "proxy"
+                },
+                {
+                    "type": "local",
+                    "tag": "local-dns",
+                    "prefer_go": true
+                }
+            ]),
+        );
+        dns.insert("rules".to_string(), serde_json::json!([]));
+        dns.insert("final".to_string(), serde_json::json!("remote-dns"));
+        dns.insert("strategy".to_string(), serde_json::json!("ipv4_only"));
     }
 
     serde_json::to_string_pretty(&cfg)
         .map_err(|e| format!("Failed to serialize Android runtime client config: {}", e))
+}
+
+#[cfg(target_os = "android")]
+fn validate_android_rule_set_file(path: &str) -> Result<(), String> {
+    let mut magic = [0_u8; 4];
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        format!(
+            "Android runtime config could not open local rule-set '{}': {}",
+            path, e
+        )
+    })?;
+
+    use std::io::Read;
+    file.read_exact(&mut magic).map_err(|e| {
+        format!(
+            "Android runtime config could not read the SRS header from '{}': {}",
+            path, e
+        )
+    })?;
+
+    if &magic[..3] != b"SRS" {
+        return Err(format!(
+            "Android runtime config requires valid .srs rule-set files, but '{}' does not start with the expected SRS header.",
+            path
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "android")]
@@ -780,8 +904,87 @@ struct AndroidNativeBackendLaunchBundle {
     protect_api_available: bool,
 }
 
+#[cfg(target_os = "android")]
+fn load_android_native_backend_launch_status(
+    path: &str,
+) -> Result<Option<AndroidNativeBackendLaunchSnapshot>, String> {
+    let path = std::path::Path::new(path);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let payload = std::fs::read_to_string(path).map_err(|e| {
+        format!(
+            "Failed to read Android native backend status {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    let value = serde_json::from_str::<serde_json::Value>(&payload).map_err(|e| {
+        format!(
+            "Failed to parse Android native backend status {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+
+    Ok(Some(AndroidNativeBackendLaunchSnapshot {
+        session_id: value
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        consumer_tag: value
+            .get("consumer_tag")
+            .and_then(|value| value.as_str())
+            .unwrap_or("rkn_android_native_backend_seam")
+            .to_string(),
+        launch_state: value
+            .get("launch_state")
+            .and_then(|value| value.as_str())
+            .or_else(|| value.get("phase").and_then(|value| value.as_str()))
+            .unwrap_or("unknown")
+            .to_string(),
+        detail: value
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        claim_path: value
+            .get("claim_path")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        launch_bundle_path: value
+            .get("launch_bundle_path")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        status_path: value
+            .get("status_path")
+            .and_then(|value| value.as_str())
+            .unwrap_or(path.to_string_lossy().as_ref())
+            .to_string(),
+        runtime_name: value
+            .get("runtime_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        runtime_selection: value
+            .get("runtime_selection")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        backend_config_summary: value
+            .get("backend_config_summary")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    }))
+}
+
 /// Extract the VPN server IP from the client config's outbound section.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "android"))]
 fn extract_server_ip_from_config(cfg: &serde_json::Value) -> Option<String> {
     let outbounds = cfg.get("outbounds")?.as_array()?;
     for outbound in outbounds {
@@ -797,6 +1000,41 @@ fn extract_server_ip_from_config(cfg: &serde_json::Value) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(not(target_os = "android"))]
+fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, String> {
+    let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
+        format!(
+            "Failed to parse generated client config for desktop runtime: {}",
+            e
+        )
+    })?;
+
+    if let Some(inbounds) = cfg
+        .get_mut("inbounds")
+        .and_then(|value| value.as_array_mut())
+    {
+        for inbound in inbounds {
+            let is_tun = inbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .map(|value| value == "tun")
+                .unwrap_or(false);
+
+            if !is_tun {
+                continue;
+            }
+
+            if let Some(object) = inbound.as_object_mut() {
+                object.remove("sniff");
+                object.remove("sniff_override_destination");
+            }
+        }
+    }
+
+    serde_json::to_string_pretty(&cfg)
+        .map_err(|e| format!("Failed to serialize desktop runtime client config: {}", e))
 }
 
 #[cfg(target_os = "windows")]
@@ -1179,6 +1417,22 @@ fn read_clipboard_text() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn get_tunnel_log_tail(max_lines: Option<usize>) -> Result<Vec<String>, String> {
+    let max_lines = max_lines.unwrap_or(200).clamp(1, 1000);
+    let log_path = tunnel_log_path();
+    let Ok(contents) = std::fs::read_to_string(log_path) else {
+        return Ok(Vec::new());
+    };
+
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+
+    Ok(lines)
+}
+
+#[tauri::command]
 fn get_android_vpn_permission_status() -> Result<bool, String> {
     #[cfg(target_os = "android")]
     {
@@ -1529,6 +1783,18 @@ fn classify_proxy_failure(line: &str) -> bool {
 
 fn classify_outdated_subordinate_config(line: &str) -> bool {
     line.to_lowercase().contains("traffic hijacked")
+}
+
+#[cfg(target_os = "android")]
+fn classify_noisy_android_core_info(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains("inbound/tun[tun-in]: inbound connection")
+        || lower.contains("outbound/direct[direct]: outbound connection")
+}
+
+#[cfg(not(target_os = "android"))]
+fn classify_noisy_android_core_info(_line: &str) -> bool {
+    false
 }
 
 fn current_singbox_target_triple() -> Result<&'static str, String> {
@@ -2541,6 +2807,30 @@ fn android_native_backend_status_state() -> Result<String, String> {
 }
 
 #[cfg(target_os = "android")]
+fn android_backend_state_is_pending(state: &str) -> bool {
+    let normalized = state.trim().to_ascii_lowercase();
+    normalized.starts_with("launching")
+        || normalized.starts_with("starting")
+        || normalized.starts_with("pending")
+}
+
+#[cfg(target_os = "android")]
+fn android_backend_state_is_ready(state: &str) -> bool {
+    state.trim().to_ascii_lowercase().starts_with("ready")
+}
+
+#[cfg(target_os = "android")]
+fn android_backend_state_is_stopped(state: &str) -> bool {
+    let normalized = state.trim().to_ascii_lowercase();
+    normalized.starts_with("idle")
+        || normalized.starts_with("stopped")
+        || normalized.starts_with("failed")
+        || normalized.starts_with("cancelled")
+        || normalized.starts_with("missing")
+        || normalized.starts_with("unknown")
+}
+
+#[cfg(target_os = "android")]
 fn android_claim_backend_handoff_session(
     session_id: &str,
     consumer_tag: &str,
@@ -2780,6 +3070,7 @@ fn android_protect_socket_fd(fd: i32) -> Result<bool, String> {
 }
 
 #[cfg(target_os = "android")]
+#[allow(dead_code)]
 async fn wait_for_android_tun_interface(app: &AppHandle) -> Result<String, String> {
     for _ in 0..20 {
         match android_tun_interface_ready() {
@@ -3021,7 +3312,7 @@ fn prepare_android_backend_consumer_handoff_inner(
 }
 
 #[cfg(target_os = "android")]
-fn start_android_native_backend_consumer_seam_inner(
+async fn start_android_native_backend_consumer_seam_inner(
     app: Option<&AppHandle>,
     local_data: &std::path::Path,
     consumer_tag: &str,
@@ -3076,7 +3367,19 @@ fn start_android_native_backend_consumer_seam_inner(
     let launch_bundle_path =
         persist_android_native_backend_launch_bundle(local_data, &launch_bundle)?;
 
-    let raw = android_start_native_backend_seam(&launch_bundle_path.to_string_lossy())?;
+    let launch_bundle_path_string = launch_bundle_path.to_string_lossy().to_string();
+    let raw = tokio::time::timeout(Duration::from_secs(15), async move {
+        tauri::async_runtime::spawn_blocking(move || {
+            android_start_native_backend_seam(&launch_bundle_path_string)
+        })
+        .await
+        .map_err(|error| format!("Android native backend seam task join failed: {}", error))?
+    })
+    .await
+    .map_err(|_| {
+        "Android native backend seam timed out after 15 seconds while waiting for libbox launch."
+            .to_string()
+    })??;
     let payload = serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
         format!(
             "Failed to parse Android native backend seam launch result: {}",
@@ -3138,6 +3441,23 @@ fn start_android_native_backend_consumer_seam_inner(
         );
     }
 
+    if android_native_backend_launch_state_is_pending(&launch_state) {
+        for _ in 0..120 {
+            sleep(Duration::from_millis(300)).await;
+
+            if let Some(updated) = load_android_native_backend_launch_status(&status_path)? {
+                if !android_native_backend_launch_state_is_pending(&updated.launch_state) {
+                    return Ok(updated);
+                }
+            }
+        }
+
+        return Err(format!(
+            "Android native backend stayed in a pending launch state for too long. status_path={}, runtime={}, detail={}",
+            status_path, runtime_name, detail
+        ));
+    }
+
     Ok(AndroidNativeBackendLaunchSnapshot {
         session_id: runtime_context.session_id,
         consumer_tag: runtime_context.consumer_tag,
@@ -3150,6 +3470,11 @@ fn start_android_native_backend_consumer_seam_inner(
         runtime_selection,
         backend_config_summary,
     })
+}
+
+#[cfg(target_os = "android")]
+fn android_native_backend_launch_state_is_pending(state: &str) -> bool {
+    android_backend_state_is_pending(state)
 }
 
 #[cfg(target_os = "android")]
@@ -3529,27 +3854,72 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                         &local_data,
                         "rkn_android_native_backend_seam",
                     )
-                    .ok();
-                    return Err(format!(
-                        "Android TUN handoff is not implemented in the current runtime. VpnService is ready with fd={}, config={}, log={}. Consumer handoff has been prepared for rkn_android_native_backend_seam{}{}. The next 6A.4.1 backend must consume this Android-owned interface instead of launching the standalone sing-box CLI.",
-                        tun_fd,
-                        config_path,
-                        log_path,
-                        consumer_claim
-                            .as_ref()
-                            .map(|claim| format!(", session={}, claim_state={}, backend_config={}", claim.session_id, claim.claim_state, claim.backend_config_path))
-                            .unwrap_or_default(),
-                        consumer_launch
-                            .as_ref()
-                            .map(|launch| format!(", seam_state={}, seam_status_path={}", launch.launch_state, launch.status_path))
-                            .unwrap_or_default()
-                    ));
+                    .await;
+                    match consumer_launch {
+                        Ok(launch) if launch.launch_state.starts_with("ready") => {
+                            let _ = app.emit(
+                                "tunnel-log",
+                                format!(
+                                    "[SYSTEM] Android native backend is ready: runtime={}, state={}, status_path={}",
+                                    launch.runtime_name, launch.launch_state, launch.status_path
+                                ),
+                            );
+                            return Ok(ANDROID_NATIVE_BACKEND_SENTINEL_PID);
+                        }
+                        Ok(launch) => {
+                            return Err(format!(
+                                "Android native backend launch failed after TUN handoff. VpnService fd={}, config={}, log={}. Consumer handoff{}; seam_state={}, runtime={}, detail={}, status_path={}",
+                                tun_fd,
+                                config_path,
+                                log_path,
+                                consumer_claim
+                                    .as_ref()
+                                    .map(|claim| format!(", session={}, claim_state={}, backend_config={}", claim.session_id, claim.claim_state, claim.backend_config_path))
+                                    .unwrap_or_default(),
+                                launch.launch_state,
+                                launch.runtime_name,
+                                launch.detail,
+                                launch.status_path
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "Android native backend seam crashed after TUN handoff. VpnService fd={}, config={}, log={}. Consumer handoff{}; seam_error={}",
+                                tun_fd,
+                                config_path,
+                                log_path,
+                                consumer_claim
+                                    .as_ref()
+                                    .map(|claim| format!(", session={}, claim_state={}, backend_config={}", claim.session_id, claim.claim_state, claim.backend_config_path))
+                                    .unwrap_or_default(),
+                                error
+                            ));
+                        }
+                    }
                 }
             }
         }
 
         #[cfg(not(target_os = "android"))]
-        let config_str = config_path.to_string_lossy().to_string();
+        let config_str = {
+            let desktop_config_path = local_data.join("client_config_desktop.json");
+            let raw = std::fs::read_to_string(&config_path).map_err(|e| {
+                format!(
+                    "Failed to read base client config {}: {}",
+                    config_path.display(),
+                    e
+                )
+            })?;
+            let runtime_cfg = build_desktop_runtime_client_config(&raw)?;
+            std::fs::write(&desktop_config_path, runtime_cfg).map_err(|e| {
+                format!(
+                    "Failed to write desktop runtime client config {}: {}",
+                    desktop_config_path.display(),
+                    e
+                )
+            })?;
+            desktop_config_path.to_string_lossy().to_string()
+        };
 
         #[cfg(not(target_os = "android"))]
         if announce_prompt {
@@ -3664,7 +4034,11 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
     {
         #[cfg(target_os = "android")]
         {
-            let _ = terminate_root_process(Some(app), old_pid);
+            if is_android_native_backend_pid(old_pid) {
+                let _ = stop_android_tunnel_service();
+            } else {
+                let _ = terminate_root_process(Some(app), old_pid);
+            }
             sleep(Duration::from_secs(1)).await;
             match prepare_android_runtime_launch(app, &local_data, &config_path, log_path, false)? {
                 AndroidRuntimeLaunchPlan::TunHandoffRequired {
@@ -3683,27 +4057,72 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
                         &local_data,
                         "rkn_android_native_backend_seam",
                     )
-                    .ok();
-                    return Err(format!(
-                        "Android TUN handoff is not implemented in the current runtime. Restart reached the same checkpoint with fd={}, config={}, log={}. Consumer handoff has been prepared for rkn_android_native_backend_seam{}{}. A libbox/SFA-style Android backend is required before mobile protection can restart for real.",
-                        tun_fd,
-                        config_path,
-                        log_path,
-                        consumer_claim
-                            .as_ref()
-                            .map(|claim| format!(", session={}, claim_state={}, backend_config={}", claim.session_id, claim.claim_state, claim.backend_config_path))
-                            .unwrap_or_default(),
-                        consumer_launch
-                            .as_ref()
-                            .map(|launch| format!(", seam_state={}, seam_status_path={}", launch.launch_state, launch.status_path))
-                            .unwrap_or_default()
-                    ));
+                    .await;
+                    match consumer_launch {
+                        Ok(launch) if launch.launch_state.starts_with("ready") => {
+                            let _ = app.emit(
+                                "tunnel-log",
+                                format!(
+                                    "[SYSTEM] Android native backend restarted successfully: runtime={}, state={}, status_path={}",
+                                    launch.runtime_name, launch.launch_state, launch.status_path
+                                ),
+                            );
+                            return Ok(ANDROID_NATIVE_BACKEND_SENTINEL_PID);
+                        }
+                        Ok(launch) => {
+                            return Err(format!(
+                                "Android native backend restart failed after TUN handoff. VpnService fd={}, config={}, log={}. Consumer handoff{}; seam_state={}, runtime={}, detail={}, status_path={}",
+                                tun_fd,
+                                config_path,
+                                log_path,
+                                consumer_claim
+                                    .as_ref()
+                                    .map(|claim| format!(", session={}, claim_state={}, backend_config={}", claim.session_id, claim.claim_state, claim.backend_config_path))
+                                    .unwrap_or_default(),
+                                launch.launch_state,
+                                launch.runtime_name,
+                                launch.detail,
+                                launch.status_path
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "Android native backend seam crashed during restart after TUN handoff. VpnService fd={}, config={}, log={}. Consumer handoff{}; seam_error={}",
+                                tun_fd,
+                                config_path,
+                                log_path,
+                                consumer_claim
+                                    .as_ref()
+                                    .map(|claim| format!(", session={}, claim_state={}, backend_config={}", claim.session_id, claim.claim_state, claim.backend_config_path))
+                                    .unwrap_or_default(),
+                                error
+                            ));
+                        }
+                    }
                 }
             }
         }
 
         #[cfg(not(target_os = "android"))]
-        let config_str = config_path.to_string_lossy().to_string();
+        let config_str = {
+            let desktop_config_path = local_data.join("client_config_desktop.json");
+            let raw = std::fs::read_to_string(&config_path).map_err(|e| {
+                format!(
+                    "Failed to read base client config {}: {}",
+                    config_path.display(),
+                    e
+                )
+            })?;
+            let runtime_cfg = build_desktop_runtime_client_config(&raw)?;
+            std::fs::write(&desktop_config_path, runtime_cfg).map_err(|e| {
+                format!(
+                    "Failed to write desktop runtime client config {}: {}",
+                    desktop_config_path.display(),
+                    e
+                )
+            })?;
+            desktop_config_path.to_string_lossy().to_string()
+        };
 
         #[cfg(not(target_os = "android"))]
         let shell_cmd = format!(
@@ -3765,6 +4184,65 @@ async fn verify_tunnel_start(
 
     #[cfg(target_os = "android")]
     {
+        if is_android_native_backend_pid(pid) {
+            let mut backend_state = "unknown".to_string();
+            let mut tun_ready = false;
+
+            for _ in 0..25 {
+                backend_state =
+                    android_native_backend_status_state().unwrap_or_else(|_| "unknown".to_string());
+                tun_ready = android_tun_interface_ready().unwrap_or(false);
+
+                if android_backend_state_is_ready(&backend_state) && tun_ready {
+                    break;
+                }
+
+                if !android_backend_state_is_pending(&backend_state) {
+                    break;
+                }
+
+                sleep(Duration::from_millis(400)).await;
+            }
+
+            if !android_backend_state_is_ready(&backend_state) || !tun_ready {
+                let _ = stop_android_tunnel_service();
+
+                {
+                    let mut guard = state.singbox_pid.lock().unwrap();
+                    if guard.as_ref() == Some(&pid) {
+                        *guard = None;
+                    }
+                }
+
+                set_network_fingerprint(state, None);
+                clear_saved_tunnel_pid(app);
+                emit_tunnel_state(app, false);
+                emit_guard_state(app, "inactive");
+
+                let log_tail = recent_log_tail(log_path, 20);
+                let details = if log_tail.is_empty() {
+                    format!(
+                        "Android native backend did not stay ready during startup. Backend state: {}, tun_ready={}",
+                        backend_state, tun_ready
+                    )
+                } else {
+                    format!(
+                        "Android native backend did not stay ready during startup. Backend state: {}, tun_ready={}\nRecent logs:\n{}",
+                        backend_state, tun_ready, log_tail
+                    )
+                };
+
+                return Err(details);
+            }
+
+            set_network_fingerprint(state, current_network_fingerprint());
+            reset_guard_state(state);
+            save_tunnel_pid(app, pid)?;
+            emit_tunnel_state(app, true);
+            emit_guard_state(app, "active");
+            return Ok(());
+        }
+
         let log_tail = recent_log_tail(log_path, 20);
         if let Some(blocker) = classify_android_startup_blocker(&log_tail) {
             let _ = terminate_root_process(None, pid);
@@ -3846,6 +4324,7 @@ async fn verify_tunnel_start(
 fn spawn_log_reader(app: AppHandle, pid: u32, log_path: &'static str) {
     tauri::async_runtime::spawn(async move {
         sleep(Duration::from_millis(500)).await;
+        let mut suppressed_noisy_lines = 0usize;
 
         let file = match tokio::fs::File::open(log_path).await {
             Ok(f) => f,
@@ -3875,6 +4354,31 @@ fn spawn_log_reader(app: AppHandle, pid: u32, log_path: &'static str) {
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     if !line.trim().is_empty() {
+                        if classify_noisy_android_core_info(&line) {
+                            suppressed_noisy_lines += 1;
+                            if suppressed_noisy_lines.is_multiple_of(100) {
+                                let _ = app.emit(
+                                    "tunnel-log",
+                                    format!(
+                                        "[CORE] [suppressed {} repetitive tun/direct info lines in the live UI; full details remain in the file log]",
+                                        suppressed_noisy_lines
+                                    ),
+                                );
+                            }
+                            continue;
+                        }
+
+                        if suppressed_noisy_lines > 0 {
+                            let _ = app.emit(
+                                "tunnel-log",
+                                format!(
+                                    "[CORE] [resuming detailed live logs after suppressing {} repetitive tun/direct info lines]",
+                                    suppressed_noisy_lines
+                                ),
+                            );
+                            suppressed_noisy_lines = 0;
+                        }
+
                         let _ = app.emit("tunnel-log", format!("[CORE] {}", line));
                         if classify_outdated_subordinate_config(&line) {
                             let _ = app.emit(
@@ -3910,6 +4414,50 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
             };
 
             if current_pid != Some(pid) {
+                break;
+            }
+
+            #[cfg(target_os = "android")]
+            if is_android_native_backend_pid(pid) {
+                let backend_state =
+                    android_native_backend_status_state().unwrap_or_else(|_| "unknown".to_string());
+                let tun_ready = android_tun_interface_ready().unwrap_or(false);
+                if backend_state.starts_with("ready") && tun_ready {
+                    continue;
+                }
+
+                {
+                    let state = app.state::<AppState>();
+                    let mut guard = state.singbox_pid.lock().unwrap();
+                    if guard.as_ref() == Some(&pid) {
+                        *guard = None;
+                    }
+                    set_network_fingerprint(&state, None);
+                    clear_saved_tunnel_pid(&app);
+                    finish_recovery(&state);
+                    reset_guard_state(&state);
+                }
+
+                let log_tail = recent_log_tail(tunnel_log_path(), 20);
+                let details = if log_tail.is_empty() {
+                    format!("Backend state: {}, tun_ready={}", backend_state, tun_ready)
+                } else {
+                    format!(
+                        "Backend state: {}, tun_ready={}\nRecent logs:\n{}",
+                        backend_state, tun_ready, log_tail
+                    )
+                };
+
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SYSTEM] Android native backend stopped. Tunnel is no longer active. {}",
+                        details
+                    ),
+                );
+                let _ = stop_android_tunnel_service();
+                emit_tunnel_state(&app, false);
+                emit_guard_state(&app, "inactive");
                 break;
             }
 
@@ -4110,6 +4658,65 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
     });
 }
 
+#[cfg(target_os = "android")]
+async fn wait_for_android_backend_shutdown(app: &AppHandle) {
+    for _ in 0..15 {
+        let backend_state =
+            android_native_backend_status_state().unwrap_or_else(|_| "unknown".to_string());
+        let tun_ready = android_tun_interface_ready().unwrap_or(false);
+
+        if android_backend_state_is_stopped(&backend_state) && !tun_ready {
+            return;
+        }
+
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    let _ = app.emit(
+        "tunnel-log",
+        "[WARN] Android backend stop did not fully settle before the timeout window expired."
+            .to_string(),
+    );
+}
+
+#[cfg(target_os = "android")]
+fn clear_android_native_backend_runtime_artifacts(app: &AppHandle) {
+    let Ok(local_data) = app.path().app_local_data_dir() else {
+        return;
+    };
+
+    if let Ok(path) = android_native_backend_status_path() {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut snapshot = match load_android_runtime_context(&local_data) {
+        Ok(Some(snapshot)) => snapshot,
+        _ => return,
+    };
+
+    if !snapshot.consumer_launch_path.is_empty() {
+        let _ = std::fs::remove_file(&snapshot.consumer_launch_path);
+    }
+
+    snapshot.consumer_launch_state = "idle".to_string();
+    snapshot.consumer_launch_path = String::new();
+    snapshot.consumer_launch_runtime = String::new();
+    snapshot.consumer_launch_selection = String::new();
+    snapshot.consumer_launch_summary = String::new();
+    snapshot.consumer_claim_state = "idle".to_string();
+    snapshot.consumer_claim_path = String::new();
+    snapshot.consumer_tag = String::new();
+    snapshot.consumer_session_dir = String::new();
+    snapshot.backend_session_state = "idle".to_string();
+    snapshot.backend_session_id = String::new();
+    snapshot.backend_session_context_path = String::new();
+    snapshot.backend_session_config_path = snapshot.backend_config_path.clone();
+    snapshot.backend_session_log_path = snapshot.log_path.clone();
+    snapshot.tun_fd = -1;
+    snapshot.tun_state = "idle".to_string();
+    let _ = persist_android_runtime_context(&local_data, &snapshot);
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "windows")]
@@ -4174,6 +4781,8 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
 
     #[cfg(target_os = "android")]
     {
+        clear_android_native_backend_runtime_artifacts(&app);
+
         if !android_vpn_permission_granted()? {
             let _ = app.emit(
                 "tunnel-log",
@@ -4194,28 +4803,11 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
             "[SYSTEM] Android VPN service anchor is active. Starting the local core next."
                 .to_string(),
         );
-
-        let tun_state = wait_for_android_tun_interface(&app)
-            .await
-            .inspect_err(|_| {
-                let _ = stop_android_tunnel_service();
-            })?;
         let _ = app.emit(
             "tunnel-log",
-            format!(
-                "[SYSTEM] Android VpnService established a real TUN interface. {}",
-                tun_state
-            ),
+            "[SYSTEM] Android VpnService foreground anchor is ready. The native backend will establish the real TUN interface during handoff."
+                .to_string(),
         );
-        if let Ok(fd) = android_peek_tun_fd() {
-            let _ = app.emit(
-                "tunnel-log",
-                format!(
-                    "[SYSTEM] Android TUN bridge foundation is ready. Service-owned TUN fd is currently visible as {}.",
-                    fd
-                ),
-            );
-        }
     }
 
     let _ = app.emit("tunnel-log", "[SYSTEM] Resolving core binary path...");
@@ -4233,7 +4825,11 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
 
     let _ = app.emit(
         "tunnel-log",
-        format!("[SYSTEM] Core process started with PID {}.", pid),
+        if cfg!(target_os = "android") && is_android_native_backend_pid(pid) {
+            "[SYSTEM] Android native backend session started inside the app process.".to_string()
+        } else {
+            format!("[SYSTEM] Core process started with PID {}.", pid)
+        },
     );
 
     verify_tunnel_start(&app, &state, pid, tunnel_log_path())
@@ -4288,10 +4884,25 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
         Some(pid) => {
             let _ = app.emit(
                 "tunnel-log",
-                format!("[SYSTEM] Stopping core process (PID {})...", pid),
+                if cfg!(target_os = "android") && is_android_native_backend_pid(pid) {
+                    "[SYSTEM] Stopping Android native backend...".to_string()
+                } else {
+                    format!("[SYSTEM] Stopping core process (PID {})...", pid)
+                },
             );
 
-            if terminate_root_process(Some(&app), pid).is_ok() {
+            if cfg!(target_os = "android") && is_android_native_backend_pid(pid) {
+                #[cfg(target_os = "android")]
+                {
+                    let _ = stop_android_tunnel_service();
+                    wait_for_android_backend_shutdown(&app).await;
+                    clear_android_native_backend_runtime_artifacts(&app);
+                }
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Android native backend terminated. Routing disabled.".to_string(),
+                );
+            } else if terminate_root_process(Some(&app), pid).is_ok() {
                 let _ = app.emit(
                     "tunnel-log",
                     "[SYSTEM] Core process terminated. Routing disabled.".to_string(),
@@ -4303,6 +4914,7 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
                 );
             }
 
+            #[cfg(not(target_os = "android"))]
             let _ = std::fs::remove_file(tunnel_log_path());
             clear_saved_tunnel_pid(&app);
             set_network_fingerprint(&state, None);
@@ -4311,7 +4923,11 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             #[cfg(target_os = "windows")]
             let _ = clear_windows_system_proxy();
             #[cfg(target_os = "android")]
-            let _ = stop_android_tunnel_service();
+            if !is_android_native_backend_pid(pid) {
+                let _ = stop_android_tunnel_service();
+                wait_for_android_backend_shutdown(&app).await;
+                clear_android_native_backend_runtime_artifacts(&app);
+            }
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
             refresh_tray_toggle_item(&app);
@@ -4330,7 +4946,11 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             #[cfg(target_os = "windows")]
             let _ = clear_windows_system_proxy();
             #[cfg(target_os = "android")]
-            let _ = stop_android_tunnel_service();
+            {
+                let _ = stop_android_tunnel_service();
+                wait_for_android_backend_shutdown(&app).await;
+                clear_android_native_backend_runtime_artifacts(&app);
+            }
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
             refresh_tray_toggle_item(&app);
@@ -4506,7 +5126,8 @@ async fn start_android_native_backend_consumer_seam(
             Some(&app),
             &local_data,
             &consumer_tag,
-        )?;
+        )
+        .await?;
         let response = serde_json::json!({
             "session_id": launch_snapshot.session_id,
             "consumer_tag": launch_snapshot.consumer_tag,
@@ -4662,6 +5283,35 @@ async fn restore_tunnel_session(
         emit_guard_state(&app, "inactive");
         return Ok(None);
     };
+
+    #[cfg(target_os = "android")]
+    if is_android_native_backend_pid(saved_pid) {
+        let backend_state =
+            android_native_backend_status_state().unwrap_or_else(|_| "unknown".to_string());
+        let tun_ready = android_tun_interface_ready().unwrap_or(false);
+        if !backend_state.starts_with("ready") || !tun_ready {
+            clear_saved_tunnel_pid(&app);
+            emit_tunnel_state(&app, false);
+            emit_guard_state(&app, "inactive");
+            return Ok(None);
+        }
+
+        {
+            let mut guard = state.singbox_pid.lock().unwrap();
+            *guard = Some(saved_pid);
+        }
+
+        set_network_fingerprint(&state, current_network_fingerprint());
+        reset_guard_state(&state);
+        emit_tunnel_state(&app, true);
+        emit_guard_state(&app, "active");
+        spawn_log_reader(app.clone(), saved_pid, tunnel_log_path());
+        spawn_process_exit_monitor(app.clone(), saved_pid);
+        spawn_network_recovery_monitor(app.clone(), saved_pid);
+        refresh_tray_toggle_item(&app);
+
+        return Ok(Some(saved_pid));
+    }
 
     if !process_exists(saved_pid) {
         clear_saved_tunnel_pid(&app);
@@ -4829,6 +5479,7 @@ pub fn run() {
             set_windows_runtime_mode,
             reset_local_data,
             restore_tunnel_session,
+            get_tunnel_log_tail,
             write_clipboard_text,
             read_clipboard_text,
             get_android_vpn_permission_status,
