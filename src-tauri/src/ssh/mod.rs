@@ -43,7 +43,7 @@ pub(crate) const CONTAINER_PREFIXES: [&str; 5] = [
 ];
 pub(crate) const LEGACY_CONTAINER_NAME: &str = "sys-network-helper";
 pub(crate) const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const SSH_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const SSH_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const SSH_SESSION_ATTEMPTS: usize = 3;
 pub(crate) const SSH_RETRY_BACKOFF: Duration = Duration::from_millis(750);
 pub(crate) const REMOTE_DEPLOY_STALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -294,8 +294,8 @@ fn connect_ssh_session_inner(
             emit_stages,
             "HANDSHAKE",
             format!(
-                "TCP connected. Starting SSH handshake (attempt {}/{})...",
-                attempt, SSH_SESSION_ATTEMPTS
+                "TCP connected. Starting SSH handshake (attempt {}/{}, {:?} timeout)...",
+                attempt, SSH_SESSION_ATTEMPTS, SSH_SESSION_TIMEOUT
             ),
         );
 
