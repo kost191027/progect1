@@ -6,10 +6,11 @@ use super::invite::resolve_master_ss_transport;
 use super::warp::{ensure_remote_warp_config, load_saved_server_profile};
 use super::{
     acquire_remote_mutation_lock, build_rotated_cover_domain_history, connect_ssh_session,
-    emit_ssh_stage, ensure_local_client_rule_sets_sync, ensure_master_role,
-    load_local_client_transport_state, load_remote_container_name, load_remote_transport_bootstrap,
-    monitored_port_pattern, run_remote_command, save_cached_transport_bootstrap,
-    LocalClientTransportState, RemoteTransportBootstrap, TransportStateSnapshot,
+    connect_ssh_session_quiet, emit_ssh_stage, ensure_local_client_rule_sets_sync,
+    ensure_master_role, load_local_client_transport_state, load_remote_container_name,
+    load_remote_transport_bootstrap, monitored_port_pattern, run_remote_command,
+    save_cached_transport_bootstrap, LocalClientTransportState, RemoteTransportBootstrap,
+    TransportStateSnapshot,
 };
 
 fn local_transport_requires_redeploy(
@@ -25,7 +26,10 @@ fn local_transport_requires_redeploy(
         || local_state.ss_password != remote_bootstrap.ss_password
 }
 
-fn load_transport_state_snapshot_sync(app: &AppHandle) -> Result<TransportStateSnapshot, String> {
+fn load_transport_state_snapshot_sync(
+    app: &AppHandle,
+    emit_ssh_logs: bool,
+) -> Result<TransportStateSnapshot, String> {
     let available_cover_domains = crate::generator::available_cover_domains();
     let local_state = load_local_client_transport_state(app)?;
 
@@ -38,7 +42,11 @@ fn load_transport_state_snapshot_sync(app: &AppHandle) -> Result<TransportStateS
         });
     };
 
-    let sess = connect_ssh_session(app, &profile.host, &profile.user, &profile.password)?;
+    let sess = if emit_ssh_logs {
+        connect_ssh_session(app, &profile.host, &profile.user, &profile.password)?
+    } else {
+        connect_ssh_session_quiet(app, &profile.host, &profile.user, &profile.password)?
+    };
     let remote_bootstrap = load_remote_transport_bootstrap(&sess)?;
 
     let Some(remote_bootstrap) = remote_bootstrap else {
@@ -63,24 +71,46 @@ fn load_transport_state_snapshot_sync(app: &AppHandle) -> Result<TransportStateS
     })
 }
 
+#[cfg(target_os = "android")]
 pub(crate) async fn ensure_local_transport_is_current(app: &AppHandle) -> Result<(), String> {
     let check_app = app.clone();
     let snapshot_result = tauri::async_runtime::spawn_blocking(move || {
-        load_transport_state_snapshot_sync(&check_app)
+        load_transport_state_snapshot_sync(&check_app, true)
     })
     .await
     .unwrap();
 
+    ensure_transport_snapshot_current(app, snapshot_result, true)
+}
+
+pub(crate) async fn ensure_local_transport_is_current_quiet(app: &AppHandle) -> Result<(), String> {
+    let check_app = app.clone();
+    let snapshot_result = tauri::async_runtime::spawn_blocking(move || {
+        load_transport_state_snapshot_sync(&check_app, false)
+    })
+    .await
+    .unwrap();
+
+    ensure_transport_snapshot_current(app, snapshot_result, false)
+}
+
+fn ensure_transport_snapshot_current(
+    app: &AppHandle,
+    snapshot_result: Result<TransportStateSnapshot, String>,
+    emit_warning: bool,
+) -> Result<(), String> {
     let snapshot = match snapshot_result {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            let _ = app.emit(
-                "tunnel-log",
-                format!(
-                    "[WARN] Unable to verify whether this device is in sync with the remote transport before starting the tunnel: {}",
-                    error
-                ),
-            );
+            if emit_warning {
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[WARN] Unable to verify whether this device is in sync with the remote transport: {}",
+                        error
+                    ),
+                );
+            }
             return Ok(());
         }
     };
@@ -228,7 +258,7 @@ fn summarize_server_status_output(stdout: &str) -> Vec<String> {
 pub async fn get_transport_state_snapshot(
     app: AppHandle,
 ) -> Result<TransportStateSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(move || load_transport_state_snapshot_sync(&app))
+    tauri::async_runtime::spawn_blocking(move || load_transport_state_snapshot_sync(&app, true))
         .await
         .unwrap()
 }

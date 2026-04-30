@@ -6,7 +6,9 @@ mod warp;
 // ── Crate-visible helpers used by lib.rs ────────────────────────────────────
 
 pub(crate) use invite::clear_issued_invites;
+#[cfg(target_os = "android")]
 pub(crate) use status::ensure_local_transport_is_current;
+pub(crate) use status::ensure_local_transport_is_current_quiet;
 pub(crate) use warp::clear_local_warp_profile_sync;
 
 // ── Shared types (used across submodules and by generator.rs) ───────────────
@@ -41,7 +43,9 @@ pub(crate) const CONTAINER_PREFIXES: [&str; 5] = [
 ];
 pub(crate) const LEGACY_CONTAINER_NAME: &str = "sys-network-helper";
 pub(crate) const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const SSH_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const SSH_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const SSH_SESSION_ATTEMPTS: usize = 3;
+pub(crate) const SSH_RETRY_BACKOFF: Duration = Duration::from_millis(750);
 pub(crate) const REMOTE_DEPLOY_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const REMOTE_DEPLOY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const MAX_FALLBACK_COVER_DOMAINS: usize = 4;
@@ -213,10 +217,46 @@ pub(crate) fn connect_ssh_session(
     user: &str,
     pass: &str,
 ) -> Result<Session, String> {
-    emit_ssh_stage(app, "RESOLVE", format!("Resolving {}...", host));
-    let addrs = resolve_ssh_socket_addrs(host)?;
-    emit_ssh_stage(
+    connect_ssh_session_inner(app, host, user, pass, true)
+}
+
+pub(crate) fn connect_ssh_session_quiet(
+    app: &AppHandle,
+    host: &str,
+    user: &str,
+    pass: &str,
+) -> Result<Session, String> {
+    connect_ssh_session_inner(app, host, user, pass, false)
+}
+
+fn maybe_emit_ssh_stage(
+    app: &AppHandle,
+    emit_stages: bool,
+    stage: &str,
+    message: impl Into<String>,
+) {
+    if emit_stages {
+        emit_ssh_stage(app, stage, message);
+    }
+}
+
+fn connect_ssh_session_inner(
+    app: &AppHandle,
+    host: &str,
+    user: &str,
+    pass: &str,
+    emit_stages: bool,
+) -> Result<Session, String> {
+    maybe_emit_ssh_stage(
         app,
+        emit_stages,
+        "RESOLVE",
+        format!("Resolving {}...", host),
+    );
+    let addrs = resolve_ssh_socket_addrs(host)?;
+    maybe_emit_ssh_stage(
+        app,
+        emit_stages,
         "CONNECT",
         format!(
             "Trying {} resolved SSH address(es) with {:?} timeout...",
@@ -225,28 +265,112 @@ pub(crate) fn connect_ssh_session(
         ),
     );
 
-    let tcp = connect_tcp_with_timeout(&addrs)?;
-    emit_ssh_stage(app, "HANDSHAKE", "TCP connected. Starting SSH handshake...");
+    let mut last_error = None;
 
-    let mut sess = Session::new().map_err(|e| e.to_string())?;
-    sess.set_timeout(SSH_SESSION_TIMEOUT.as_millis() as u32);
-    sess.set_tcp_stream(tcp);
-    sess.handshake()
-        .map_err(|e| format!("SSH handshake failed: {}", e))?;
+    for attempt in 1..=SSH_SESSION_ATTEMPTS {
+        let tcp = match connect_tcp_with_timeout(&addrs) {
+            Ok(stream) => stream,
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < SSH_SESSION_ATTEMPTS {
+                    maybe_emit_ssh_stage(
+                        app,
+                        emit_stages,
+                        "RETRY",
+                        format!(
+                            "SSH TCP connect attempt {}/{} failed. Retrying shortly...",
+                            attempt, SSH_SESSION_ATTEMPTS
+                        ),
+                    );
+                    thread::sleep(SSH_RETRY_BACKOFF);
+                    continue;
+                }
+                break;
+            }
+        };
 
-    emit_ssh_stage(
-        app,
-        "AUTH",
-        format!("Authenticating with password as {}...", user),
-    );
-    sess.userauth_password(user, pass)
-        .map_err(|e| format!("Auth failed: {}", e))?;
+        maybe_emit_ssh_stage(
+            app,
+            emit_stages,
+            "HANDSHAKE",
+            format!(
+                "TCP connected. Starting SSH handshake (attempt {}/{})...",
+                attempt, SSH_SESSION_ATTEMPTS
+            ),
+        );
 
-    if !sess.authenticated() {
-        return Err("Authentication failed".to_string());
+        let mut sess = Session::new().map_err(|e| e.to_string())?;
+        sess.set_timeout(SSH_SESSION_TIMEOUT.as_millis() as u32);
+        sess.set_tcp_stream(tcp);
+
+        if let Err(error) = sess.handshake() {
+            last_error = Some(format!("SSH handshake failed: {}", error));
+            if attempt < SSH_SESSION_ATTEMPTS {
+                maybe_emit_ssh_stage(
+                    app,
+                    emit_stages,
+                    "RETRY",
+                    format!(
+                        "SSH handshake attempt {}/{} timed out or failed. Retrying...",
+                        attempt, SSH_SESSION_ATTEMPTS
+                    ),
+                );
+                thread::sleep(SSH_RETRY_BACKOFF);
+                continue;
+            }
+            break;
+        }
+
+        maybe_emit_ssh_stage(
+            app,
+            emit_stages,
+            "AUTH",
+            format!(
+                "Authenticating with password as {} (attempt {}/{})...",
+                user, attempt, SSH_SESSION_ATTEMPTS
+            ),
+        );
+
+        if let Err(error) = sess.userauth_password(user, pass) {
+            last_error = Some(format!("Auth failed: {}", error));
+            if attempt < SSH_SESSION_ATTEMPTS {
+                maybe_emit_ssh_stage(
+                    app,
+                    emit_stages,
+                    "RETRY",
+                    format!(
+                        "SSH auth attempt {}/{} failed. Retrying...",
+                        attempt, SSH_SESSION_ATTEMPTS
+                    ),
+                );
+                thread::sleep(SSH_RETRY_BACKOFF);
+                continue;
+            }
+            break;
+        }
+
+        if !sess.authenticated() {
+            last_error = Some("Authentication failed".to_string());
+            if attempt < SSH_SESSION_ATTEMPTS {
+                maybe_emit_ssh_stage(
+                    app,
+                    emit_stages,
+                    "RETRY",
+                    format!(
+                        "SSH auth state was not established on attempt {}/{}. Retrying...",
+                        attempt, SSH_SESSION_ATTEMPTS
+                    ),
+                );
+                thread::sleep(SSH_RETRY_BACKOFF);
+                continue;
+            }
+            break;
+        }
+
+        return Ok(sess);
     }
 
-    Ok(sess)
+    Err(last_error.unwrap_or_else(|| "SSH session failed to start.".to_string()))
 }
 
 // ── Remote command execution ────────────────────────────────────────────────

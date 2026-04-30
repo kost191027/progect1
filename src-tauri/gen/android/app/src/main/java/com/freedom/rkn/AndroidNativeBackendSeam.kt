@@ -76,12 +76,14 @@ object AndroidNativeBackendSeam {
                 )
             }
 
-            AndroidTunnelService.updateBackendHandoffSessionState(
-                sessionId = sessionId,
-                consumerTag = consumerTag,
-                phase = "launching",
-                detail = "Android native backend seam is validating the claimed handoff session.",
-            )
+            if (launchBundle.backendHint == "android_native_handoff_required") {
+                AndroidTunnelService.updateBackendHandoffSessionState(
+                    sessionId = sessionId,
+                    consumerTag = consumerTag,
+                    phase = "launching",
+                    detail = "Android native backend seam is validating the claimed handoff session.",
+                )
+            }
 
             val contextFile = File(launchBundle.contextPath)
             val backendConfigFile = File(launchBundle.backendConfigPath)
@@ -90,7 +92,10 @@ object AndroidNativeBackendSeam {
             File(launchBundle.sessionDir).mkdirs()
             File(launchBundle.runtimeLogPath).parentFile?.mkdirs()
 
-            if (launchBundle.backendHint != "android_native_handoff_required") {
+            if (
+                launchBundle.backendHint != "android_native_handoff_required" &&
+                    launchBundle.backendHint != "android_native_proxy_fallback"
+            ) {
                 val detail =
                     "Android native backend seam received a launch bundle with an unexpected backend hint."
                 AndroidTunnelService.updateBackendHandoffSessionState(
@@ -135,12 +140,17 @@ object AndroidNativeBackendSeam {
                 runtimeName = selection.runtime.runtimeName,
                 runtimeSelection = selection.selectionSummary,
             )
-            val launchState = AndroidTunnelService.updateBackendHandoffSessionState(
-                sessionId = sessionId,
-                consumerTag = consumerTag,
-                phase = initialLaunchResult.phase,
-                detail = initialLaunchResult.detail,
-            )
+            val launchState =
+                if (launchBundle.backendHint == "android_native_proxy_fallback") {
+                    initialLaunchResult.phase
+                } else {
+                    AndroidTunnelService.updateBackendHandoffSessionState(
+                        sessionId = sessionId,
+                        consumerTag = consumerTag,
+                        phase = initialLaunchResult.phase,
+                        detail = initialLaunchResult.detail,
+                    )
+                }
             val payload = initialLaunchResult.toJson(
                 launchBundlePath = launchBundlePath,
                 statusPath = statusFile.absolutePath,
@@ -162,7 +172,10 @@ object AndroidNativeBackendSeam {
                 )
 
                 val activeSession = AndroidTunnelService.getBackendHandoffSessionId()
-                if (activeSession != sessionId) {
+                val sessionWasCleared =
+                    launchBundle.backendHint == "android_native_handoff_required" &&
+                        activeSession != sessionId
+                if (sessionWasCleared) {
                     launchResult.runningHandle?.let { handle ->
                         runCatching { selection.runtime.stop(handle) }
                     }
@@ -250,12 +263,17 @@ object AndroidNativeBackendSeam {
         launchResult: AndroidNativeBackendLaunchResult,
     ) {
         val effectiveLaunchResult = mergeWithExistingStatusIfFurther(statusFile, launchResult)
-        val launchState = AndroidTunnelService.updateBackendHandoffSessionState(
-            sessionId = sessionId,
-            consumerTag = consumerTag,
-            phase = effectiveLaunchResult.phase,
-            detail = effectiveLaunchResult.detail,
-        )
+        val launchState =
+            if (launchBundle.backendHint == "android_native_proxy_fallback") {
+                effectiveLaunchResult.phase
+            } else {
+                AndroidTunnelService.updateBackendHandoffSessionState(
+                    sessionId = sessionId,
+                    consumerTag = consumerTag,
+                    phase = effectiveLaunchResult.phase,
+                    detail = effectiveLaunchResult.detail,
+                )
+            }
         val payload = effectiveLaunchResult.toJson(
             launchBundlePath = launchBundlePath,
             statusPath = statusFile.absolutePath,

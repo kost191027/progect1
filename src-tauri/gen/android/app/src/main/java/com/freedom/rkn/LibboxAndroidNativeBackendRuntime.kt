@@ -137,9 +137,7 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             // CommandServer.startOrReloadService().
             val commandServer = Libbox.newCommandServer(handler, platformInterface)
             val configContent = configFile.readText()
-            require(configContainsTunInbound(configContent)) {
-                "libbox runtime expected configPath=${bundle.configPath} to contain a tun inbound, but it did not. backendConfigPath=${bundle.backendConfigPath} stays diagnostic-only and cannot replace the full runtime config."
-            }
+            val usesTunInbound = configContainsTunInbound(configContent)
 
             try {
                 writeRuntimeLog(bundle.runtimeLogPath, "step: commandServer.start begin")
@@ -156,6 +154,17 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
                 runCatching { commandServer.close() }
                 platformInterface.close()
                 throw error
+            }
+
+            if (!usesTunInbound && tunOpened.compareAndSet(false, true)) {
+                persistRuntimePhase(
+                    bundle = bundle,
+                    phase = "ready",
+                    detail = "libbox proxy fallback runtime started without a tun inbound and is ready to serve the local mixed proxy.",
+                    runtimeName = runtimeName,
+                    runtimeSelection = "preferred=${BuildConfig.ANDROID_NATIVE_BACKEND_RUNTIME}, selected=$runtimeId",
+                    backendConfigSummary = backendSummary,
+                )
             }
 
             val state = LibboxRuntimeState(
@@ -178,7 +187,11 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             AndroidNativeBackendLaunchResult(
                 phase = if (tunOpened.get()) "ready" else "starting",
                 detail = if (tunOpened.get()) {
-                    "libbox runtime started and consumed the Android handoff session with a duplicated VpnService-owned TUN fd."
+                    if (usesTunInbound) {
+                        "libbox runtime started and consumed the Android handoff session with a duplicated VpnService-owned TUN fd."
+                    } else {
+                        "libbox proxy fallback runtime started without a tun inbound and exposed the local mixed proxy."
+                    }
                 } else {
                     "libbox runtime started and is waiting for the first openTun callback before marking the tunnel ready."
                 },
@@ -390,12 +403,17 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
         runtimeSelection: String,
         backendConfigSummary: String,
     ) {
-        val launchState = AndroidTunnelService.updateBackendHandoffSessionState(
-            sessionId = bundle.sessionId,
-            consumerTag = bundle.consumerTag,
-            phase = phase,
-            detail = detail,
-        )
+        val launchState =
+            if (bundle.backendHint == "android_native_proxy_fallback") {
+                phase
+            } else {
+                AndroidTunnelService.updateBackendHandoffSessionState(
+                    sessionId = bundle.sessionId,
+                    consumerTag = bundle.consumerTag,
+                    phase = phase,
+                    detail = detail,
+                )
+            }
         val payload = JSONObject().apply {
             put("phase", phase)
             put("detail", detail)
@@ -552,7 +570,7 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
         @Volatile
         private var duplicatedTunDescriptor: ParcelFileDescriptor? = null
 
-        override fun usePlatformAutoDetectInterfaceControl(): Boolean = false
+        override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
 
         override fun autoDetectInterfaceControl(fd: Int) {
             val protected = AndroidVpnBridge.protectSocketFd(appContext, fd)
@@ -613,11 +631,13 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
         override fun startDefaultInterfaceMonitor(listener: io.nekohasekai.libbox.InterfaceUpdateListener) {
             writeRuntimeLog(
                 bundle.runtimeLogPath,
-                "libbox requested default interface monitor; RKN keeps this disabled for the current Android smoke path to avoid forbidden interface-bound forwarders.",
+                "libbox requested default interface monitor; publishing the current non-VPN Android network.",
             )
+            AndroidDefaultNetworkMonitor.setListener(appContext, listener)
         }
 
         override fun closeDefaultInterfaceMonitor(listener: io.nekohasekai.libbox.InterfaceUpdateListener) {
+            AndroidDefaultNetworkMonitor.setListener(appContext, null)
         }
 
         override fun getInterfaces(): NetworkInterfaceIterator {

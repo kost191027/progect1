@@ -39,6 +39,7 @@ struct AppState {
     network_fingerprint: Mutex<Option<String>>,
     recovery_in_progress: Mutex<bool>,
     proxy_failure_count: Mutex<u8>,
+    proxy_failure_window_started: Mutex<Option<std::time::Instant>>,
     kill_switch_engaged: Mutex<bool>,
     #[cfg(desktop)]
     tray_toggle_item: Mutex<Option<MenuItem<Wry>>>,
@@ -413,6 +414,10 @@ fn run_admin_command(script: &str) -> Result<std::process::Output, String> {
 
 #[allow(unused_variables)]
 fn terminate_root_process(app: Option<&AppHandle>, pid: u32) -> Result<(), String> {
+    if !process_exists(pid) {
+        return Ok(());
+    }
+
     #[cfg(target_os = "windows")]
     {
         let local_app_dir = app
@@ -474,6 +479,17 @@ fn terminate_root_process(app: Option<&AppHandle>, pid: u32) -> Result<(), Strin
             return Err(String::from_utf8_lossy(&force_output.stderr)
                 .trim()
                 .to_string());
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .output();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            if !process_exists(pid) {
+                return Ok(());
+            }
         }
 
         #[cfg(not(target_os = "android"))]
@@ -615,7 +631,14 @@ fn trim_utf8_bom(value: &str) -> &str {
 }
 
 #[cfg(target_os = "android")]
+const ANDROID_PROXY_FALLBACK_MODE: bool = false;
+
+#[cfg(target_os = "android")]
 fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Result<String, String> {
+    if ANDROID_PROXY_FALLBACK_MODE {
+        return build_android_proxy_runtime_client_config(raw_config, log_path);
+    }
+
     let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
         format!(
             "Failed to parse generated client config for Android runtime: {}",
@@ -627,7 +650,7 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
     })?;
 
     cfg["log"]["output"] = serde_json::json!(log_path);
-    cfg["log"]["level"] = serde_json::json!("info");
+    cfg["log"]["level"] = serde_json::json!("warn");
     cfg["log"]["timestamp"] = serde_json::json!(true);
 
     if let Some(inbounds) = cfg
@@ -652,6 +675,36 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 // Android relies on route rule actions for sniffing instead.
                 object.remove("sniff");
                 object.remove("sniff_override_destination");
+                // Android's VpnService-backed TUN does not implement strict_route,
+                // and the system stack is what keeps emitting forbidden
+                // "bind forwarder to interface" warnings for our current smoke path.
+                // Use the fully userspace gVisor stack here to avoid privileged
+                // interface-bound forwarders while we stabilize the mobile tunnel.
+                object.insert("strict_route".to_string(), serde_json::json!(false));
+                object.insert("stack".to_string(), serde_json::json!("gvisor"));
+                object.insert("mtu".to_string(), serde_json::json!(1400));
+            }
+        }
+    }
+
+    if let Some(outbounds) = cfg
+        .get_mut("outbounds")
+        .and_then(|value| value.as_array_mut())
+    {
+        for outbound in outbounds {
+            let outbound_type = outbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let outbound_tag = outbound
+                .get("tag")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+
+            if outbound_type == "shadowsocks" && outbound_tag == "proxy" {
+                if let Some(object) = outbound.as_object_mut() {
+                    object.remove("multiplex");
+                }
             }
         }
     }
@@ -703,11 +756,22 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             serde_json::json!([
                 {
                     "inbound": "tun-in",
+                    "action": "sniff",
+                    "timeout": "1s"
+                },
+                {
+                    "inbound": "tun-in",
                     "protocol": "dns",
                     "action": "hijack-dns"
                 },
                 {
+                    "ip_cidr": ["172.19.0.2/32"],
+                    "port": 53,
+                    "action": "hijack-dns"
+                },
+                {
                     "network": "udp",
+                    "port": 443,
                     "action": "reject",
                     "method": "default"
                 },
@@ -747,6 +811,120 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
 
     serde_json::to_string_pretty(&cfg)
         .map_err(|e| format!("Failed to serialize Android runtime client config: {}", e))
+}
+
+#[cfg(target_os = "android")]
+fn build_android_proxy_runtime_client_config(
+    raw_config: &str,
+    log_path: &str,
+) -> Result<String, String> {
+    let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
+        format!(
+            "Failed to parse generated client config for Android proxy fallback runtime: {}",
+            e
+        )
+    })?;
+    let server_ip = extract_server_ip_from_config(&cfg).ok_or_else(|| {
+        "Android proxy fallback config could not determine the upstream server IP from the generated client config.".to_string()
+    })?;
+
+    cfg["log"]["output"] = serde_json::json!(log_path);
+    cfg["log"]["level"] = serde_json::json!("info");
+    cfg["log"]["timestamp"] = serde_json::json!(true);
+
+    cfg["inbounds"] = serde_json::json!([
+        {
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "127.0.0.1",
+            "listen_port": 2080,
+            "set_system_proxy": true
+        }
+    ]);
+
+    if let Some(outbounds) = cfg
+        .get_mut("outbounds")
+        .and_then(|value| value.as_array_mut())
+    {
+        for outbound in outbounds {
+            let outbound_type = outbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let outbound_tag = outbound
+                .get("tag")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+
+            if outbound_type == "shadowsocks" && outbound_tag == "proxy" {
+                if let Some(object) = outbound.as_object_mut() {
+                    object.remove("udp_over_tcp");
+                }
+            }
+        }
+    }
+
+    if let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) {
+        route.insert(
+            "auto_detect_interface".to_string(),
+            serde_json::json!(false),
+        );
+        route.remove("default_interface");
+        route.remove("override_android_vpn");
+        route.remove("default_network_strategy");
+        route.remove("network_strategy");
+        route.insert(
+            "default_domain_resolver".to_string(),
+            serde_json::json!("remote-dns"),
+        );
+        route.insert(
+            "rules".to_string(),
+            serde_json::json!([
+                {
+                    "ip_cidr": [format!("{}/32", server_ip)],
+                    "action": "route",
+                    "outbound": "direct"
+                }
+            ]),
+        );
+        route.remove("rule_set");
+        route.insert("final".to_string(), serde_json::json!("proxy"));
+    }
+
+    if let Some(dns) = cfg.get_mut("dns").and_then(|value| value.as_object_mut()) {
+        dns.insert(
+            "servers".to_string(),
+            serde_json::json!([
+                {
+                    "type": "https",
+                    "tag": "remote-dns",
+                    "server": "8.8.8.8",
+                    "server_port": 443,
+                    "path": "/dns-query",
+                    "detour": "proxy",
+                    "tls": {
+                        "enabled": true,
+                        "server_name": "dns.google"
+                    }
+                },
+                {
+                    "type": "local",
+                    "tag": "local-dns",
+                    "prefer_go": true
+                }
+            ]),
+        );
+        dns.insert("rules".to_string(), serde_json::json!([]));
+        dns.insert("final".to_string(), serde_json::json!("remote-dns"));
+        dns.insert("strategy".to_string(), serde_json::json!("ipv4_only"));
+    }
+
+    serde_json::to_string_pretty(&cfg).map_err(|e| {
+        format!(
+            "Failed to serialize Android proxy fallback runtime client config: {}",
+            e
+        )
+    })
 }
 
 #[cfg(target_os = "android")]
@@ -811,6 +989,10 @@ fn build_android_handoff_backend_config(runtime_config: &str) -> Result<String, 
 enum AndroidRuntimeLaunchPlan {
     TunHandoffRequired {
         tun_fd: i32,
+        config_path: String,
+        log_path: String,
+    },
+    ProxyOnly {
         config_path: String,
         log_path: String,
     },
@@ -1011,6 +1193,9 @@ fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, Strin
         )
     })?;
 
+    cfg["log"]["level"] = serde_json::json!("warn");
+    cfg["log"]["timestamp"] = serde_json::json!(true);
+
     if let Some(inbounds) = cfg
         .get_mut("inbounds")
         .and_then(|value| value.as_array_mut())
@@ -1029,6 +1214,28 @@ fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, Strin
             if let Some(object) = inbound.as_object_mut() {
                 object.remove("sniff");
                 object.remove("sniff_override_destination");
+            }
+        }
+    }
+
+    if let Some(outbounds) = cfg
+        .get_mut("outbounds")
+        .and_then(|value| value.as_array_mut())
+    {
+        for outbound in outbounds {
+            let outbound_type = outbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let outbound_tag = outbound
+                .get("tag")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+
+            if outbound_type == "shadowsocks" && outbound_tag == "proxy" {
+                if let Some(object) = outbound.as_object_mut() {
+                    object.remove("multiplex");
+                }
             }
         }
     }
@@ -1477,14 +1684,29 @@ fn current_network_fingerprint() -> Option<String> {
                            status: &mut Option<String>,
                            ipv4: &mut Option<String>| {
             if let Some(iface) = header.take() {
-                if iface.starts_with("lo0") || iface.starts_with("utun") {
+                let normalized_iface = iface.to_lowercase();
+                if normalized_iface.starts_with("lo")
+                    || normalized_iface.starts_with("utun")
+                    || normalized_iface.starts_with("awdl")
+                    || normalized_iface.starts_with("llw")
+                    || normalized_iface.starts_with("bridge")
+                    || normalized_iface.starts_with("gif")
+                    || normalized_iface.starts_with("stf")
+                {
                     *status = None;
                     *ipv4 = None;
                     return;
                 }
 
                 let status_value = status.take().unwrap_or_else(|| "unknown".to_string());
-                let ipv4_value = ipv4.take().unwrap_or_else(|| "no-ipv4".to_string());
+                if status_value != "active" {
+                    *ipv4 = None;
+                    return;
+                }
+
+                let Some(ipv4_value) = ipv4.take() else {
+                    return;
+                };
                 blocks.push(format!("{}|{}|{}", iface, status_value, ipv4_value));
             }
         };
@@ -1715,7 +1937,6 @@ fn finish_recovery(state: &AppState) {
     *guard = false;
 }
 
-#[cfg(target_os = "windows")]
 fn begin_recovery(state: &AppState) -> bool {
     let mut guard = state.recovery_in_progress.lock().unwrap();
     if *guard {
@@ -1728,14 +1949,30 @@ fn begin_recovery(state: &AppState) -> bool {
 
 fn reset_guard_state(state: &AppState) {
     *state.proxy_failure_count.lock().unwrap() = 0;
+    *state.proxy_failure_window_started.lock().unwrap() = None;
     *state.kill_switch_engaged.lock().unwrap() = false;
 }
 
 fn register_proxy_failure(app: &AppHandle, state: &AppState) {
+    const PROXY_FAILURE_RECOVERY_THRESHOLD: u8 = 8;
+    const PROXY_FAILURE_WINDOW: Duration = Duration::from_secs(45);
+
+    {
+        let mut window = state.proxy_failure_window_started.lock().unwrap();
+        match *window {
+            Some(started) if started.elapsed() <= PROXY_FAILURE_WINDOW => {}
+            _ => {
+                *window = Some(std::time::Instant::now());
+                *state.proxy_failure_count.lock().unwrap() = 0;
+                *state.kill_switch_engaged.lock().unwrap() = false;
+            }
+        }
+    }
+
     let mut failure_count = state.proxy_failure_count.lock().unwrap();
     *failure_count = failure_count.saturating_add(1);
 
-    if *failure_count < 3 {
+    if *failure_count < PROXY_FAILURE_RECOVERY_THRESHOLD {
         return;
     }
 
@@ -1763,6 +2000,31 @@ fn register_proxy_failure(app: &AppHandle, state: &AppState) {
                 "[SYSTEM] Proxy transport is failing repeatedly on Windows. Stopping the tunnel to release system routing and restore the normal network path.".to_string(),
             );
             let _ = stop_tunnel_inner(app_handle.clone()).await;
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if !begin_recovery(state) {
+            return;
+        }
+
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = restart_tunnel_if_running(
+                &app_handle,
+                "[SYSTEM] Proxy transport is failing repeatedly. Restarting the tunnel to refresh the upstream session.",
+            )
+            .await;
+
+            if let Err(error) = result {
+                let state = app_handle.state::<AppState>();
+                finish_recovery(&state);
+                let _ = app_handle.emit(
+                    "tunnel-log",
+                    format!("[ERROR] Proxy transport recovery failed: {}", error),
+                );
+            }
         });
     }
 }
@@ -3151,6 +3413,20 @@ fn android_native_backend_session_dir(
 }
 
 #[cfg(target_os = "android")]
+fn android_runtime_launch_uses_tun(app: &AppHandle) -> Result<bool, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let config_path = local_data.join("client_config_android.json");
+    let raw = std::fs::read_to_string(&config_path).map_err(|e| {
+        format!(
+            "Failed to read Android runtime config {} while checking launch mode: {}",
+            config_path.display(),
+            e
+        )
+    })?;
+    android_runtime_uses_tun_inbound(&raw)
+}
+
+#[cfg(target_os = "android")]
 fn create_android_handoff_session_id(tun_fd: i32) -> String {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3263,15 +3539,20 @@ fn prepare_android_backend_consumer_handoff_inner(
     let mut runtime_context = load_android_runtime_context(local_data)?
         .ok_or_else(|| "Android runtime handoff context is not available yet.".to_string())?;
 
-    if runtime_context.backend_hint != "android_native_handoff_required" {
+    if runtime_context.backend_hint != "android_native_handoff_required"
+        && runtime_context.backend_hint != "android_native_proxy_fallback"
+    {
         return Err(format!(
-            "Android runtime context is not in handoff mode. Current backend hint: {}",
+            "Android runtime context is not in a supported Android backend mode. Current backend hint: {}",
             runtime_context.backend_hint
         ));
     }
 
-    let claim_state =
-        android_claim_backend_handoff_session(&runtime_context.session_id, consumer_tag)?;
+    let claim_state = if runtime_context.backend_hint == "android_native_handoff_required" {
+        android_claim_backend_handoff_session(&runtime_context.session_id, consumer_tag)?
+    } else {
+        "not-required(proxy-only)".to_string()
+    };
 
     runtime_context.backend_session_state = claim_state.clone();
     runtime_context.consumer_tag = consumer_tag.to_string();
@@ -3299,7 +3580,7 @@ fn prepare_android_backend_consumer_handoff_inner(
         let _ = app.emit(
             "tunnel-log",
             format!(
-                "[SYSTEM] Android backend consumer handoff prepared: session={}, consumer={}, claim_state={}, claim_path={}",
+                "[SYSTEM] Android backend consumer launch prepared: session={}, consumer={}, claim_state={}, claim_path={}",
                 claim_snapshot.session_id,
                 claim_snapshot.consumer_tag,
                 claim_snapshot.claim_state,
@@ -3499,6 +3780,10 @@ fn summarize_android_command_failure(prefix: &str, output: &std::process::Output
 
 #[cfg(target_os = "android")]
 fn ensure_android_config_has_no_local_proxy_inbounds(config_path: &str) -> Result<(), String> {
+    if ANDROID_PROXY_FALLBACK_MODE {
+        return Ok(());
+    }
+
     let raw = std::fs::read_to_string(config_path).map_err(|e| {
         format!(
             "Failed to read Android client config for localhost proxy audit: {}",
@@ -3709,10 +3994,57 @@ fn prepare_android_runtime_launch(
         });
     }
 
-    Err(format!(
-        "Android runtime config did not contain a TUN inbound after normalization. The mobile path no longer falls back to standalone CLI because /dev/tun is not usable inside the app process. Config={}, backend_config={}",
-        runtime_config_path, backend_config_path
-    ))
+    let session_id = create_android_handoff_session_id(-1);
+    let placeholder_snapshot = AndroidRuntimeContextSnapshot {
+        backend_hint: "android_native_proxy_fallback".to_string(),
+        session_id: session_id.clone(),
+        tun_fd: -1,
+        tun_state: "proxy-only".to_string(),
+        tun_address: "n/a".to_string(),
+        tun_prefix_length: -1,
+        tun_route: "n/a".to_string(),
+        tun_mtu: -1,
+        config_path: runtime_config_path.clone(),
+        backend_config_path: backend_config_path.clone(),
+        log_path: log_path.to_string(),
+        protect_api_available: false,
+        backend_session_state: "not-required(proxy-only)".to_string(),
+        backend_session_id: session_id.clone(),
+        backend_session_context_path: String::new(),
+        backend_session_config_path: backend_config_path.clone(),
+        backend_session_log_path: log_path.to_string(),
+        consumer_tag: String::new(),
+        consumer_claim_state: "idle".to_string(),
+        consumer_claim_path: String::new(),
+        consumer_launch_state: "idle".to_string(),
+        consumer_launch_path: String::new(),
+        consumer_launch_runtime: String::new(),
+        consumer_launch_selection: String::new(),
+        consumer_launch_summary: String::new(),
+        consumer_session_dir: String::new(),
+        tun_fd_ownership: "proxy-only(no-vpn-fd)".to_string(),
+    };
+    let context_path = persist_android_runtime_context(local_data, &placeholder_snapshot)?;
+    let snapshot = AndroidRuntimeContextSnapshot {
+        backend_session_context_path: context_path.to_string_lossy().to_string(),
+        ..placeholder_snapshot
+    };
+    let _ = persist_android_runtime_context(local_data, &snapshot)?;
+    let _ = app.emit(
+        "tunnel-log",
+        format!(
+            "[SYSTEM] Android proxy fallback prepared: session={}, config={}, backend_config={}, context={}. Starting the native backend without VpnService/TUN handoff.",
+            session_id,
+            runtime_config_path,
+            backend_config_path,
+            context_path.display(),
+        ),
+    );
+
+    Ok(AndroidRuntimeLaunchPlan::ProxyOnly {
+        config_path: runtime_config_path,
+        log_path: log_path.to_string(),
+    })
 }
 
 #[cfg(target_os = "android")]
@@ -3897,6 +4229,46 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                         }
                     }
                 }
+                AndroidRuntimeLaunchPlan::ProxyOnly {
+                    config_path,
+                    log_path,
+                } => {
+                    let consumer_launch = start_android_native_backend_consumer_seam_inner(
+                        Some(app),
+                        &local_data,
+                        "rkn_android_native_backend_seam",
+                    )
+                    .await;
+                    match consumer_launch {
+                        Ok(launch) if launch.launch_state.starts_with("ready") => {
+                            let _ = app.emit(
+                                "tunnel-log",
+                                format!(
+                                    "[SYSTEM] Android native backend proxy fallback is ready: runtime={}, state={}, status_path={}",
+                                    launch.runtime_name, launch.launch_state, launch.status_path
+                                ),
+                            );
+                            return Ok(ANDROID_NATIVE_BACKEND_SENTINEL_PID);
+                        }
+                        Ok(launch) => {
+                            return Err(format!(
+                                "Android native backend proxy fallback launch failed. Config={}, log={}; seam_state={}, runtime={}, detail={}, status_path={}",
+                                config_path,
+                                log_path,
+                                launch.launch_state,
+                                launch.runtime_name,
+                                launch.detail,
+                                launch.status_path
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "Android native backend proxy fallback seam crashed. Config={}, log={}; seam_error={}",
+                                config_path, log_path, error
+                            ));
+                        }
+                    }
+                }
             }
         }
 
@@ -4040,6 +4412,23 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
                 let _ = terminate_root_process(Some(app), old_pid);
             }
             sleep(Duration::from_secs(1)).await;
+
+            if !ANDROID_PROXY_FALLBACK_MODE {
+                if !android_vpn_permission_granted()? {
+                    return Err(
+                        "Android VPN permission is required before restarting protection."
+                            .to_string(),
+                    );
+                }
+
+                start_android_tunnel_service()?;
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Android VPN service anchor restarted for tunnel recovery."
+                        .to_string(),
+                );
+            }
+
             match prepare_android_runtime_launch(app, &local_data, &config_path, log_path, false)? {
                 AndroidRuntimeLaunchPlan::TunHandoffRequired {
                     tun_fd,
@@ -4096,6 +4485,46 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
                                     .map(|claim| format!(", session={}, claim_state={}, backend_config={}", claim.session_id, claim.claim_state, claim.backend_config_path))
                                     .unwrap_or_default(),
                                 error
+                            ));
+                        }
+                    }
+                }
+                AndroidRuntimeLaunchPlan::ProxyOnly {
+                    config_path,
+                    log_path,
+                } => {
+                    let consumer_launch = start_android_native_backend_consumer_seam_inner(
+                        Some(app),
+                        &local_data,
+                        "rkn_android_native_backend_seam",
+                    )
+                    .await;
+                    match consumer_launch {
+                        Ok(launch) if launch.launch_state.starts_with("ready") => {
+                            let _ = app.emit(
+                                "tunnel-log",
+                                format!(
+                                    "[SYSTEM] Android native backend proxy fallback restarted successfully: runtime={}, state={}, status_path={}",
+                                    launch.runtime_name, launch.launch_state, launch.status_path
+                                ),
+                            );
+                            return Ok(ANDROID_NATIVE_BACKEND_SENTINEL_PID);
+                        }
+                        Ok(launch) => {
+                            return Err(format!(
+                                "Android native backend proxy fallback restart failed. Config={}, log={}; seam_state={}, runtime={}, detail={}, status_path={}",
+                                config_path,
+                                log_path,
+                                launch.launch_state,
+                                launch.runtime_name,
+                                launch.detail,
+                                launch.status_path
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "Android native backend proxy fallback seam crashed during restart. Config={}, log={}; seam_error={}",
+                                config_path, log_path, error
                             ));
                         }
                     }
@@ -4187,13 +4616,14 @@ async fn verify_tunnel_start(
         if is_android_native_backend_pid(pid) {
             let mut backend_state = "unknown".to_string();
             let mut tun_ready = false;
+            let tun_required = android_runtime_launch_uses_tun(app).unwrap_or(false);
 
             for _ in 0..25 {
                 backend_state =
                     android_native_backend_status_state().unwrap_or_else(|_| "unknown".to_string());
                 tun_ready = android_tun_interface_ready().unwrap_or(false);
 
-                if android_backend_state_is_ready(&backend_state) && tun_ready {
+                if android_backend_state_is_ready(&backend_state) && (!tun_required || tun_ready) {
                     break;
                 }
 
@@ -4204,8 +4634,10 @@ async fn verify_tunnel_start(
                 sleep(Duration::from_millis(400)).await;
             }
 
-            if !android_backend_state_is_ready(&backend_state) || !tun_ready {
-                let _ = stop_android_tunnel_service();
+            if !android_backend_state_is_ready(&backend_state) || (tun_required && !tun_ready) {
+                if tun_required {
+                    let _ = stop_android_tunnel_service();
+                }
 
                 {
                     let mut guard = state.singbox_pid.lock().unwrap();
@@ -4222,13 +4654,13 @@ async fn verify_tunnel_start(
                 let log_tail = recent_log_tail(log_path, 20);
                 let details = if log_tail.is_empty() {
                     format!(
-                        "Android native backend did not stay ready during startup. Backend state: {}, tun_ready={}",
-                        backend_state, tun_ready
+                        "Android native backend did not stay ready during startup. Backend state: {}, tun_required={}, tun_ready={}",
+                        backend_state, tun_required, tun_ready
                     )
                 } else {
                     format!(
-                        "Android native backend did not stay ready during startup. Backend state: {}, tun_ready={}\nRecent logs:\n{}",
-                        backend_state, tun_ready, log_tail
+                        "Android native backend did not stay ready during startup. Backend state: {}, tun_required={}, tun_ready={}\nRecent logs:\n{}",
+                        backend_state, tun_required, tun_ready, log_tail
                     )
                 };
 
@@ -4534,7 +4966,6 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
 
 fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
     tauri::async_runtime::spawn(async move {
-        #[cfg(target_os = "windows")]
         let mut last_tick = std::time::Instant::now();
         #[cfg(target_os = "windows")]
         let mut adapter_missing = false;
@@ -4552,13 +4983,12 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                 break;
             }
 
+            let elapsed = last_tick.elapsed();
+            last_tick = std::time::Instant::now();
             let current_fingerprint = current_network_fingerprint();
 
             #[cfg(target_os = "windows")]
             {
-                let elapsed = last_tick.elapsed();
-                last_tick = std::time::Instant::now();
-
                 if elapsed >= Duration::from_secs(20) {
                     let state = app.state::<AppState>();
                     if begin_recovery(&state) {
@@ -4613,6 +5043,30 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                 }
             }
 
+            #[cfg(not(target_os = "windows"))]
+            if elapsed >= Duration::from_secs(20) {
+                let should_recover = {
+                    let state = app.state::<AppState>();
+                    begin_recovery(&state)
+                };
+
+                if should_recover {
+                    let result = restart_tunnel_if_running(
+                        &app,
+                        "[SYSTEM] Resume detected after sleep or app suspension. Restarting the tunnel to refresh stale transport sessions.",
+                    )
+                    .await;
+
+                    if let Err(error) = result {
+                        let _ = app.emit(
+                            "tunnel-log",
+                            format!("[ERROR] Tunnel recovery after resume failed: {}", error),
+                        );
+                    }
+                    break;
+                }
+            }
+
             let fingerprint_changed = {
                 let state = app.state::<AppState>();
                 let previous = get_network_fingerprint(&state);
@@ -4649,11 +5103,57 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
 
             #[cfg(not(target_os = "windows"))]
             {
-                let _ = app.emit(
-                    "tunnel-log",
-                    "[SYSTEM] Network change detected. Keeping tunnel active and updating the network context.".to_string(),
-                );
+                let should_recover = {
+                    let state = app.state::<AppState>();
+                    begin_recovery(&state)
+                };
+
+                if should_recover {
+                    let result = restart_tunnel_if_running(
+                        &app,
+                        "[SYSTEM] Network change detected. Restarting the tunnel to bind the transport to the new network context.",
+                    )
+                    .await;
+
+                    if let Err(error) = result {
+                        let _ = app.emit(
+                            "tunnel-log",
+                            format!(
+                                "[ERROR] Tunnel recovery after network change failed: {}",
+                                error
+                            ),
+                        );
+                    }
+                    break;
+                }
             }
+        }
+    });
+}
+
+#[cfg(not(target_os = "android"))]
+fn spawn_post_start_transport_sync_check(app: AppHandle, pid: u32) {
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(500)).await;
+
+        if let Err(error) = ssh::ensure_local_transport_is_current_quiet(&app).await {
+            let still_current_tunnel = {
+                let state = app.state::<AppState>();
+                let current_pid = *state.singbox_pid.lock().unwrap();
+                current_pid == Some(pid)
+            };
+            if !still_current_tunnel {
+                return;
+            }
+
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[ERROR] Remote transport verification failed after startup: {}",
+                    error
+                ),
+            );
+            let _ = stop_tunnel_inner(app.clone()).await;
         }
     });
 }
@@ -4776,6 +5276,7 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         );
     }
 
+    #[cfg(target_os = "android")]
     ssh::ensure_local_transport_is_current(&app).await?;
     crate::geodata::ensure_local_client_rule_sets(&app).await?;
 
@@ -4783,31 +5284,39 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
     {
         clear_android_native_backend_runtime_artifacts(&app);
 
-        if !android_vpn_permission_granted()? {
+        if ANDROID_PROXY_FALLBACK_MODE {
             let _ = app.emit(
                 "tunnel-log",
-                "[SYSTEM] Android VPN permission is required before protection can start. Opening the system prompt now.".to_string(),
+                "[SYSTEM] Android proxy fallback mode is active. Starting the local core without a VpnService anchor."
+                    .to_string(),
             );
-
-            if !request_android_vpn_permission()? {
-                return Err(
-                    "Android VPN permission requested. Approve it in the system dialog, then tap Start Protection again."
-                        .to_string(),
+        } else {
+            if !android_vpn_permission_granted()? {
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Android VPN permission is required before protection can start. Opening the system prompt now.".to_string(),
                 );
-            }
-        }
 
-        start_android_tunnel_service()?;
-        let _ = app.emit(
-            "tunnel-log",
-            "[SYSTEM] Android VPN service anchor is active. Starting the local core next."
-                .to_string(),
-        );
-        let _ = app.emit(
-            "tunnel-log",
-            "[SYSTEM] Android VpnService foreground anchor is ready. The native backend will establish the real TUN interface during handoff."
-                .to_string(),
-        );
+                if !request_android_vpn_permission()? {
+                    return Err(
+                        "Android VPN permission requested. Approve it in the system dialog, then tap Start Protection again."
+                            .to_string(),
+                    );
+                }
+            }
+
+            start_android_tunnel_service()?;
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Android VPN service anchor is active. Starting the local core next."
+                    .to_string(),
+            );
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Android VpnService foreground anchor is ready. The native backend will establish the real TUN interface during handoff."
+                    .to_string(),
+            );
+        }
     }
 
     let _ = app.emit("tunnel-log", "[SYSTEM] Resolving core binary path...");
@@ -4841,6 +5350,8 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
     spawn_log_reader(app.clone(), pid, tunnel_log_path());
     spawn_process_exit_monitor(app.clone(), pid);
     spawn_network_recovery_monitor(app.clone(), pid);
+    #[cfg(not(target_os = "android"))]
+    spawn_post_start_transport_sync_check(app.clone(), pid);
 
     #[cfg(target_os = "windows")]
     {
@@ -4856,11 +5367,14 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {
         #[cfg(target_os = "android")]
-        let _ = app.emit(
-            "tunnel-log",
-            "[SYSTEM] Android protection runtime is active. The VPN service anchor and local core are now running."
-                .to_string(),
-        );
+        let _ = app.emit("tunnel-log", {
+            if ANDROID_PROXY_FALLBACK_MODE {
+                "[SYSTEM] Android proxy fallback runtime is active. The local core is running without VpnService/TUN.".to_string()
+            } else {
+                "[SYSTEM] Android protection runtime is active. The VPN service anchor and local core are now running."
+                    .to_string()
+            }
+        });
 
         #[cfg(not(target_os = "android"))]
         let _ = app.emit(
@@ -5247,6 +5761,7 @@ pub(crate) async fn restart_tunnel_if_running(
     spawn_log_reader(app.clone(), new_pid, tunnel_log_path());
     spawn_process_exit_monitor(app.clone(), new_pid);
     spawn_network_recovery_monitor(app.clone(), new_pid);
+    finish_recovery(&state);
     let _ = app.emit(
         "tunnel-log",
         "[SYSTEM] Tunnel restarted with the updated local configuration.".to_string(),
@@ -5347,6 +5862,7 @@ pub fn run() {
             network_fingerprint: Mutex::new(None),
             recovery_in_progress: Mutex::new(false),
             proxy_failure_count: Mutex::new(0),
+            proxy_failure_window_started: Mutex::new(None),
             kill_switch_engaged: Mutex::new(false),
             #[cfg(desktop)]
             tray_toggle_item: Mutex::new(None),
