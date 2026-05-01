@@ -723,8 +723,15 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             serde_json::json!("remote-dns"),
         );
 
+        let mut direct_rule_set_tags = Vec::<String>::new();
+        let mut google_rule_set_available = false;
+
         if let Some(rule_sets) = route.get("rule_set").and_then(|value| value.as_array()) {
             for rule_set in rule_sets {
+                let tag = rule_set
+                    .get("tag")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
                 let rule_type = rule_set
                     .get("type")
                     .and_then(|value| value.as_str())
@@ -749,40 +756,76 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 }
 
                 validate_android_rule_set_file(path)?;
+
+                if tag == crate::geodata::GOOGLE_RULE_SET_TAG {
+                    google_rule_set_available = true;
+                }
+
+                if crate::geodata::DIRECT_ROUTE_RULE_SET_TAGS.contains(&tag) {
+                    direct_rule_set_tags.push(tag.to_string());
+                }
             }
         }
-        route.insert(
-            "rules".to_string(),
-            serde_json::json!([
-                {
-                    "inbound": "tun-in",
-                    "action": "sniff",
-                    "timeout": "1s"
-                },
-                {
-                    "inbound": "tun-in",
-                    "protocol": "dns",
-                    "action": "hijack-dns"
-                },
-                {
-                    "ip_cidr": ["172.19.0.2/32"],
-                    "port": 53,
-                    "action": "hijack-dns"
-                },
-                {
-                    "network": "udp",
-                    "port": 443,
-                    "action": "reject",
-                    "method": "default"
-                },
-                {
-                    "ip_cidr": [format!("{}/32", server_ip)],
-                    "action": "route",
-                    "outbound": "direct"
-                }
-            ]),
-        );
-        route.remove("rule_set");
+
+        let mut route_rules = vec![
+            serde_json::json!({
+                "inbound": "tun-in",
+                "action": "sniff",
+                "timeout": "1s"
+            }),
+            serde_json::json!({
+                "inbound": "tun-in",
+                "protocol": "dns",
+                "action": "hijack-dns"
+            }),
+            serde_json::json!({
+                "ip_cidr": ["172.19.0.2/32"],
+                "port": 53,
+                "action": "hijack-dns"
+            }),
+            serde_json::json!({
+                "network": "udp",
+                "port": 443,
+                "action": "reject",
+                "method": "default"
+            }),
+        ];
+
+        if google_rule_set_available {
+            route_rules.push(serde_json::json!({
+                "rule_set": [crate::geodata::GOOGLE_RULE_SET_TAG],
+                "action": "route",
+                "outbound": "proxy"
+            }));
+        }
+
+        route_rules.extend([
+            serde_json::json!({
+                "domain_suffix": crate::geodata::PROXY_PRIORITY_DOMAIN_SUFFIXES,
+                "action": "route",
+                "outbound": "proxy"
+            }),
+            serde_json::json!({
+                "ip_cidr": [format!("{}/32", server_ip)],
+                "action": "route",
+                "outbound": "direct"
+            }),
+            serde_json::json!({
+                "domain_suffix": crate::geodata::CURATED_RU_DOMAIN_SUFFIXES,
+                "action": "route",
+                "outbound": "direct"
+            }),
+        ]);
+
+        if !direct_rule_set_tags.is_empty() {
+            route_rules.push(serde_json::json!({
+                "rule_set": direct_rule_set_tags,
+                "action": "route",
+                "outbound": "direct"
+            }));
+        }
+
+        route.insert("rules".to_string(), serde_json::json!(route_rules));
         route.insert("final".to_string(), serde_json::json!("proxy"));
     }
 
@@ -804,7 +847,58 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 }
             ]),
         );
-        dns.insert("rules".to_string(), serde_json::json!([]));
+        let mut dns_rules = vec![
+            serde_json::json!({
+                "domain_suffix": crate::geodata::PROXY_PRIORITY_DOMAIN_SUFFIXES,
+                "server": "remote-dns"
+            }),
+            serde_json::json!({
+                "domain_suffix": crate::geodata::CURATED_RU_DOMAIN_SUFFIXES,
+                "server": "local-dns"
+            }),
+        ];
+
+        let route_rule_sets = cfg
+            .get("route")
+            .and_then(|value| value.get("rule_set"))
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut direct_dns_rule_set_tags = Vec::<String>::new();
+        let mut google_rule_set_available = false;
+        for rule_set in route_rule_sets {
+            let tag = rule_set
+                .get("tag")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if tag == crate::geodata::GOOGLE_RULE_SET_TAG {
+                google_rule_set_available = true;
+            }
+            if crate::geodata::DIRECT_ROUTE_RULE_SET_TAGS.contains(&tag)
+                && !tag.starts_with("geoip-")
+            {
+                direct_dns_rule_set_tags.push(tag.to_string());
+            }
+        }
+
+        if google_rule_set_available {
+            dns_rules.insert(
+                0,
+                serde_json::json!({
+                    "rule_set": [crate::geodata::GOOGLE_RULE_SET_TAG],
+                    "server": "remote-dns"
+                }),
+            );
+        }
+
+        if !direct_dns_rule_set_tags.is_empty() {
+            dns_rules.push(serde_json::json!({
+                "rule_set": direct_dns_rule_set_tags,
+                "server": "local-dns"
+            }));
+        }
+
+        dns.insert("rules".to_string(), serde_json::json!(dns_rules));
         dns.insert("final".to_string(), serde_json::json!("remote-dns"));
         dns.insert("strategy".to_string(), serde_json::json!("ipv4_only"));
     }
@@ -1165,8 +1259,6 @@ fn load_android_native_backend_launch_status(
     }))
 }
 
-/// Extract the VPN server IP from the client config's outbound section.
-#[cfg(any(target_os = "windows", target_os = "android"))]
 fn extract_server_ip_from_config(cfg: &serde_json::Value) -> Option<String> {
     let outbounds = cfg.get("outbounds")?.as_array()?;
     for outbound in outbounds {
@@ -1182,6 +1274,29 @@ fn extract_server_ip_from_config(cfg: &serde_json::Value) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_server_route_prelude(server_ip: Option<&str>) -> String {
+    let Some(server_ip) = server_ip else {
+        return String::new();
+    };
+
+    format!(
+        "SERVER_IP={}; \
+         PHYSICAL_ROUTE=$(netstat -rn -f inet | awk '$1==\"default\" && $2 !~ /^link#/ && $4 !~ /^utun/ {{print $2\" \"$4; exit}}'); \
+         PHYSICAL_GW=${{PHYSICAL_ROUTE%% *}}; \
+         if [ -n \"$PHYSICAL_GW\" ] && [ \"$PHYSICAL_GW\" != \"$PHYSICAL_ROUTE\" ]; then \
+           /sbin/route -n delete -host \"$SERVER_IP\" >/dev/null 2>&1 || true; \
+           /sbin/route -n add -host \"$SERVER_IP\" \"$PHYSICAL_GW\" >/dev/null 2>&1 || true; \
+         fi; ",
+        shell_single_quote(server_ip)
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_server_route_prelude(_server_ip: Option<&str>) -> String {
+    String::new()
 }
 
 #[cfg(not(target_os = "android"))]
@@ -2003,7 +2118,16 @@ fn register_proxy_failure(app: &AppHandle, state: &AppState) {
         });
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Proxy transport is failing repeatedly. Automatic privileged restart is suppressed on macOS to avoid repeated administrator prompts; toggle the tunnel manually if traffic does not recover."
+                .to_string(),
+        );
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         if !begin_recovery(state) {
             return;
@@ -4273,7 +4397,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
         }
 
         #[cfg(not(target_os = "android"))]
-        let config_str = {
+        let (config_str, server_ip) = {
             let desktop_config_path = local_data.join("client_config_desktop.json");
             let raw = std::fs::read_to_string(&config_path).map_err(|e| {
                 format!(
@@ -4282,6 +4406,14 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                     e
                 )
             })?;
+            let parsed = serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
+                format!(
+                    "Failed to parse base client config {} before desktop startup: {}",
+                    config_path.display(),
+                    e
+                )
+            })?;
+            let server_ip = extract_server_ip_from_config(&parsed);
             let runtime_cfg = build_desktop_runtime_client_config(&raw)?;
             std::fs::write(&desktop_config_path, runtime_cfg).map_err(|e| {
                 format!(
@@ -4290,7 +4422,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                     e
                 )
             })?;
-            desktop_config_path.to_string_lossy().to_string()
+            (desktop_config_path.to_string_lossy().to_string(), server_ip)
         };
 
         #[cfg(not(target_os = "android"))]
@@ -4302,8 +4434,12 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
         }
 
         #[cfg(not(target_os = "android"))]
+        let route_prelude = macos_server_route_prelude(server_ip.as_deref());
+
+        #[cfg(not(target_os = "android"))]
         let shell_cmd = format!(
-            "{} run -c {} > {} 2>&1 & echo $!",
+            "{}{} run -c {} > {} 2>&1 & echo $!",
+            route_prelude,
             shell_single_quote(&singbox_path),
             shell_single_quote(&config_str),
             shell_single_quote(log_path),
@@ -4533,7 +4669,7 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
         }
 
         #[cfg(not(target_os = "android"))]
-        let config_str = {
+        let (config_str, server_ip) = {
             let desktop_config_path = local_data.join("client_config_desktop.json");
             let raw = std::fs::read_to_string(&config_path).map_err(|e| {
                 format!(
@@ -4542,6 +4678,14 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
                     e
                 )
             })?;
+            let parsed = serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
+                format!(
+                    "Failed to parse base client config {} before desktop restart: {}",
+                    config_path.display(),
+                    e
+                )
+            })?;
+            let server_ip = extract_server_ip_from_config(&parsed);
             let runtime_cfg = build_desktop_runtime_client_config(&raw)?;
             std::fs::write(&desktop_config_path, runtime_cfg).map_err(|e| {
                 format!(
@@ -4550,12 +4694,16 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
                     e
                 )
             })?;
-            desktop_config_path.to_string_lossy().to_string()
+            (desktop_config_path.to_string_lossy().to_string(), server_ip)
         };
 
         #[cfg(not(target_os = "android"))]
+        let route_prelude = macos_server_route_prelude(server_ip.as_deref());
+
+        #[cfg(not(target_os = "android"))]
         let shell_cmd = format!(
-            "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n{} run -c {} > {} 2>&1 & echo $!",
+            "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n{}{} run -c {} > {} 2>&1 & echo $!",
+            route_prelude,
             shell_single_quote(&singbox_path),
             shell_single_quote(&config_str),
             shell_single_quote(log_path),

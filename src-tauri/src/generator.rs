@@ -22,34 +22,24 @@ pub const INTERNAL_SS_PORT: u16 = 14433;
 /// ShadowTLS TLS 1.3 compatibility list that have not recently produced
 /// certificate mismatches in our real client tests stay in the primary pool.
 const PRIMARY_COVER_DOMAINS: &[&str] = &[
-    "feishu.cn",
     "weather-data.apple.com",
-    "upyun.com",
-    "mp.weixin.qq.com",
+    "www.apple.com",
+    "www.microsoft.com",
+    "speed.cloudflare.com",
 ];
 
 /// Additional ShadowTLS-friendly domains used only for SNI rotation.
 ///
 /// These candidates come from the upstream ShadowTLS TLS 1.3 compatibility
-/// list. `captive.apple.com` is kept because it has worked for us on some
-/// paths. `cloud.tencent.com`, `publicassets.cdn-apple.com` and `coding.net`
-/// are treated as legacy domains and excluded from new selections because they
-/// have returned certificates for a different hostname in real client tests.
+/// list. Domains that timed out, returned mismatched certificates, or proved
+/// unstable on real client paths are treated as legacy and excluded from new
+/// selections.
 const ROTATION_COVER_DOMAINS: &[&str] = &[
-    "feishu.cn",
     "weather-data.apple.com",
-    "upyun.com",
-    "mp.weixin.qq.com",
-    "douyin.com",
-    "toutiao.com",
-    "sns-video-hw.xhscdn.com",
-    "sns-img-qc.xhscdn.com",
-    "sns-video-qn.xhscdn.com",
-    "p9-dy.byteimg.com",
-    "p6-dy.byteimg.com",
-    "v6-dy-y.ixigua.com",
-    "hls3-akm.douyucdn.cn",
-    "captive.apple.com",
+    "www.apple.com",
+    "www.microsoft.com",
+    "www.cloudflare.com",
+    "speed.cloudflare.com",
 ];
 
 pub fn available_cover_domains() -> Vec<String> {
@@ -83,7 +73,22 @@ pub fn select_cover_domain(short_id: &str) -> &'static str {
 pub fn is_legacy_cover_domain_requiring_refresh(domain: &str) -> bool {
     matches!(
         domain,
-        "cloud.tencent.com" | "publicassets.cdn-apple.com" | "coding.net"
+        "cloud.tencent.com"
+            | "publicassets.cdn-apple.com"
+            | "coding.net"
+            | "feishu.cn"
+            | "upyun.com"
+            | "mp.weixin.qq.com"
+            | "douyin.com"
+            | "toutiao.com"
+            | "sns-video-hw.xhscdn.com"
+            | "sns-img-qc.xhscdn.com"
+            | "sns-video-qn.xhscdn.com"
+            | "p9-dy.byteimg.com"
+            | "p6-dy.byteimg.com"
+            | "v6-dy-y.ixigua.com"
+            | "hls3-akm.douyucdn.cn"
+            | "captive.apple.com"
     )
 }
 
@@ -377,12 +382,7 @@ pub fn build_server_config_with_invites(params: ServerConfigParams<'_>) -> Strin
           "listen_port": params.internal_ss_port,
           "method": "2022-blake3-aes-128-gcm",
           "password": params.ss_server_password,
-          "users": shadowsocks_users,
-          "sniff": true,
-          "sniff_override_destination": true,
-          "multiplex": {
-            "enabled": true
-          }
+          "users": shadowsocks_users
         }
       ],
       "outbounds": outbounds,

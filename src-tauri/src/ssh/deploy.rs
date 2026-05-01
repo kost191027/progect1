@@ -6,13 +6,14 @@ use tauri::{AppHandle, Emitter, Manager};
 use super::invite::resolve_master_ss_transport;
 use super::warp::{ensure_remote_warp_config, has_local_warp_profile_sync};
 use super::{
-    acquire_remote_mutation_lock, build_container_name, connect_ssh_session, emit_ssh_stage,
-    ensure_local_client_rule_sets_sync, ensure_master_role, load_remote_container_image,
-    load_remote_container_name, load_remote_transport_bootstrap, remote_runtime_uses_warp,
-    run_remote_command, save_backend_app_role, save_cached_transport_bootstrap,
-    save_server_profile, snapshot_for_cover_domain, stream_remote_deploy_output, BackendAppRole,
-    RemoteDeployTarget, RemoteTransportBootstrap, SavedServerProfile, TransportStateSnapshot,
-    EXTERNAL_PORT_CANDIDATES, INTERNAL_SS_PORT_CANDIDATES, LEGACY_CONTAINER_NAME,
+    acquire_remote_mutation_lock, build_container_name, build_rotated_cover_domain_history,
+    connect_ssh_session, emit_ssh_stage, ensure_local_client_rule_sets_sync, ensure_master_role,
+    load_remote_container_image, load_remote_container_name, load_remote_transport_bootstrap,
+    remote_runtime_uses_warp, run_remote_command, save_backend_app_role,
+    save_cached_transport_bootstrap, save_server_profile, snapshot_for_cover_domain,
+    stream_remote_deploy_output, BackendAppRole, RemoteDeployTarget, RemoteTransportBootstrap,
+    SavedServerProfile, TransportStateSnapshot, EXTERNAL_PORT_CANDIDATES,
+    INTERNAL_SS_PORT_CANDIDATES, LEGACY_CONTAINER_NAME, MAX_FALLBACK_COVER_DOMAINS,
     PINNED_SING_BOX_IMAGE, PRIMARY_EXTERNAL_PORT,
 };
 
@@ -257,6 +258,11 @@ pub(crate) fn summarize_runtime_validation_error(error: &str) -> String {
         let trimmed = line.trim();
         if trimmed.starts_with("[error]") || trimmed.starts_with("container_running=") {
             Some(trimmed.to_string())
+        } else if trimmed.contains(r#"unknown field "local_address""#) {
+            Some(
+                "server image/config mismatch: WARP local_address requires the pinned sing-box v1.10.7 runtime"
+                    .to_string(),
+            )
         } else if trimmed.contains("bind: address already in use") {
             Some("internal Shadowsocks port is already in use on the host".to_string())
         } else {
@@ -297,6 +303,134 @@ pub(crate) fn verify_external_port_reachable(host: &str, external_port: u16) -> 
         external_port,
         last_error.unwrap_or_else(|| "no resolved addresses".to_string())
     ))
+}
+
+fn summarize_transport_smoke_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("context deadline exceeded") {
+        "ShadowTLS/Shadowsocks handshake timed out from this client".to_string()
+    } else if lower.contains("hmac mismatch") || lower.contains("verify failed") {
+        "ShadowTLS secret or cover-domain handshake was rejected by the server".to_string()
+    } else if lower.contains("connection refused") {
+        "transport port is reachable by TCP scan but refused the real proxy session".to_string()
+    } else if lower.contains("eof") {
+        "transport connection closed during ShadowTLS/Shadowsocks handshake".to_string()
+    } else {
+        "client transport smoke-check failed".to_string()
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn build_client_transport_smoke_config(client_cfg: &str) -> Result<String, String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(client_cfg).map_err(|e| {
+        format!(
+            "Failed to parse generated client config for smoke-check: {}",
+            e
+        )
+    })?;
+    let outbounds = parsed
+        .get("outbounds")
+        .cloned()
+        .ok_or_else(|| "Generated client config has no outbounds for smoke-check".to_string())?;
+
+    serde_json::to_string_pretty(&json!({
+        "log": {
+            "level": "warn"
+        },
+        "outbounds": outbounds
+    }))
+    .map_err(|e| format!("Failed to serialize transport smoke-check config: {}", e))
+}
+
+#[cfg(not(target_os = "android"))]
+fn run_client_transport_smoke_check(
+    app: &AppHandle,
+    local_data: &std::path::Path,
+    client_cfg: &str,
+) -> Result<(), String> {
+    let smoke_cfg = build_client_transport_smoke_config(client_cfg)?;
+    std::fs::create_dir_all(local_data).map_err(|e| e.to_string())?;
+    let smoke_cfg_path = local_data.join("client_transport_smoke.json");
+    std::fs::write(&smoke_cfg_path, smoke_cfg).map_err(|e| {
+        format!(
+            "Failed to write transport smoke-check config {}: {}",
+            smoke_cfg_path.display(),
+            e
+        )
+    })?;
+
+    let singbox_path = crate::resolve_singbox_path(app)?;
+    let mut child = std::process::Command::new(&singbox_path)
+        .args([
+            "--disable-color",
+            "tools",
+            "fetch",
+            "-c",
+            smoke_cfg_path.to_string_lossy().as_ref(),
+            "-o",
+            "proxy",
+            "https://www.gstatic.com/generate_204",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "Failed to start local sing-box transport smoke-check with {}: {}",
+                singbox_path, e
+            )
+        })?;
+
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(18);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("Failed to poll transport smoke-check: {}", e))?
+        {
+            let output = child
+                .wait_with_output()
+                .map_err(|e| format!("Failed to collect transport smoke-check output: {}", e))?;
+            if status.success() {
+                return Ok(());
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "{}. stdout: {} stderr: {}",
+                summarize_transport_smoke_error(&format!("{} {}", stdout, stderr)),
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .map_err(|e| format!("Failed to stop timed-out transport smoke-check: {}", e))?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Transport smoke-check timed out after {:?}. stdout: {} stderr: {}",
+                timeout,
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+}
+
+#[cfg(target_os = "android")]
+fn run_client_transport_smoke_check(
+    _app: &AppHandle,
+    _local_data: &std::path::Path,
+    _client_cfg: &str,
+) -> Result<(), String> {
+    Ok(())
 }
 
 pub(crate) fn execute_remote_deploy(
@@ -427,7 +561,7 @@ pub async fn deploy_server(
             let _mutation_guard = acquire_remote_mutation_lock()?;
             let _ = app.emit(
                 "tunnel-log",
-                format!("--- [SSH] Connecting to {}:22 ---", host),
+                format!("--- [SSH] Connecting to {} (ports 22/2222) ---", host),
             );
 
             let sess = connect_ssh_session(&app, &host, &user, &pass)?;
@@ -554,6 +688,22 @@ pub async fn deploy_server(
                 &local_rule_sets,
             );
 
+            emit_ssh_stage(
+                &app,
+                "VALIDATE",
+                "Running local ShadowTLS transport smoke-check before accepting the existing server...",
+            );
+            if let Err(error) = run_client_transport_smoke_check(&app, &local_data, &client_cfg) {
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SSH WARN] Existing server metadata is present, but the real client transport handshake failed. Falling back to a repair deploy with preserved credentials. {}",
+                        error
+                    ),
+                );
+                return Ok(None);
+            }
+
             std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
             let client_cfg_path = local_data.join("client_config.json");
             backup_local_file_if_exists(&client_cfg_path)?;
@@ -617,7 +767,7 @@ pub async fn deploy_server(
         let _mutation_guard = acquire_remote_mutation_lock()?;
         let _ = deploy_app.emit(
             "tunnel-log",
-            format!("--- [SSH] Connecting to {}:22 ---", host),
+            format!("--- [SSH] Connecting to {} (ports 22/2222) ---", host),
         );
 
         let sess = connect_ssh_session(&deploy_app, &host, &user, &pass)?;
@@ -744,74 +894,198 @@ pub async fn deploy_server(
             );
             None
         };
-        let server_cfg = crate::generator::build_server_config_with_invites(
-            crate::generator::ServerConfigParams {
-                master_shadow_pass: &shadow_pass,
-                ss_server_password: &ss_server_password,
-                master_ss_user_password: &master_ss_user_password,
-                external_port,
-                internal_ss_port,
-                routing_mode: &routing_mode,
-                cover_domain: &cover_domain,
-                fallback_cover_domains: &fallback_cover_domains,
-                issued_invites: &issued_invites,
-                warp: warp_config.as_ref(),
-            },
-        );
         let local_rule_sets = ensure_local_client_rule_sets_sync(&deploy_app)?;
-        let client_cfg = crate::generator::build_client_config(
-            &host,
-            &shadow_pass,
-            &ss_password,
-            external_port,
-            &cover_domain,
-            &local_rule_sets,
-        );
-        let bootstrap_cfg = json!({
-            "external_port": external_port,
-            "internal_ss_port": internal_ss_port,
-            "routing_mode": routing_mode,
-            "cover_domain": cover_domain,
-            "fallback_cover_domains": fallback_cover_domains,
-            "shadow_pass": shadow_pass,
-            "ss_password": ss_password,
-            "ss_server_password": ss_server_password,
-            "issued_invites": issued_invites
-        })
-        .to_string();
+        let mut active_cover_domain = cover_domain.clone();
+        let mut active_fallback_cover_domains = fallback_cover_domains.clone();
+        let mut occupied_cover_domains = active_fallback_cover_domains.clone();
+        if !occupied_cover_domains
+            .iter()
+            .any(|domain| domain == &active_cover_domain)
+        {
+            occupied_cover_domains.push(active_cover_domain.clone());
+        }
+        let mut last_smoke_error = None::<String>;
+        let mut accepted_client_cfg = None::<String>;
+        let mut accepted_cover_domain = None::<String>;
+        let mut accepted_fallback_cover_domains = None::<Vec<String>>;
 
-        emit_ssh_stage(
-            &deploy_app,
-            "DEPLOY",
-            format!("Deploying transport on external port {}...", external_port),
-        );
-        execute_remote_deploy(
-            &sess,
-            &deploy_app,
-            &RemoteDeployExecution {
-                container_name: &container_name,
+        for attempt_index in 0..=MAX_FALLBACK_COVER_DOMAINS {
+            if attempt_index > 0 {
+                let next_cover_domain = crate::generator::select_next_cover_domain(
+                    &active_cover_domain,
+                    &occupied_cover_domains,
+                )
+                .to_string();
+                let _ = deploy_app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SSH WARN] Transport smoke-check failed with cover domain {}. Trying fallback cover domain {} while preserving ShadowTLS/Shadowsocks credentials.",
+                        active_cover_domain, next_cover_domain
+                    ),
+                );
+                active_fallback_cover_domains = build_rotated_cover_domain_history(
+                    &active_cover_domain,
+                    &active_fallback_cover_domains,
+                    &next_cover_domain,
+                );
+                active_cover_domain = next_cover_domain;
+                if !occupied_cover_domains
+                    .iter()
+                    .any(|domain| domain == &active_cover_domain)
+                {
+                    occupied_cover_domains.push(active_cover_domain.clone());
+                }
+            }
+
+            let server_cfg = crate::generator::build_server_config_with_invites(
+                crate::generator::ServerConfigParams {
+                    master_shadow_pass: &shadow_pass,
+                    ss_server_password: &ss_server_password,
+                    master_ss_user_password: &master_ss_user_password,
+                    external_port,
+                    internal_ss_port,
+                    routing_mode: &routing_mode,
+                    cover_domain: &active_cover_domain,
+                    fallback_cover_domains: &active_fallback_cover_domains,
+                    issued_invites: &issued_invites,
+                    warp: warp_config.as_ref(),
+                },
+            );
+            let client_cfg = crate::generator::build_client_config(
+                &host,
+                &shadow_pass,
+                &ss_password,
                 external_port,
-                internal_ss_port,
-                server_cfg: &server_cfg,
-                bootstrap_cfg: &bootstrap_cfg,
-            },
-        )?;
+                &active_cover_domain,
+                &local_rule_sets,
+            );
+            let bootstrap_cfg = json!({
+                "external_port": external_port,
+                "internal_ss_port": internal_ss_port,
+                "routing_mode": routing_mode,
+                "cover_domain": active_cover_domain,
+                "fallback_cover_domains": active_fallback_cover_domains,
+                "shadow_pass": shadow_pass,
+                "ss_password": ss_password,
+                "ss_server_password": ss_server_password,
+                "issued_invites": issued_invites
+            })
+            .to_string();
 
-        emit_ssh_stage(
-            &deploy_app,
-            "VALIDATE",
+            emit_ssh_stage(
+                &deploy_app,
+                "DEPLOY",
+                format!(
+                    "Deploying ShadowTLS transport on external port {} with cover domain {}...",
+                    external_port, active_cover_domain
+                ),
+            );
+            execute_remote_deploy(
+                &sess,
+                &deploy_app,
+                &RemoteDeployExecution {
+                    container_name: &container_name,
+                    external_port,
+                    internal_ss_port,
+                    server_cfg: &server_cfg,
+                    bootstrap_cfg: &bootstrap_cfg,
+                },
+            )?;
+
+            emit_ssh_stage(
+                &deploy_app,
+                "VALIDATE",
+                format!(
+                    "Remote runtime looks healthy. Verifying external port {} from this client...",
+                    external_port
+                ),
+            );
+            verify_external_port_reachable(&host, external_port)?;
+
+            emit_ssh_stage(
+                &deploy_app,
+                "VALIDATE",
+                "Running local ShadowTLS transport smoke-check through the generated proxy outbound...",
+            );
+            match run_client_transport_smoke_check(&deploy_app, &local_data, &client_cfg) {
+                Ok(()) => {
+                    emit_ssh_stage(
+                        &deploy_app,
+                        "VALIDATE",
+                        "Client transport smoke-check passed. Handshake is accepted.",
+                    );
+                    accepted_client_cfg = Some(client_cfg);
+                    accepted_cover_domain = Some(active_cover_domain.clone());
+                    accepted_fallback_cover_domains = Some(active_fallback_cover_domains.clone());
+                    break;
+                }
+                Err(error) => {
+                    last_smoke_error = Some(error);
+                }
+            }
+        }
+
+        let client_cfg = accepted_client_cfg.ok_or_else(|| {
+            if let Some(existing_bootstrap) = existing_bootstrap.as_ref() {
+                let _ = deploy_app.emit(
+                    "tunnel-log",
+                    "[SSH WARN] All transport smoke-check attempts failed. Rolling the remote runtime back to the previous bootstrap before returning the error.".to_string(),
+                );
+                let rollback_server_cfg = crate::generator::build_server_config_with_invites(
+                    crate::generator::ServerConfigParams {
+                        master_shadow_pass: &existing_bootstrap.shadow_pass,
+                        ss_server_password: &ss_server_password,
+                        master_ss_user_password: &master_ss_user_password,
+                        external_port,
+                        internal_ss_port,
+                        routing_mode: &routing_mode,
+                        cover_domain: &cover_domain,
+                        fallback_cover_domains: &fallback_cover_domains,
+                        issued_invites: &issued_invites,
+                        warp: warp_config.as_ref(),
+                    },
+                );
+                let rollback_bootstrap_cfg = json!({
+                    "external_port": external_port,
+                    "internal_ss_port": internal_ss_port,
+                    "routing_mode": routing_mode,
+                    "cover_domain": cover_domain,
+                    "fallback_cover_domains": fallback_cover_domains,
+                    "shadow_pass": existing_bootstrap.shadow_pass,
+                    "ss_password": ss_password,
+                    "ss_server_password": ss_server_password,
+                    "issued_invites": issued_invites
+                })
+                .to_string();
+                if let Err(error) = execute_remote_deploy(
+                    &sess,
+                    &deploy_app,
+                    &RemoteDeployExecution {
+                        container_name: &container_name,
+                        external_port,
+                        internal_ss_port,
+                        server_cfg: &rollback_server_cfg,
+                        bootstrap_cfg: &rollback_bootstrap_cfg,
+                    },
+                ) {
+                    let _ = deploy_app.emit(
+                        "tunnel-log",
+                        format!(
+                            "[SSH WARN] Rollback to the previous transport bootstrap also failed: {}",
+                            error
+                        ),
+                    );
+                }
+            }
             format!(
-                "Remote runtime looks healthy. Verifying external port {} from this client...",
-                external_port
-            ),
-        );
-        verify_external_port_reachable(&host, external_port)?;
-
-        emit_ssh_stage(
-            &deploy_app,
-            "VALIDATE",
-            format!("External port {} is reachable from this client.", external_port),
-        );
+                "Remote runtime is listening, but every ShadowTLS cover-domain smoke-check failed. Last error: {}",
+                last_smoke_error.unwrap_or_else(|| "unknown smoke-check failure".to_string())
+            )
+        })?;
+        let cover_domain = accepted_cover_domain
+            .ok_or_else(|| "Transport smoke-check passed without an accepted cover domain".to_string())?;
+        let fallback_cover_domains = accepted_fallback_cover_domains
+            .ok_or_else(|| "Transport smoke-check passed without fallback cover history".to_string())?;
 
         std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
         let client_cfg_path = local_data.join("client_config.json");

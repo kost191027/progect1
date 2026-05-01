@@ -171,6 +171,9 @@ fn summarize_server_status_output(stdout: &str) -> Vec<String> {
     let warp_enabled = stdout.contains(r#""tag": "warp""#)
         && (stdout.contains(r#""final": "warp""#) || stdout.contains(r#""outbound": "warp""#));
     let fatal_count = stdout.matches("FATAL").count();
+    let local_address_schema_error = stdout.contains(r#"unknown field "local_address""#);
+    let external_port_not_listening =
+        stdout.contains("external port") && stdout.contains("is not listening");
     let hmac_mismatch_count = stdout
         .matches("client hello verify failed: hmac mismatch")
         .count();
@@ -232,6 +235,20 @@ fn summarize_server_status_output(stdout: &str) -> Vec<String> {
         ));
     }
 
+    if local_address_schema_error {
+        summary.push(
+            "Server config compatibility: WARP local_address requires the pinned server sing-box v1.10.7 runtime. Run Deploy/Update to repair the RKN container image/config pair."
+                .to_string(),
+        );
+    }
+
+    if external_port_not_listening {
+        summary.push(
+            "Server transport unhealthy: the selected external port is not listening. Deploy/Update should recreate the RKN container or choose the next free port."
+                .to_string(),
+        );
+    }
+
     let transport_noise_count =
         hmac_mismatch_count + unexpected_session_count + unexpected_eof_count;
     if transport_noise_count > 0 && fatal_count == 0 {
@@ -239,6 +256,13 @@ fn summarize_server_status_output(stdout: &str) -> Vec<String> {
             "ShadowTLS noise: {} external handshake mismatch / scan event(s) seen recently. These warnings are usually background internet noise unless the client itself is failing.",
             transport_noise_count
         ));
+    }
+
+    if hmac_mismatch_count > 0 && !running {
+        summary.push(
+            "ShadowTLS health: handshake mismatches are present while the runtime is unhealthy; refresh local config from the remote bootstrap before rotating credentials."
+                .to_string(),
+        );
     }
 
     if !known_service_matches.is_empty() {
@@ -271,7 +295,10 @@ pub async fn check_server_status(app: AppHandle) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _ = app.emit(
             "tunnel-log",
-            format!("--- [SSH] Checking server status on {}:22 ---", profile.host),
+            format!(
+                "--- [SSH] Checking server status on {} (ports 22/2222) ---",
+                profile.host
+            ),
         );
 
         let sess = connect_ssh_session(&app, &profile.host, &profile.user, &profile.password)?;
@@ -312,11 +339,11 @@ fi
         for line in summarize_server_status_output(&stdout) {
             let _ = app.emit("tunnel-log", format!("[SYSTEM] {}", line));
         }
-        for line in stdout.lines() {
-            if !line.trim().is_empty() {
-                let _ = app.emit("tunnel-log", format!("[SERVER STATUS] {}", line));
-            }
-        }
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Full server diagnostic dump was collected and returned to the diagnostic view without streaming every line into the live tunnel log."
+                .to_string(),
+        );
 
         if exit_status == 0 {
             Ok(stdout)

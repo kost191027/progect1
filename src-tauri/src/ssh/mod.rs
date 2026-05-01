@@ -16,12 +16,11 @@ pub(crate) use warp::clear_local_warp_profile_sync;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ssh2::Session;
-use std::io::ErrorKind;
-use std::io::Read;
-use std::net::SocketAddr;
-use std::net::TcpStream;
+use std::io::{ErrorKind, Read, Write};
 use std::net::ToSocketAddrs;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -46,6 +45,7 @@ pub(crate) const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const SSH_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const SSH_SESSION_ATTEMPTS: usize = 3;
 pub(crate) const SSH_RETRY_BACKOFF: Duration = Duration::from_millis(750);
+const SSH_PORT_CANDIDATES: [u16; 2] = [22, 2222];
 pub(crate) const REMOTE_DEPLOY_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const REMOTE_DEPLOY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const MAX_FALLBACK_COVER_DOMAINS: usize = 4;
@@ -173,8 +173,20 @@ pub(crate) fn emit_ssh_stage(app: &AppHandle, stage: &str, message: impl Into<St
     let _ = app.emit("tunnel-log", format!("[SSH:{}] {}", stage, message.into()));
 }
 
-fn resolve_ssh_socket_addrs(host: &str) -> Result<Vec<SocketAddr>, String> {
-    let address = format!("{}:22", host);
+fn parse_ssh_target(host: &str) -> (String, Vec<u16>) {
+    if let Some((hostname, port)) = host.rsplit_once(':') {
+        if !hostname.is_empty() && !hostname.contains(':') {
+            if let Ok(port) = port.parse::<u16>() {
+                return (hostname.to_string(), vec![port]);
+            }
+        }
+    }
+
+    (host.to_string(), SSH_PORT_CANDIDATES.to_vec())
+}
+
+fn resolve_ssh_socket_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    let address = format!("{}:{}", host, port);
     let resolved = address
         .to_socket_addrs()
         .map_err(|e| format!("Failed to resolve {}: {}", address, e))?
@@ -211,6 +223,126 @@ fn connect_tcp_with_timeout(addrs: &[SocketAddr]) -> Result<TcpStream, String> {
     ))
 }
 
+fn read_remote_ssh_banner(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut collected = Vec::new();
+    let mut line = Vec::new();
+
+    loop {
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte).map_err(|e| {
+            format!(
+                "Failed to read remote SSH banner before client hello: {}",
+                e
+            )
+        })?;
+        collected.push(byte[0]);
+        line.push(byte[0]);
+
+        if collected.len() > 8192 {
+            return Err("Remote SSH banner exceeded the safety limit".to_string());
+        }
+
+        if byte[0] == b'\n' {
+            if line.starts_with(b"SSH-") {
+                return Ok(collected);
+            }
+            line.clear();
+        }
+    }
+}
+
+fn proxy_bidirectional(mut left: TcpStream, mut right: TcpStream) {
+    let Ok(mut left_read) = left.try_clone() else {
+        return;
+    };
+    let Ok(mut right_write) = right.try_clone() else {
+        return;
+    };
+
+    let join = thread::spawn(move || {
+        let _ = std::io::copy(&mut left_read, &mut right_write);
+        let _ = right_write.shutdown(Shutdown::Write);
+    });
+
+    let _ = std::io::copy(&mut right, &mut left);
+    let _ = left.shutdown(Shutdown::Write);
+    let _ = join.join();
+}
+
+fn connect_tcp_with_banner_first_proxy(addrs: &[SocketAddr]) -> Result<TcpStream, String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("Failed to bind local SSH banner-first proxy: {}", e))?;
+    listener
+        .set_nonblocking(false)
+        .map_err(|e| format!("Failed to configure local SSH banner-first proxy: {}", e))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to read local SSH banner-first proxy address: {}", e))?;
+    let remote_addrs = addrs.to_vec();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+
+    thread::spawn(move || {
+        let (mut local_stream, _) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                let _ = ready_tx.send(Err(format!(
+                    "Failed to accept local SSH banner-first proxy client: {}",
+                    error
+                )));
+                return;
+            }
+        };
+        let _ = local_stream.set_nodelay(true);
+        let _ = local_stream.set_read_timeout(Some(SSH_SESSION_TIMEOUT));
+        let _ = local_stream.set_write_timeout(Some(SSH_SESSION_TIMEOUT));
+
+        let mut remote_stream = match connect_tcp_with_timeout(&remote_addrs) {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+                return;
+            }
+        };
+
+        let banner = match read_remote_ssh_banner(&mut remote_stream) {
+            Ok(banner) => banner,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+                return;
+            }
+        };
+
+        if let Err(error) = local_stream.write_all(&banner) {
+            let _ = ready_tx.send(Err(format!(
+                "Failed to forward remote SSH banner to libssh2: {}",
+                error
+            )));
+            return;
+        }
+        let _ = ready_tx.send(Ok(()));
+        proxy_bidirectional(local_stream, remote_stream);
+    });
+
+    let stream = TcpStream::connect_timeout(&local_addr, SSH_CONNECT_TIMEOUT).map_err(|e| {
+        format!(
+            "Failed to connect to local SSH banner-first proxy at {}: {}",
+            local_addr, e
+        )
+    })?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(SSH_SESSION_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SSH_SESSION_TIMEOUT));
+
+    match ready_rx.recv_timeout(SSH_SESSION_TIMEOUT) {
+        Ok(Ok(())) => Ok(stream),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(format!(
+            "Timed out waiting for SSH banner-first proxy readiness: {}",
+            error
+        )),
+    }
+}
+
 pub(crate) fn connect_ssh_session(
     app: &AppHandle,
     host: &str,
@@ -240,6 +372,68 @@ fn maybe_emit_ssh_stage(
     }
 }
 
+struct SshAttemptContext<'a> {
+    app: &'a AppHandle,
+    user: &'a str,
+    pass: &'a str,
+    port: u16,
+    attempt: usize,
+    mode: &'a str,
+    emit_stages: bool,
+}
+
+fn complete_ssh_session_from_stream(
+    tcp: TcpStream,
+    ctx: SshAttemptContext<'_>,
+) -> Result<Session, String> {
+    maybe_emit_ssh_stage(
+        ctx.app,
+        ctx.emit_stages,
+        "HANDSHAKE",
+        format!(
+            "TCP connected on port {} via {}. Starting SSH handshake (attempt {}/{}, {:?} timeout)...",
+            ctx.port, ctx.mode, ctx.attempt, SSH_SESSION_ATTEMPTS, SSH_SESSION_TIMEOUT
+        ),
+    );
+
+    let mut sess = Session::new().map_err(|e| e.to_string())?;
+    sess.set_timeout(SSH_SESSION_TIMEOUT.as_millis() as u32);
+    sess.set_tcp_stream(tcp);
+    sess.handshake().map_err(|error| {
+        format!(
+            "SSH handshake failed on port {} via {}: {}",
+            ctx.port, ctx.mode, error
+        )
+    })?;
+
+    maybe_emit_ssh_stage(
+        ctx.app,
+        ctx.emit_stages,
+        "AUTH",
+        format!(
+            "Authenticating with password as {} on port {} via {} (attempt {}/{})...",
+            ctx.user, ctx.port, ctx.mode, ctx.attempt, SSH_SESSION_ATTEMPTS
+        ),
+    );
+
+    sess.userauth_password(ctx.user, ctx.pass)
+        .map_err(|error| {
+            format!(
+                "Auth failed on port {} via {}: {}",
+                ctx.port, ctx.mode, error
+            )
+        })?;
+
+    if !sess.authenticated() {
+        return Err(format!(
+            "Authentication failed on port {} via {}",
+            ctx.port, ctx.mode
+        ));
+    }
+
+    Ok(sess)
+}
+
 fn connect_ssh_session_inner(
     app: &AppHandle,
     host: &str,
@@ -247,127 +441,135 @@ fn connect_ssh_session_inner(
     pass: &str,
     emit_stages: bool,
 ) -> Result<Session, String> {
+    let (ssh_host, ssh_ports) = parse_ssh_target(host);
     maybe_emit_ssh_stage(
         app,
         emit_stages,
         "RESOLVE",
-        format!("Resolving {}...", host),
+        format!("Resolving {}...", ssh_host),
     );
-    let addrs = resolve_ssh_socket_addrs(host)?;
+    let mut resolved_targets = Vec::new();
+    for port in ssh_ports {
+        resolved_targets.push((port, resolve_ssh_socket_addrs(&ssh_host, port)?));
+    }
+
+    let resolved_count = resolved_targets
+        .iter()
+        .map(|(_, addrs)| addrs.len())
+        .sum::<usize>();
+    let port_list = resolved_targets
+        .iter()
+        .map(|(port, _)| port.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     maybe_emit_ssh_stage(
         app,
         emit_stages,
         "CONNECT",
         format!(
-            "Trying {} resolved SSH address(es) with {:?} timeout...",
-            addrs.len(),
-            SSH_CONNECT_TIMEOUT
+            "Trying {} resolved SSH address(es) on port(s) {} with {:?} timeout...",
+            resolved_count, port_list, SSH_CONNECT_TIMEOUT
         ),
     );
 
     let mut last_error = None;
 
     for attempt in 1..=SSH_SESSION_ATTEMPTS {
-        let tcp = match connect_tcp_with_timeout(&addrs) {
-            Ok(stream) => stream,
-            Err(error) => {
-                last_error = Some(error);
-                if attempt < SSH_SESSION_ATTEMPTS {
+        for (port, addrs) in &resolved_targets {
+            let tcp = match connect_tcp_with_timeout(addrs) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    last_error = Some(format!(
+                        "SSH TCP connect failed on port {}: {}",
+                        port, error
+                    ));
+                    continue;
+                }
+            };
+
+            match complete_ssh_session_from_stream(
+                tcp,
+                SshAttemptContext {
+                    app,
+                    user,
+                    pass,
+                    port: *port,
+                    attempt,
+                    mode: "direct",
+                    emit_stages,
+                },
+            ) {
+                Ok(sess) => return Ok(sess),
+                Err(error) => {
                     maybe_emit_ssh_stage(
                         app,
                         emit_stages,
                         "RETRY",
                         format!(
-                            "SSH TCP connect attempt {}/{} failed. Retrying shortly...",
-                            attempt, SSH_SESSION_ATTEMPTS
+                            "{}. Trying SSH banner-first fallback on the same endpoint...",
+                            error
                         ),
                     );
-                    thread::sleep(SSH_RETRY_BACKOFF);
+                }
+            }
+
+            let tcp = match connect_tcp_with_banner_first_proxy(addrs) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    last_error = Some(format!(
+                        "SSH banner-first fallback failed on port {}: {}",
+                        port, error
+                    ));
+                    maybe_emit_ssh_stage(
+                        app,
+                        emit_stages,
+                        "RETRY",
+                        format!(
+                            "SSH banner-first fallback failed on port {}. Trying the next SSH endpoint...",
+                            port
+                        ),
+                    );
                     continue;
                 }
-                break;
-            }
-        };
+            };
 
-        maybe_emit_ssh_stage(
-            app,
-            emit_stages,
-            "HANDSHAKE",
-            format!(
-                "TCP connected. Starting SSH handshake (attempt {}/{}, {:?} timeout)...",
-                attempt, SSH_SESSION_ATTEMPTS, SSH_SESSION_TIMEOUT
-            ),
-        );
-
-        let mut sess = Session::new().map_err(|e| e.to_string())?;
-        sess.set_timeout(SSH_SESSION_TIMEOUT.as_millis() as u32);
-        sess.set_tcp_stream(tcp);
-
-        if let Err(error) = sess.handshake() {
-            last_error = Some(format!("SSH handshake failed: {}", error));
-            if attempt < SSH_SESSION_ATTEMPTS {
-                maybe_emit_ssh_stage(
+            match complete_ssh_session_from_stream(
+                tcp,
+                SshAttemptContext {
                     app,
+                    user,
+                    pass,
+                    port: *port,
+                    attempt,
+                    mode: "banner-first fallback",
                     emit_stages,
-                    "RETRY",
-                    format!(
-                        "SSH handshake attempt {}/{} timed out or failed. Retrying...",
-                        attempt, SSH_SESSION_ATTEMPTS
-                    ),
-                );
-                thread::sleep(SSH_RETRY_BACKOFF);
-                continue;
+                },
+            ) {
+                Ok(sess) => return Ok(sess),
+                Err(error) => {
+                    last_error = Some(error.clone());
+                    maybe_emit_ssh_stage(
+                        app,
+                        emit_stages,
+                        "RETRY",
+                        format!("{}. Trying the next SSH endpoint...", error),
+                    );
+                }
             }
-            break;
         }
 
-        maybe_emit_ssh_stage(
-            app,
-            emit_stages,
-            "AUTH",
-            format!(
-                "Authenticating with password as {} (attempt {}/{})...",
-                user, attempt, SSH_SESSION_ATTEMPTS
-            ),
-        );
-
-        if let Err(error) = sess.userauth_password(user, pass) {
-            last_error = Some(format!("Auth failed: {}", error));
-            if attempt < SSH_SESSION_ATTEMPTS {
-                maybe_emit_ssh_stage(
-                    app,
-                    emit_stages,
-                    "RETRY",
-                    format!(
-                        "SSH auth attempt {}/{} failed. Retrying...",
-                        attempt, SSH_SESSION_ATTEMPTS
-                    ),
-                );
-                thread::sleep(SSH_RETRY_BACKOFF);
-                continue;
-            }
-            break;
+        if attempt < SSH_SESSION_ATTEMPTS {
+            maybe_emit_ssh_stage(
+                app,
+                emit_stages,
+                "RETRY",
+                format!(
+                    "SSH attempt {}/{} failed on all configured endpoints. Retrying shortly...",
+                    attempt, SSH_SESSION_ATTEMPTS
+                ),
+            );
+            thread::sleep(SSH_RETRY_BACKOFF);
         }
-
-        if !sess.authenticated() {
-            last_error = Some("Authentication failed".to_string());
-            if attempt < SSH_SESSION_ATTEMPTS {
-                maybe_emit_ssh_stage(
-                    app,
-                    emit_stages,
-                    "RETRY",
-                    format!(
-                        "SSH auth state was not established on attempt {}/{}. Retrying...",
-                        attempt, SSH_SESSION_ATTEMPTS
-                    ),
-                );
-                thread::sleep(SSH_RETRY_BACKOFF);
-                continue;
-            }
-            break;
-        }
-
-        return Ok(sess);
     }
 
     Err(last_error.unwrap_or_else(|| "SSH session failed to start.".to_string()))

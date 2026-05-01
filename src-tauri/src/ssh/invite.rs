@@ -159,16 +159,27 @@ pub(crate) fn resolve_master_ss_transport(
     remote_bootstrap: &RemoteTransportBootstrap,
 ) -> Result<(String, String, String), String> {
     if !remote_bootstrap.ss_server_password.is_empty() {
-        let (_, master_user_password) = split_multi_user_ss_password(&remote_bootstrap.ss_password)
-            .ok_or_else(|| {
-                "Remote bootstrap is missing the master multi-user Shadowsocks password."
-                    .to_string()
-            })?;
+        let master_user_password = if let Some((_, master_user_password)) =
+            split_multi_user_ss_password(&remote_bootstrap.ss_password)
+        {
+            master_user_password
+        } else {
+            let _ = app.emit(
+                    "tunnel-log",
+                    "[SSH WARN] Remote bootstrap has a server Shadowsocks password but the master client password is still in the legacy single-password format. Migrating this device to a multi-user Shadowsocks credential while preserving the server password."
+                        .to_string(),
+                );
+            tauri::async_runtime::block_on(crate::generator::generate_ss_password(app))?
+        };
+        let master_combined_password = compose_multi_user_ss_password(
+            &remote_bootstrap.ss_server_password,
+            &master_user_password,
+        );
 
         return Ok((
             remote_bootstrap.ss_server_password.clone(),
             master_user_password,
-            remote_bootstrap.ss_password.clone(),
+            master_combined_password,
         ));
     }
 
