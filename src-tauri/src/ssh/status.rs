@@ -8,9 +8,9 @@ use super::{
     acquire_remote_mutation_lock, build_rotated_cover_domain_history, connect_ssh_session,
     connect_ssh_session_quiet, emit_ssh_stage, ensure_local_client_rule_sets_sync,
     ensure_master_role, load_local_client_transport_state, load_remote_container_name,
-    load_remote_transport_bootstrap, monitored_port_pattern, run_remote_command,
-    save_cached_transport_bootstrap, LocalClientTransportState, RemoteTransportBootstrap,
-    TransportStateSnapshot,
+    load_remote_transport_bootstrap, monitored_port_pattern,
+    pinned_sing_box_image_for_routing_mode, run_remote_command, save_cached_transport_bootstrap,
+    LocalClientTransportState, RemoteTransportBootstrap, TransportStateSnapshot,
 };
 
 fn local_transport_requires_redeploy(
@@ -509,6 +509,9 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
                 container_name: &container_name,
                 external_port: remote_bootstrap.external_port,
                 internal_ss_port: remote_bootstrap.internal_ss_port,
+                sing_box_image: pinned_sing_box_image_for_routing_mode(
+                    &remote_bootstrap.routing_mode,
+                ),
                 server_cfg: &server_cfg,
                 bootstrap_cfg: &bootstrap_cfg,
             },

@@ -31,7 +31,8 @@ use tauri::{AppHandle, Emitter, Manager};
 pub(crate) const PRIMARY_EXTERNAL_PORT: u16 = 4433;
 pub(crate) const EXTERNAL_PORT_CANDIDATES: [u16; 5] = [4433, 443, 5443, 7443, 9443];
 pub(crate) const INTERNAL_SS_PORT_CANDIDATES: [u16; 5] = [14433, 15433, 16433, 17433, 18433];
-pub(crate) const PINNED_SING_BOX_IMAGE: &str = "ghcr.io/sagernet/sing-box:v1.10.7";
+pub(crate) const PINNED_WARP_SING_BOX_IMAGE: &str = "ghcr.io/sagernet/sing-box:v1.10.7";
+pub(crate) const PINNED_DIRECT_SING_BOX_IMAGE: &str = "ghcr.io/sagernet/sing-box:v1.13.5";
 pub(crate) const WGCF_VERSION: &str = "2.2.29";
 pub(crate) const CONTAINER_PREFIXES: [&str; 5] = [
     "sys-networkd",
@@ -49,6 +50,14 @@ const SSH_PORT_CANDIDATES: [u16; 2] = [22, 2222];
 pub(crate) const REMOTE_DEPLOY_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const REMOTE_DEPLOY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const MAX_FALLBACK_COVER_DOMAINS: usize = 4;
+
+pub(crate) fn pinned_sing_box_image_for_routing_mode(routing_mode: &str) -> &'static str {
+    if routing_mode == "warp" {
+        PINNED_WARP_SING_BOX_IMAGE
+    } else {
+        PINNED_DIRECT_SING_BOX_IMAGE
+    }
+}
 
 // ── Shared types ────────────────────────────────────────────────────────────
 
@@ -624,7 +633,7 @@ pub(crate) fn stream_remote_deploy_output(
                 last_progress = Instant::now();
                 let output = String::from_utf8_lossy(&buffer[..n]);
                 for line in output.lines() {
-                    if !line.trim().is_empty() {
+                    if should_emit_remote_deploy_line(line) {
                         let _ = app.emit("tunnel-log", format!("[SERVER] {}", line));
                     }
                 }
@@ -650,6 +659,28 @@ pub(crate) fn stream_remote_deploy_output(
 
     sess.set_blocking(true);
     Ok(())
+}
+
+fn should_emit_remote_deploy_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.contains("Digest:")
+        || trimmed.contains("Pulling from")
+        || trimmed.contains("Status: Image is up to date")
+        || trimmed == PINNED_WARP_SING_BOX_IMAGE
+        || trimmed == PINNED_DIRECT_SING_BOX_IMAGE
+    {
+        return false;
+    }
+
+    trimmed.starts_with("[INFO]")
+        || trimmed.starts_with("[WARN]")
+        || trimmed.starts_with("[ERROR]")
+        || trimmed.starts_with("[SUCCESS]")
+        || trimmed.contains("Container is UP")
 }
 
 // ── Server profile persistence ──────────────────────────────────────────────

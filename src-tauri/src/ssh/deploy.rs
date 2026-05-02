@@ -9,13 +9,19 @@ use super::{
     acquire_remote_mutation_lock, build_container_name, build_rotated_cover_domain_history,
     connect_ssh_session, emit_ssh_stage, ensure_local_client_rule_sets_sync, ensure_master_role,
     load_remote_container_image, load_remote_container_name, load_remote_transport_bootstrap,
-    remote_runtime_uses_warp, run_remote_command, save_backend_app_role,
-    save_cached_transport_bootstrap, save_server_profile, snapshot_for_cover_domain,
-    stream_remote_deploy_output, BackendAppRole, RemoteDeployTarget, RemoteTransportBootstrap,
-    SavedServerProfile, TransportStateSnapshot, EXTERNAL_PORT_CANDIDATES,
-    INTERNAL_SS_PORT_CANDIDATES, LEGACY_CONTAINER_NAME, MAX_FALLBACK_COVER_DOMAINS,
-    PINNED_SING_BOX_IMAGE, PRIMARY_EXTERNAL_PORT,
+    pinned_sing_box_image_for_routing_mode, remote_runtime_uses_warp, run_remote_command,
+    save_backend_app_role, save_cached_transport_bootstrap, save_server_profile,
+    snapshot_for_cover_domain, stream_remote_deploy_output, BackendAppRole, RemoteDeployTarget,
+    RemoteTransportBootstrap, SavedServerProfile, TransportStateSnapshot, EXTERNAL_PORT_CANDIDATES,
+    INTERNAL_SS_PORT_CANDIDATES, LEGACY_CONTAINER_NAME, PRIMARY_EXTERNAL_PORT,
 };
+
+const MAX_AUTOMATIC_REPAIR_COVER_ROTATIONS: usize = 0;
+const TRANSPORT_SMOKE_TARGETS: &[&str] = &[
+    "https://www.gstatic.com/generate_204",
+    "https://cp.cloudflare.com/generate_204",
+    "https://www.apple.com/library/test/success.html",
+];
 
 fn compose_multi_user_ss_password(server_password: &str, user_password: &str) -> String {
     format!("{}:{}", server_password, user_password)
@@ -47,6 +53,7 @@ pub(crate) struct RemoteDeployExecution<'a> {
     pub(crate) container_name: &'a str,
     pub(crate) external_port: u16,
     pub(crate) internal_ss_port: u16,
+    pub(crate) sing_box_image: &'a str,
     pub(crate) server_cfg: &'a str,
     pub(crate) bootstrap_cfg: &'a str,
 }
@@ -360,7 +367,27 @@ fn run_client_transport_smoke_check(
     })?;
 
     let singbox_path = crate::resolve_singbox_path(app)?;
-    let mut child = std::process::Command::new(&singbox_path)
+    let mut errors = Vec::new();
+    for target_url in TRANSPORT_SMOKE_TARGETS {
+        match run_client_transport_smoke_check_once(&singbox_path, &smoke_cfg_path, target_url) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(format!("{} => {}", target_url, error)),
+        }
+    }
+
+    Err(format!(
+        "all transport smoke targets failed: {}",
+        errors.join("; ")
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
+fn run_client_transport_smoke_check_once(
+    singbox_path: &str,
+    smoke_cfg_path: &std::path::Path,
+    target_url: &str,
+) -> Result<(), String> {
+    let mut child = std::process::Command::new(singbox_path)
         .args([
             "--disable-color",
             "tools",
@@ -369,7 +396,7 @@ fn run_client_transport_smoke_check(
             smoke_cfg_path.to_string_lossy().as_ref(),
             "-o",
             "proxy",
-            "https://www.gstatic.com/generate_204",
+            target_url,
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -382,7 +409,7 @@ fn run_client_transport_smoke_check(
         })?;
 
     let started = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(18);
+    let timeout = std::time::Duration::from_secs(8);
     loop {
         if let Some(status) = child
             .try_wait()
@@ -463,7 +490,7 @@ BOOTSTRAPEOF
 
 {}
 "#,
-        PINNED_SING_BOX_IMAGE,
+        execution.sing_box_image,
         execution.container_name,
         execution.server_cfg,
         execution.bootstrap_cfg,
@@ -615,24 +642,26 @@ pub async fn deploy_server(
                 ),
             );
 
+            let effective_routing_mode = if remote_runtime_uses_warp(&sess)? {
+                "warp"
+            } else {
+                "direct"
+            };
+            let expected_image = pinned_sing_box_image_for_routing_mode(effective_routing_mode);
+
             if let Some(remote_image) = load_remote_container_image(&sess, &container_name)? {
-                if remote_image != PINNED_SING_BOX_IMAGE {
+                if remote_image != expected_image {
                     let _ = app.emit(
                         "tunnel-log",
                         format!(
                             "[SSH WARN] Existing RKN runtime uses server image {} but this build pins {}. Falling back to a fresh deploy to migrate the server runtime.",
-                            remote_image, PINNED_SING_BOX_IMAGE
+                            remote_image, expected_image
                         ),
                     );
                     return Ok(None);
                 }
             }
 
-            let effective_routing_mode = if remote_runtime_uses_warp(&sess)? {
-                "warp"
-            } else {
-                "direct"
-            };
             if remote_bootstrap.routing_mode != effective_routing_mode {
                 let _ = app.emit(
                     "tunnel-log",
@@ -697,11 +726,10 @@ pub async fn deploy_server(
                 let _ = app.emit(
                     "tunnel-log",
                     format!(
-                        "[SSH WARN] Existing server metadata is present, but the real client transport handshake failed. Falling back to a repair deploy with preserved credentials. {}",
+                        "[SSH WARN] Advisory transport smoke-check for the existing server failed, but runtime and port validation passed. Saving the refreshed client config anyway. Details: {}",
                         error
                     ),
                 );
-                return Ok(None);
             }
 
             std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
@@ -810,14 +838,6 @@ pub async fn deploy_server(
             );
         }
 
-        let _ = deploy_app.emit(
-            "tunnel-log",
-            format!(
-                "[SSH] Selected pinned image {} and container name {}.",
-                PINNED_SING_BOX_IMAGE, container_name
-            ),
-        );
-
         let existing_bootstrap = load_remote_transport_bootstrap(&sess)?;
         let (shadow_pass, ss_server_password, master_ss_user_password, ss_password, routing_mode, cover_domain, fallback_cover_domains, issued_invites) =
             if let Some(existing_bootstrap) = existing_bootstrap.clone() {
@@ -874,6 +894,14 @@ pub async fn deploy_server(
                     Vec::new(),
                 )
             };
+        let sing_box_image = pinned_sing_box_image_for_routing_mode(&routing_mode);
+        let _ = deploy_app.emit(
+            "tunnel-log",
+            format!(
+                "[SSH] Selected pinned image {} and container name {}.",
+                sing_box_image, container_name
+            ),
+        );
         let _ = deploy_app.emit(
             "tunnel-log",
             format!(
@@ -909,7 +937,7 @@ pub async fn deploy_server(
         let mut accepted_cover_domain = None::<String>;
         let mut accepted_fallback_cover_domains = None::<Vec<String>>;
 
-        for attempt_index in 0..=MAX_FALLBACK_COVER_DOMAINS {
+        for attempt_index in 0..=MAX_AUTOMATIC_REPAIR_COVER_ROTATIONS {
             if attempt_index > 0 {
                 let next_cover_domain = crate::generator::select_next_cover_domain(
                     &active_cover_domain,
@@ -987,6 +1015,7 @@ pub async fn deploy_server(
                     container_name: &container_name,
                     external_port,
                     internal_ss_port,
+                    sing_box_image,
                     server_cfg: &server_cfg,
                     bootstrap_cfg: &bootstrap_cfg,
                 },
@@ -1025,67 +1054,26 @@ pub async fn deploy_server(
             }
         }
 
-        let client_cfg = accepted_client_cfg.ok_or_else(|| {
-            if let Some(existing_bootstrap) = existing_bootstrap.as_ref() {
-                let _ = deploy_app.emit(
-                    "tunnel-log",
-                    "[SSH WARN] All transport smoke-check attempts failed. Rolling the remote runtime back to the previous bootstrap before returning the error.".to_string(),
-                );
-                let rollback_server_cfg = crate::generator::build_server_config_with_invites(
-                    crate::generator::ServerConfigParams {
-                        master_shadow_pass: &existing_bootstrap.shadow_pass,
-                        ss_server_password: &ss_server_password,
-                        master_ss_user_password: &master_ss_user_password,
-                        external_port,
-                        internal_ss_port,
-                        routing_mode: &routing_mode,
-                        cover_domain: &cover_domain,
-                        fallback_cover_domains: &fallback_cover_domains,
-                        issued_invites: &issued_invites,
-                        warp: warp_config.as_ref(),
-                    },
-                );
-                let rollback_bootstrap_cfg = json!({
-                    "external_port": external_port,
-                    "internal_ss_port": internal_ss_port,
-                    "routing_mode": routing_mode,
-                    "cover_domain": cover_domain,
-                    "fallback_cover_domains": fallback_cover_domains,
-                    "shadow_pass": existing_bootstrap.shadow_pass,
-                    "ss_password": ss_password,
-                    "ss_server_password": ss_server_password,
-                    "issued_invites": issued_invites
-                })
-                .to_string();
-                if let Err(error) = execute_remote_deploy(
-                    &sess,
-                    &deploy_app,
-                    &RemoteDeployExecution {
-                        container_name: &container_name,
-                        external_port,
-                        internal_ss_port,
-                        server_cfg: &rollback_server_cfg,
-                        bootstrap_cfg: &rollback_bootstrap_cfg,
-                    },
-                ) {
-                    let _ = deploy_app.emit(
-                        "tunnel-log",
-                        format!(
-                            "[SSH WARN] Rollback to the previous transport bootstrap also failed: {}",
-                            error
-                        ),
-                    );
-                }
-            }
-            format!(
-                "Remote runtime is listening, but every ShadowTLS cover-domain smoke-check failed. Last error: {}",
-                last_smoke_error.unwrap_or_else(|| "unknown smoke-check failure".to_string())
+        let client_cfg = accepted_client_cfg.unwrap_or_else(|| {
+            let _ = deploy_app.emit(
+                "tunnel-log",
+                format!(
+                    "[SSH WARN] Advisory transport smoke-check failed, but the remote runtime is healthy and the client config will still be saved. Start the tunnel to verify the live path. Details: {}",
+                    last_smoke_error.unwrap_or_else(|| "unknown smoke-check failure".to_string())
+                ),
+            );
+            crate::generator::build_client_config(
+                &host,
+                &shadow_pass,
+                &ss_password,
+                external_port,
+                &cover_domain,
+                &local_rule_sets,
             )
-        })?;
-        let cover_domain = accepted_cover_domain
-            .ok_or_else(|| "Transport smoke-check passed without an accepted cover domain".to_string())?;
-        let fallback_cover_domains = accepted_fallback_cover_domains
-            .ok_or_else(|| "Transport smoke-check passed without fallback cover history".to_string())?;
+        });
+        let cover_domain = accepted_cover_domain.unwrap_or_else(|| cover_domain.clone());
+        let fallback_cover_domains =
+            accepted_fallback_cover_domains.unwrap_or_else(|| fallback_cover_domains.clone());
 
         std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
         let client_cfg_path = local_data.join("client_config.json");

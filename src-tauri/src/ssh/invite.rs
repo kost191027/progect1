@@ -17,8 +17,9 @@ use super::{
     acquire_remote_mutation_lock, clear_cached_transport_bootstrap, connect_ssh_session,
     ensure_local_client_rule_sets_sync, ensure_master_role, load_cached_transport_bootstrap,
     load_remote_container_name, load_remote_transport_bootstrap, local_client_config_path,
-    remove_saved_server_profile, save_backend_app_role, save_cached_transport_bootstrap,
-    BackendAppRole, LocalInstallationState, RemoteInviteRecord, RemoteTransportBootstrap,
+    pinned_sing_box_image_for_routing_mode, remove_saved_server_profile, save_backend_app_role,
+    save_cached_transport_bootstrap, BackendAppRole, LocalInstallationState, RemoteInviteRecord,
+    RemoteTransportBootstrap,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +332,7 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
             container_name: &container_name,
             external_port: remote_bootstrap.external_port,
             internal_ss_port: remote_bootstrap.internal_ss_port,
+            sing_box_image: pinned_sing_box_image_for_routing_mode(&remote_bootstrap.routing_mode),
             server_cfg: &server_cfg,
             bootstrap_cfg: &bootstrap_cfg,
         },
