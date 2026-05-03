@@ -4,11 +4,13 @@ use std::io::Write;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::invite::resolve_master_ss_transport;
-use super::warp::{ensure_remote_warp_config, has_local_warp_profile_sync};
+use super::warp::{
+    ensure_remote_warp_config, has_local_warp_profile_sync, load_remote_warp_config,
+};
 use super::{
-    acquire_remote_mutation_lock, build_container_name, build_rotated_cover_domain_history,
-    connect_ssh_session, emit_ssh_stage, ensure_local_client_rule_sets_sync, ensure_master_role,
-    load_remote_container_image, load_remote_container_name, load_remote_transport_bootstrap,
+    acquire_remote_mutation_lock, build_container_name, connect_ssh_session, emit_ssh_stage,
+    ensure_local_client_rule_sets_sync, ensure_master_role, load_remote_container_image,
+    load_remote_container_name, load_remote_transport_bootstrap,
     pinned_sing_box_image_for_routing_mode, remote_runtime_uses_warp, run_remote_command,
     save_backend_app_role, save_cached_transport_bootstrap, save_server_profile,
     snapshot_for_cover_domain, stream_remote_deploy_output, BackendAppRole, RemoteDeployTarget,
@@ -16,12 +18,15 @@ use super::{
     INTERNAL_SS_PORT_CANDIDATES, LEGACY_CONTAINER_NAME, PRIMARY_EXTERNAL_PORT,
 };
 
-const MAX_AUTOMATIC_REPAIR_COVER_ROTATIONS: usize = 0;
 const TRANSPORT_SMOKE_TARGETS: &[&str] = &[
     "https://www.gstatic.com/generate_204",
     "https://cp.cloudflare.com/generate_204",
     "https://www.apple.com/library/test/success.html",
 ];
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r#"'"'"'"#))
+}
 
 fn compose_multi_user_ss_password(server_password: &str, user_password: &str) -> String {
     format!("{}:{}", server_password, user_password)
@@ -74,14 +79,28 @@ pub(crate) fn select_remote_deploy_target(
         .join(" ");
     let generated_container_name = build_container_name(short_id);
 
-    let command = format!(
-        r#"bash -lc '
+    let script = format!(
+        r#"
 CONFIG_DIR="/opt/rkn"
 ACTIVE_CONTAINER_FILE="$CONFIG_DIR/container_name"
+ACTIVE_CONFIG="$CONFIG_DIR/config.json"
 PREVIOUS_CONTAINER=""
-PRIMARY_PORT="{primary_port}"
 SELECTED_PORT=""
 INTERNAL_PORT=""
+RKN_MANAGED_LABEL="com.freedom.rkn.managed=true"
+
+is_tcp_port_listening() {{
+  port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -Htanl 2>/dev/null | awk '"'"'{{print $4}}'"'"' | grep -Eq "(^|:)$port$"
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -tnl 2>/dev/null | awk '"'"'{{print $4}}'"'"' | grep -Eq "(^|[.:])$port$"
+    return $?
+  fi
+  return 1
+}}
 
 if command -v docker >/dev/null 2>&1; then
   if [ -f "$ACTIVE_CONTAINER_FILE" ]; then
@@ -92,32 +111,40 @@ if command -v docker >/dev/null 2>&1; then
     PREVIOUS_CONTAINER="{legacy_container_name}"
   fi
 
+  if [ -z "$PREVIOUS_CONTAINER" ]; then
+    PREVIOUS_CONTAINER="$(docker ps -a --filter "label=$RKN_MANAGED_LABEL" --format '"'"'{{{{.Names}}}}'"'"' 2>/dev/null | head -n 1 || true)"
+  fi
+
   if [ -n "$PREVIOUS_CONTAINER" ] && docker inspect "$PREVIOUS_CONTAINER" >/dev/null 2>&1; then
-    CURRENT_PORT="$(grep -m1 '"'"'"listen_port"'"'"' "$CONFIG_DIR/config.json" | sed -E '"'"'s/[^0-9]*([0-9]+).*/\1/'"'"' || true)"
-    if [ "$CURRENT_PORT" != "$PRIMARY_PORT" ] && ! ss -Htanl "( sport = :$PRIMARY_PORT )" | grep -q .; then
-      SELECTED_PORT="$PRIMARY_PORT"
-      echo "port=$PRIMARY_PORT"
+    CURRENT_PORT=""
+    CURRENT_INTERNAL_PORT=""
+    if [ -f "$ACTIVE_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+      CURRENT_PORT="$(jq -r '"'"'[.inbounds[]? | select(.type=="shadowtls") | .listen_port][0] // empty'"'"' "$ACTIVE_CONFIG" 2>/dev/null || true)"
+      CURRENT_INTERNAL_PORT="$(jq -r '"'"'[.inbounds[]? | select(.type=="shadowsocks") | .listen_port][0] // empty'"'"' "$ACTIVE_CONFIG" 2>/dev/null || true)"
+    fi
+    if [ -z "$CURRENT_PORT" ] && [ -f "$ACTIVE_CONFIG" ]; then
+      CURRENT_PORT="$(grep '"'"'"listen_port"'"' "$ACTIVE_CONFIG" | sed -n '1p' | sed -E '"'"'s/[^0-9]*([0-9]+).*/\1/'"'"' || true)"
+    fi
+    if [ -z "$CURRENT_INTERNAL_PORT" ] && [ -f "$ACTIVE_CONFIG" ]; then
+      CURRENT_INTERNAL_PORT="$(grep '"'"'"listen_port"'"' "$ACTIVE_CONFIG" | sed -n '2p' | sed -E '"'"'s/[^0-9]*([0-9]+).*/\1/'"'"' || true)"
+    fi
+    if [ -n "$CURRENT_PORT" ]; then
+      SELECTED_PORT="$CURRENT_PORT"
+      echo "port=$CURRENT_PORT"
       echo "container=$PREVIOUS_CONTAINER"
       echo "reuse=true"
-      echo "migrate_primary=true"
-    else
-      for candidate in {candidates}; do
-      if [ "$candidate" = "$CURRENT_PORT" ]; then
-        SELECTED_PORT="$CURRENT_PORT"
-        echo "port=$CURRENT_PORT"
-        echo "container=$PREVIOUS_CONTAINER"
-        echo "reuse=true"
-        echo "migrate_primary=false"
-        break
+      echo "migrate_primary=false"
+      if [ -n "$CURRENT_INTERNAL_PORT" ]; then
+        INTERNAL_PORT="$CURRENT_INTERNAL_PORT"
+        echo "internal_port=$CURRENT_INTERNAL_PORT"
       fi
-      done
     fi
   fi
 fi
 
 if [ -z "$SELECTED_PORT" ]; then
   for port in {candidates}; do
-    if ! ss -Htanl "( sport = :$port )" | grep -q .; then
+    if ! is_tcp_port_listening "$port"; then
       SELECTED_PORT="$port"
       echo "port=$port"
       echo "container={generated_container_name}"
@@ -128,33 +155,54 @@ if [ -z "$SELECTED_PORT" ]; then
   done
 fi
 
-for port in {internal_candidates}; do
-  if ! ss -Htanl "( sport = :$port )" | grep -q .; then
-    INTERNAL_PORT="$port"
-    break
+if [ -z "$INTERNAL_PORT" ]; then
+  for port in {internal_candidates}; do
+    if ! is_tcp_port_listening "$port"; then
+      INTERNAL_PORT="$port"
+      break
+    fi
+  done
+  if [ -n "$INTERNAL_PORT" ]; then
+    echo "internal_port=$INTERNAL_PORT"
   fi
-done
-
-if [ -z "$SELECTED_PORT" ] || [ -z "$INTERNAL_PORT" ]; then
-  exit 1
 fi
 
-echo "internal_port=$INTERNAL_PORT"
+if [ -z "$SELECTED_PORT" ] || [ -z "$INTERNAL_PORT" ]; then
+  if [ -z "$SELECTED_PORT" ]; then
+    echo "missing_external_port=true"
+  fi
+  if [ -z "$INTERNAL_PORT" ]; then
+    echo "missing_internal_port=true"
+  fi
+  if [ -n "$PREVIOUS_CONTAINER" ]; then
+    echo "previous_container=$PREVIOUS_CONTAINER"
+  fi
+  if [ -f "$ACTIVE_CONFIG" ]; then
+    echo "active_config_present=true"
+  fi
+  exit 1
+fi
 exit 0
-'"#,
+"#,
         legacy_container_name = LEGACY_CONTAINER_NAME,
         candidates = candidates,
         internal_candidates = internal_candidates,
-        generated_container_name = generated_container_name,
-        primary_port = PRIMARY_EXTERNAL_PORT
+        generated_container_name = generated_container_name
     );
+    let command = format!("bash -lc {}", shell_single_quote(&script));
 
     let (stdout, exit_status) = run_remote_command(sess, &command)?;
 
     if exit_status != 0 {
+        if let Ok(target) = select_remote_deploy_target_from_socket_dump(sess, short_id) {
+            return Ok(target);
+        }
+
         return Err(format!(
-            "No free external ports found in candidate list: {}",
-            candidates
+            "No deploy target could be selected. External candidates: {}; internal candidates: {}. Output: {}",
+            candidates,
+            internal_candidates,
+            stdout.trim()
         ));
     }
 
@@ -200,6 +248,69 @@ exit 0
         container_name,
         reusing_existing_instance,
         migrating_to_primary_port,
+    })
+}
+
+fn select_remote_deploy_target_from_socket_dump(
+    sess: &Session,
+    short_id: &str,
+) -> Result<RemoteDeployTarget, String> {
+    let command = r#"bash -lc '
+if command -v ss >/dev/null 2>&1; then
+  ss -Htanl 2>/dev/null || true
+elif command -v netstat >/dev/null 2>&1; then
+  netstat -tnl 2>/dev/null || true
+fi
+'"#;
+    let (stdout, _exit_status) = run_remote_command(sess, command)?;
+    let external_port = EXTERNAL_PORT_CANDIDATES
+        .iter()
+        .copied()
+        .find(|port| !socket_dump_contains_port(&stdout, *port))
+        .ok_or_else(|| {
+            format!(
+                "No free external ports found in fallback socket dump. Candidates: {}. Output: {}",
+                EXTERNAL_PORT_CANDIDATES
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                stdout.trim()
+            )
+        })?;
+    let internal_ss_port = INTERNAL_SS_PORT_CANDIDATES
+        .iter()
+        .copied()
+        .find(|port| !socket_dump_contains_port(&stdout, *port))
+        .ok_or_else(|| {
+            format!(
+                "No free internal Shadowsocks ports found in fallback socket dump. Candidates: {}. Output: {}",
+                INTERNAL_SS_PORT_CANDIDATES
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                stdout.trim()
+            )
+        })?;
+
+    Ok(RemoteDeployTarget {
+        external_port,
+        internal_ss_port,
+        container_name: build_container_name(short_id),
+        reusing_existing_instance: false,
+        migrating_to_primary_port: false,
+    })
+}
+
+fn socket_dump_contains_port(socket_dump: &str, port: u16) -> bool {
+    let colon_port = format!(":{}", port);
+    let dot_port = format!(".{}", port);
+    socket_dump.split_whitespace().any(|field| {
+        let address = field
+            .trim_matches(|c| c == '[' || c == ']')
+            .trim_end_matches(',');
+        address.ends_with(&colon_port) || address.ends_with(&dot_port)
     })
 }
 
@@ -642,11 +753,31 @@ pub async fn deploy_server(
                 ),
             );
 
-            let effective_routing_mode = if remote_runtime_uses_warp(&sess)? {
+            let runtime_uses_warp = remote_runtime_uses_warp(&sess)?;
+            let effective_routing_mode = if remote_bootstrap.routing_mode == "warp" || runtime_uses_warp {
                 "warp"
             } else {
                 "direct"
             };
+            let has_local_warp_profile = has_local_warp_profile_sync(&app)?;
+            let has_remote_warp_profile = load_remote_warp_config(&sess)?.is_some();
+            if effective_routing_mode == "direct"
+                && (has_local_warp_profile || has_remote_warp_profile)
+            {
+                let reason = if has_remote_warp_profile {
+                    "a remote WARP profile already exists"
+                } else {
+                    "a local WARP profile is present"
+                };
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SSH:WARP] Existing runtime is direct, but {}. Falling back to a repair deploy so the server config is rebuilt with WARP egress.",
+                        reason
+                    ),
+                );
+                return Ok(None);
+            }
             let expected_image = pinned_sing_box_image_for_routing_mode(effective_routing_mode);
 
             if let Some(remote_image) = load_remote_container_image(&sess, &container_name)? {
@@ -726,7 +857,7 @@ pub async fn deploy_server(
                 let _ = app.emit(
                     "tunnel-log",
                     format!(
-                        "[SSH WARN] Advisory transport smoke-check for the existing server failed, but runtime and port validation passed. Saving the refreshed client config anyway. Details: {}",
+                        "[SSH] Advisory transport smoke-check for the existing server failed, but runtime and port validation passed. Saving the refreshed client config anyway. Details: {}",
                         error
                     ),
                 );
@@ -839,6 +970,8 @@ pub async fn deploy_server(
         }
 
         let existing_bootstrap = load_remote_transport_bootstrap(&sess)?;
+        let has_local_warp_profile = has_local_warp_profile_sync(&deploy_app)?;
+        let has_remote_warp_profile = load_remote_warp_config(&sess)?.is_some();
         let (shadow_pass, ss_server_password, master_ss_user_password, ss_password, routing_mode, cover_domain, fallback_cover_domains, issued_invites) =
             if let Some(existing_bootstrap) = existing_bootstrap.clone() {
                 let _ = deploy_app.emit(
@@ -847,18 +980,32 @@ pub async fn deploy_server(
                 );
                 let (ss_server_password, master_ss_user_password, master_combined_password) =
                     resolve_master_ss_transport(&deploy_app, &existing_bootstrap)?;
+                let routing_mode = if existing_bootstrap.routing_mode == "warp"
+                    || has_local_warp_profile
+                    || has_remote_warp_profile
+                {
+                    if existing_bootstrap.routing_mode != "warp" {
+                        let _ = deploy_app.emit(
+                            "tunnel-log",
+                            "[SSH:WARP] WARP profile is present. Migrating this existing server runtime from direct egress to WARP egress.".to_string(),
+                        );
+                    }
+                    "warp".to_string()
+                } else {
+                    existing_bootstrap.routing_mode.clone()
+                };
                 (
                     existing_bootstrap.shadow_pass.clone(),
                     ss_server_password,
                     master_ss_user_password,
                     master_combined_password,
-                    existing_bootstrap.routing_mode.clone(),
+                    routing_mode,
                     existing_bootstrap.cover_domain.clone(),
                     existing_bootstrap.fallback_cover_domains.clone(),
                     existing_bootstrap.issued_invites.clone(),
                 )
             } else {
-                let default_routing_mode = if has_local_warp_profile_sync(&deploy_app)? {
+                let default_routing_mode = if has_local_warp_profile || has_remote_warp_profile {
                     "warp"
                 } else {
                     "direct"
@@ -923,157 +1070,92 @@ pub async fn deploy_server(
             None
         };
         let local_rule_sets = ensure_local_client_rule_sets_sync(&deploy_app)?;
-        let mut active_cover_domain = cover_domain.clone();
-        let mut active_fallback_cover_domains = fallback_cover_domains.clone();
-        let mut occupied_cover_domains = active_fallback_cover_domains.clone();
-        if !occupied_cover_domains
-            .iter()
-            .any(|domain| domain == &active_cover_domain)
-        {
-            occupied_cover_domains.push(active_cover_domain.clone());
-        }
-        let mut last_smoke_error = None::<String>;
-        let mut accepted_client_cfg = None::<String>;
-        let mut accepted_cover_domain = None::<String>;
-        let mut accepted_fallback_cover_domains = None::<Vec<String>>;
-
-        for attempt_index in 0..=MAX_AUTOMATIC_REPAIR_COVER_ROTATIONS {
-            if attempt_index > 0 {
-                let next_cover_domain = crate::generator::select_next_cover_domain(
-                    &active_cover_domain,
-                    &occupied_cover_domains,
-                )
-                .to_string();
-                let _ = deploy_app.emit(
-                    "tunnel-log",
-                    format!(
-                        "[SSH WARN] Transport smoke-check failed with cover domain {}. Trying fallback cover domain {} while preserving ShadowTLS/Shadowsocks credentials.",
-                        active_cover_domain, next_cover_domain
-                    ),
-                );
-                active_fallback_cover_domains = build_rotated_cover_domain_history(
-                    &active_cover_domain,
-                    &active_fallback_cover_domains,
-                    &next_cover_domain,
-                );
-                active_cover_domain = next_cover_domain;
-                if !occupied_cover_domains
-                    .iter()
-                    .any(|domain| domain == &active_cover_domain)
-                {
-                    occupied_cover_domains.push(active_cover_domain.clone());
-                }
-            }
-
-            let server_cfg = crate::generator::build_server_config_with_invites(
-                crate::generator::ServerConfigParams {
-                    master_shadow_pass: &shadow_pass,
-                    ss_server_password: &ss_server_password,
-                    master_ss_user_password: &master_ss_user_password,
-                    external_port,
-                    internal_ss_port,
-                    routing_mode: &routing_mode,
-                    cover_domain: &active_cover_domain,
-                    fallback_cover_domains: &active_fallback_cover_domains,
-                    issued_invites: &issued_invites,
-                    warp: warp_config.as_ref(),
-                },
-            );
-            let client_cfg = crate::generator::build_client_config(
-                &host,
-                &shadow_pass,
-                &ss_password,
+        let server_cfg = crate::generator::build_server_config_with_invites(
+            crate::generator::ServerConfigParams {
+                master_shadow_pass: &shadow_pass,
+                ss_server_password: &ss_server_password,
+                master_ss_user_password: &master_ss_user_password,
                 external_port,
-                &active_cover_domain,
-                &local_rule_sets,
-            );
-            let bootstrap_cfg = json!({
-                "external_port": external_port,
-                "internal_ss_port": internal_ss_port,
-                "routing_mode": routing_mode,
-                "cover_domain": active_cover_domain,
-                "fallback_cover_domains": active_fallback_cover_domains,
-                "shadow_pass": shadow_pass,
-                "ss_password": ss_password,
-                "ss_server_password": ss_server_password,
-                "issued_invites": issued_invites
-            })
-            .to_string();
+                internal_ss_port,
+                routing_mode: &routing_mode,
+                cover_domain: &cover_domain,
+                fallback_cover_domains: &fallback_cover_domains,
+                issued_invites: &issued_invites,
+                warp: warp_config.as_ref(),
+            },
+        );
+        let client_cfg = crate::generator::build_client_config(
+            &host,
+            &shadow_pass,
+            &ss_password,
+            external_port,
+            &cover_domain,
+            &local_rule_sets,
+        );
+        let bootstrap_cfg = json!({
+            "external_port": external_port,
+            "internal_ss_port": internal_ss_port,
+            "routing_mode": routing_mode,
+            "cover_domain": cover_domain,
+            "fallback_cover_domains": fallback_cover_domains,
+            "shadow_pass": shadow_pass,
+            "ss_password": ss_password,
+            "ss_server_password": ss_server_password,
+            "issued_invites": issued_invites
+        })
+        .to_string();
 
-            emit_ssh_stage(
-                &deploy_app,
-                "DEPLOY",
-                format!(
-                    "Deploying ShadowTLS transport on external port {} with cover domain {}...",
-                    external_port, active_cover_domain
-                ),
-            );
-            execute_remote_deploy(
-                &sess,
-                &deploy_app,
-                &RemoteDeployExecution {
-                    container_name: &container_name,
-                    external_port,
-                    internal_ss_port,
-                    sing_box_image,
-                    server_cfg: &server_cfg,
-                    bootstrap_cfg: &bootstrap_cfg,
-                },
-            )?;
+        emit_ssh_stage(
+            &deploy_app,
+            "DEPLOY",
+            format!(
+                "Deploying ShadowTLS transport on external port {} with cover domain {}...",
+                external_port, cover_domain
+            ),
+        );
+        execute_remote_deploy(
+            &sess,
+            &deploy_app,
+            &RemoteDeployExecution {
+                container_name: &container_name,
+                external_port,
+                internal_ss_port,
+                sing_box_image,
+                server_cfg: &server_cfg,
+                bootstrap_cfg: &bootstrap_cfg,
+            },
+        )?;
 
-            emit_ssh_stage(
-                &deploy_app,
-                "VALIDATE",
-                format!(
-                    "Remote runtime looks healthy. Verifying external port {} from this client...",
-                    external_port
-                ),
-            );
-            verify_external_port_reachable(&host, external_port)?;
+        emit_ssh_stage(
+            &deploy_app,
+            "VALIDATE",
+            format!(
+                "Remote runtime looks healthy. Verifying external port {} from this client...",
+                external_port
+            ),
+        );
+        verify_external_port_reachable(&host, external_port)?;
 
-            emit_ssh_stage(
-                &deploy_app,
-                "VALIDATE",
-                "Running local ShadowTLS transport smoke-check through the generated proxy outbound...",
-            );
-            match run_client_transport_smoke_check(&deploy_app, &local_data, &client_cfg) {
-                Ok(()) => {
-                    emit_ssh_stage(
-                        &deploy_app,
-                        "VALIDATE",
-                        "Client transport smoke-check passed. Handshake is accepted.",
-                    );
-                    accepted_client_cfg = Some(client_cfg);
-                    accepted_cover_domain = Some(active_cover_domain.clone());
-                    accepted_fallback_cover_domains = Some(active_fallback_cover_domains.clone());
-                    break;
-                }
-                Err(error) => {
-                    last_smoke_error = Some(error);
-                }
-            }
-        }
-
-        let client_cfg = accepted_client_cfg.unwrap_or_else(|| {
+        emit_ssh_stage(
+            &deploy_app,
+            "VALIDATE",
+            "Running local ShadowTLS transport smoke-check through the generated proxy outbound...",
+        );
+        if let Err(error) = run_client_transport_smoke_check(&deploy_app, &local_data, &client_cfg) {
             let _ = deploy_app.emit(
                 "tunnel-log",
                 format!(
-                    "[SSH WARN] Advisory transport smoke-check failed, but the remote runtime is healthy and the client config will still be saved. Start the tunnel to verify the live path. Details: {}",
-                    last_smoke_error.unwrap_or_else(|| "unknown smoke-check failure".to_string())
+                    "[SSH] Advisory transport smoke-check failed, but the remote runtime is healthy and the client config will still be saved. Start the tunnel to verify the live path. Details: {}",
+                    error
                 ),
             );
-            crate::generator::build_client_config(
-                &host,
-                &shadow_pass,
-                &ss_password,
-                external_port,
-                &cover_domain,
-                &local_rule_sets,
-            )
-        });
-        let cover_domain = accepted_cover_domain.unwrap_or_else(|| cover_domain.clone());
-        let fallback_cover_domains =
-            accepted_fallback_cover_domains.unwrap_or_else(|| fallback_cover_domains.clone());
+        } else {
+            emit_ssh_stage(
+                &deploy_app,
+                "VALIDATE",
+                "Client transport smoke-check passed. Handshake is accepted.",
+            );
+        }
 
         std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
         let client_cfg_path = local_data.join("client_config.json");

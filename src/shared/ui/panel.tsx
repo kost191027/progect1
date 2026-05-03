@@ -16,6 +16,7 @@ type PanelProps = HTMLAttributes<HTMLDivElement> & {
   defaultOpen?: boolean;
   storageKey?: string;
   contentClassName?: string;
+  allowOverflow?: boolean;
   iconSrc?: string;
 };
 
@@ -28,6 +29,7 @@ export function Panel({
   defaultOpen = false,
   storageKey,
   contentClassName,
+  allowOverflow = false,
   iconSrc,
   ...props
 }: PanelProps) {
@@ -80,7 +82,12 @@ export function Panel({
             </div>
           </summary>
         ) : null}
-        <div className="overflow-hidden rounded-b-2xl border-t border-zinc-800/80">
+        <div
+          className={cn(
+            allowOverflow ? "overflow-visible" : "overflow-hidden",
+            "rounded-b-2xl border-t border-zinc-800/80",
+          )}
+        >
           {subtitle ? (
             <div className="px-6 py-4">
               <p className="max-w-2xl text-sm leading-6 text-zinc-500">{subtitle}</p>

@@ -86,6 +86,7 @@ export function DiagnosticsActionsPanel({
       collapsible={collapsible}
       defaultOpen={defaultOpen}
       storageKey={storageKey}
+      allowOverflow
       iconSrc={collapsible ? SETTINGS_PANEL_ICONS.diagnostics : undefined}
     >
       <div className="flex flex-col gap-3">
@@ -161,7 +162,7 @@ export function DiagnosticsActionsPanel({
             {isDropdownOpen ? (
               <div
                 role="listbox"
-                className="absolute z-20 mt-2 max-h-72 w-full overflow-y-auto rounded-2xl border border-zinc-800 bg-[#171818] p-2 shadow-2xl shadow-black/40"
+                className="absolute left-0 right-0 z-50 mt-2 max-h-[min(420px,70vh)] min-w-full overflow-y-auto overscroll-contain rounded-2xl border border-zinc-800 bg-[#171818] p-2 shadow-2xl shadow-black/50"
               >
                 {availableCoverDomains.map((domain) => {
                   const isCurrent = domain === currentCoverDomain;
@@ -182,8 +183,8 @@ export function DiagnosticsActionsPanel({
                         }
                       }}
                     >
-                      <div className="min-w-0">
-                        <div className="truncate text-sm font-semibold">{domain}</div>
+                      <div className="min-w-0 pr-3">
+                        <div className="break-all text-sm font-semibold">{domain}</div>
                         <div
                           className={`mt-1 text-xs leading-5 ${
                             isCurrent ? "text-emerald-300" : "text-zinc-500"

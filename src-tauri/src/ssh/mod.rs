@@ -47,7 +47,7 @@ pub(crate) const SSH_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const SSH_SESSION_ATTEMPTS: usize = 3;
 pub(crate) const SSH_RETRY_BACKOFF: Duration = Duration::from_millis(750);
 const SSH_PORT_CANDIDATES: [u16; 2] = [22, 2222];
-pub(crate) const REMOTE_DEPLOY_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const REMOTE_DEPLOY_STALL_TIMEOUT: Duration = Duration::from_secs(180);
 pub(crate) const REMOTE_DEPLOY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const MAX_FALLBACK_COVER_DOMAINS: usize = 4;
 
