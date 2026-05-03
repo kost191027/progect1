@@ -44,6 +44,8 @@ temp
 src-tauri/gen/android/app/src/main/assets/
 src-tauri/gen/android/app/libs/*.aar
 !src-tauri/gen/android/app/libs/.gitkeep
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/app/build/
 
 # Editor directories and files
 .vscode/*
