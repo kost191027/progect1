@@ -11,6 +11,8 @@ const tempRoot = resolve(
 );
 const singBoxDir = join(tempRoot, "sing-box");
 const sfaDir = join(tempRoot, "sing-box-for-android");
+const singBoxRef = process.env.RKN_LIBBOX_SING_BOX_REF || "v1.13.5";
+const sfaRef = process.env.RKN_LIBBOX_SFA_REF || "";
 const requiredAar = join(appLibsDir, "libbox.aar");
 const requiredLegacyAar = join(appLibsDir, "libbox-legacy.aar");
 
@@ -63,15 +65,24 @@ function capture(command, args, options = {}) {
   }).trim();
 }
 
-function ensureClone(targetDir, repoUrl) {
+function ensureClone(targetDir, repoUrl, ref = "") {
   if (existsSync(targetDir)) {
     log(`Reusing existing clone: ${targetDir}`);
-    run("git", ["-C", targetDir, "fetch", "--depth", "1", "origin"]);
-    run("git", ["-C", targetDir, "reset", "--hard", "origin/HEAD"]);
+    if (ref) {
+      run("git", ["-C", targetDir, "fetch", "--depth", "1", "origin", ref]);
+      run("git", ["-C", targetDir, "checkout", "--detach", "FETCH_HEAD"]);
+    } else {
+      run("git", ["-C", targetDir, "fetch", "--depth", "1", "origin"]);
+      run("git", ["-C", targetDir, "reset", "--hard", "origin/HEAD"]);
+    }
     return;
   }
 
-  run("git", ["clone", "--depth", "1", repoUrl, targetDir]);
+  if (ref) {
+    run("git", ["clone", "--depth", "1", "--branch", ref, repoUrl, targetDir]);
+  } else {
+    run("git", ["clone", "--depth", "1", repoUrl, targetDir]);
+  }
 }
 
 function ensureToolchainEnv() {
@@ -163,8 +174,9 @@ function main() {
   log("Preparing upstream worktree for libbox build...");
   ensureToolchainEnv();
   mkdirSync(tempRoot, { recursive: true });
-  ensureClone(singBoxDir, "https://github.com/SagerNet/sing-box.git");
-  ensureClone(sfaDir, "https://github.com/SagerNet/sing-box-for-android.git");
+  log(`Using sing-box ref: ${singBoxRef}`);
+  ensureClone(singBoxDir, "https://github.com/SagerNet/sing-box.git", singBoxRef);
+  ensureClone(sfaDir, "https://github.com/SagerNet/sing-box-for-android.git", sfaRef);
 
   ensureGoTool("gomobile");
   ensureGoTool("gobind");
