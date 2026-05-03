@@ -29,6 +29,10 @@ fn load_local_warp_config_sync(app: &AppHandle) -> Result<Option<RemoteWarpConfi
     Ok(Some(config))
 }
 
+pub(crate) fn has_local_warp_profile_sync(app: &AppHandle) -> Result<bool, String> {
+    Ok(load_local_warp_config_sync(app)?.is_some())
+}
+
 fn save_local_warp_config_sync(app: &AppHandle, config: &RemoteWarpConfig) -> Result<(), String> {
     validate_warp_config(config)?;
 
@@ -77,15 +81,30 @@ fn parse_endpoint(endpoint_line: &str) -> Result<(String, u16), String> {
     Ok((host.trim().to_string(), port))
 }
 
+fn normalize_wireguard_key(key: String) -> String {
+    let mut normalized = key.trim().to_string();
+    let remainder = normalized.len() % 4;
+    if remainder != 0 {
+        normalized.push_str(&"=".repeat(4 - remainder));
+    }
+    normalized
+}
+
+fn normalize_warp_config(mut config: RemoteWarpConfig) -> RemoteWarpConfig {
+    config.private_key = normalize_wireguard_key(config.private_key);
+    config.peer_public_key = normalize_wireguard_key(config.peer_public_key);
+    config
+}
+
 fn parse_compact_warp_json(value: &Value) -> Option<RemoteWarpConfig> {
-    Some(RemoteWarpConfig {
+    Some(normalize_warp_config(RemoteWarpConfig {
         private_key: json_string(value.get("private_key"))?,
         address_v4: json_string(value.get("address_v4"))?,
         address_v6: json_string(value.get("address_v6")).unwrap_or_default(),
         endpoint: json_string(value.get("endpoint"))?,
         endpoint_port: json_u16(value.get("endpoint_port"))?,
         peer_public_key: json_string(value.get("peer_public_key"))?,
-    })
+    }))
 }
 
 fn parse_wireguard_outbound_json(value: &Value) -> Option<RemoteWarpConfig> {
@@ -104,14 +123,14 @@ fn parse_wireguard_outbound_json(value: &Value) -> Option<RemoteWarpConfig> {
         .unwrap_or_default()
         .to_string();
 
-    Some(RemoteWarpConfig {
+    Some(normalize_warp_config(RemoteWarpConfig {
         private_key: json_string(value.get("private_key"))?,
         address_v4,
         address_v6,
         endpoint: json_string(value.get("server"))?,
         endpoint_port: json_u16(value.get("server_port"))?,
         peer_public_key: json_string(value.get("peer_public_key"))?,
-    })
+    }))
 }
 
 fn parse_outbound_from_singbox_config(value: &Value) -> Option<RemoteWarpConfig> {
@@ -188,7 +207,7 @@ fn parse_wgcf_profile_text(profile_text: &str) -> Result<RemoteWarpConfig, Strin
         endpoint_line.ok_or_else(|| "WARP profile is missing Endpoint.".to_string())?;
     let (endpoint, endpoint_port) = parse_endpoint(&endpoint_line)?;
 
-    Ok(RemoteWarpConfig {
+    Ok(normalize_warp_config(RemoteWarpConfig {
         private_key: private_key
             .ok_or_else(|| "WARP profile is missing PrivateKey.".to_string())?,
         address_v4,
@@ -197,7 +216,7 @@ fn parse_wgcf_profile_text(profile_text: &str) -> Result<RemoteWarpConfig, Strin
         endpoint_port,
         peer_public_key: peer_public_key
             .ok_or_else(|| "WARP profile is missing Peer PublicKey.".to_string())?,
-    })
+    }))
 }
 
 fn parse_local_warp_profile(profile_text: &str) -> Result<RemoteWarpConfig, String> {
@@ -225,7 +244,7 @@ fn parse_local_warp_profile(profile_text: &str) -> Result<RemoteWarpConfig, Stri
     Ok(parsed)
 }
 
-fn load_remote_warp_config(sess: &Session) -> Result<Option<RemoteWarpConfig>, String> {
+pub(crate) fn load_remote_warp_config(sess: &Session) -> Result<Option<RemoteWarpConfig>, String> {
     let command = r#"bash -lc '
 WARP_JSON="/opt/rkn/warp.json"
 if [ -f "$WARP_JSON" ]; then
@@ -247,6 +266,7 @@ fi
 
     let config = serde_json::from_str::<RemoteWarpConfig>(stdout.trim())
         .map_err(|e| format!("Failed to parse remote WARP JSON: {}", e))?;
+    let config = normalize_warp_config(config);
     validate_warp_config(&config)?;
 
     Ok(Some(config))
@@ -256,8 +276,9 @@ fn upload_remote_warp_config(
     sess: &Session,
     config: &RemoteWarpConfig,
 ) -> Result<RemoteWarpConfig, String> {
-    validate_warp_config(config)?;
-    let config_json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    let config = normalize_warp_config(config.clone());
+    validate_warp_config(&config)?;
+    let config_json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     let command = format!(
         r#"bash -lc '
 mkdir -p /opt/rkn
@@ -278,9 +299,43 @@ cat /opt/rkn/warp.json
 
     let uploaded = serde_json::from_str::<RemoteWarpConfig>(stdout.trim())
         .map_err(|e| format!("Failed to parse uploaded WARP JSON: {}", e))?;
+    let uploaded = normalize_warp_config(uploaded);
     validate_warp_config(&uploaded)?;
 
     Ok(uploaded)
+}
+
+fn redact_warp_bootstrap_output(output: &str) -> String {
+    let redacted = output
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("PrivateKey")
+                || trimmed.starts_with("\"private_key\"")
+                || trimmed.starts_with("private_key")
+            {
+                return "[redacted WARP private key]".to_string();
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    const MAX_REMOTE_OUTPUT_CHARS: usize = 4000;
+    if redacted.chars().count() <= MAX_REMOTE_OUTPUT_CHARS {
+        return redacted;
+    }
+
+    let mut truncated = redacted
+        .chars()
+        .take(MAX_REMOTE_OUTPUT_CHARS)
+        .collect::<String>();
+    truncated.push_str("\n[truncated]");
+    truncated
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
 pub(crate) fn ensure_remote_warp_config(
@@ -324,9 +379,10 @@ pub(crate) fn ensure_remote_warp_config(
         return Ok(existing);
     }
 
-    let command = format!(
-        r#"bash -lc '
+    let script = format!(
+        r#"
 set -e
+exec 2>&1
 
 CONFIG_DIR="/opt/rkn"
 WARP_DIR="$CONFIG_DIR/warp"
@@ -344,6 +400,28 @@ if [ -f "$WARP_JSON" ]; then
   echo "__STATUS__ existing"
   cat "$WARP_JSON"
   exit 0
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "__STEP__ install-warp-bootstrap-deps"
+  export DEBIAN_FRONTEND=noninteractive
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y
+    apt-get install -y --no-install-recommends ca-certificates curl
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y ca-certificates curl
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y ca-certificates curl
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache ca-certificates curl
+  else
+    echo "__ERROR__ curl is missing and no supported package manager was found"
+    exit 1
+  fi
+fi
+
+if command -v update-ca-certificates >/dev/null 2>&1; then
+  update-ca-certificates >/dev/null 2>&1 || true
 fi
 
 run_with_timeout() {{
@@ -376,12 +454,12 @@ cd "$WARP_DIR"
 rm -f wgcf-account.toml wgcf-profile.conf
 
 echo "__STEP__ register-wgcf"
-if ! run_with_timeout 45s "$WGCF_BIN" register --accept-tos >/dev/null 2>&1; then
-  printf "y\n" | run_with_timeout 45s "$WGCF_BIN" register >/dev/null 2>&1
+if ! run_with_timeout 45s "$WGCF_BIN" register --accept-tos; then
+  printf "y\n" | run_with_timeout 45s "$WGCF_BIN" register
 fi
 
 echo "__STEP__ generate-wgcf"
-run_with_timeout 45s "$WGCF_BIN" generate >/dev/null 2>&1
+run_with_timeout 45s "$WGCF_BIN" generate
 
 echo "__STEP__ parse-wgcf"
 set +e
@@ -445,21 +523,58 @@ EOF
 
 echo "__STATUS__ created"
 cat "$WARP_JSON"
-'"#,
+"#,
         wgcf_version = WGCF_VERSION
     );
+    let command = format!("bash -lc {}", shell_single_quote(&script));
 
     let (stdout, exit_status) = run_remote_command(sess, &command)?;
-    if exit_status != 0 {
-        let message =
-            "Automatic remote WARP bootstrap failed. Import a personal WARP profile in Server Access and redeploy.";
-        let _ = app.emit("tunnel-log", format!("[SSH:WARP] {}", message));
-        return Err(format!("{} [Automatic remote WARP bootstrap failed. Import a personal WARP profile in Server Access and redeploy.]", message));
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(step) = trimmed.strip_prefix("__STEP__") {
+            let _ = app.emit("tunnel-log", format!("[SSH:WARP] Step: {}.", step.trim()));
+        } else if let Some(error) = trimmed.strip_prefix("__ERROR__") {
+            let _ = app.emit(
+                "tunnel-log",
+                format!("[SSH:WARP] Remote bootstrap detail: {}.", error.trim()),
+            );
+        }
     }
 
-    let mut lines = stdout.lines();
-    let status_line = lines.next().unwrap_or_default().trim().to_string();
-    let json_payload = lines.collect::<Vec<_>>().join("\n");
+    if exit_status != 0 {
+        let message = "Automatic remote WARP bootstrap failed. Review the remote output below, then retry Create WARP Profile; if Cloudflare registration is unavailable from this server, import a personal WARP profile in Server Access and redeploy.";
+        let _ = app.emit("tunnel-log", format!("[SSH:WARP] {}", message));
+        let remote_output = redact_warp_bootstrap_output(stdout.trim());
+        if !remote_output.is_empty() {
+            let _ = app.emit(
+                "tunnel-log",
+                format!("[SSH:WARP] Remote output:\n{}", remote_output),
+            );
+        }
+        return Err(format!("{} Remote output: {}", message, remote_output));
+    }
+
+    let mut status_line = None::<String>;
+    let mut json_lines = Vec::<&str>::new();
+    let mut collect_json = false;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("__STATUS__") {
+            status_line = Some(trimmed.to_string());
+            collect_json = true;
+            continue;
+        }
+        if collect_json {
+            json_lines.push(line);
+        }
+    }
+    let status_line = status_line.ok_or_else(|| {
+        format!(
+            "Remote WARP bootstrap completed without a status marker. Output: {}",
+            stdout.trim()
+        )
+    })?;
+    let json_payload = json_lines.join("\n");
     let warp = serde_json::from_str::<RemoteWarpConfig>(json_payload.trim()).map_err(|e| {
         format!(
             "Failed to parse remote WARP bootstrap JSON: {}. Output: {}",
@@ -467,6 +582,7 @@ cat "$WARP_JSON"
             stdout.trim()
         )
     })?;
+    let warp = normalize_warp_config(warp);
 
     let human_status = if status_line == "__STATUS__ existing" {
         "Reusing existing remote WARP identity."

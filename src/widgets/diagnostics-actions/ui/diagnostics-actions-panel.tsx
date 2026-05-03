@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { Button } from "../../../shared/ui/button";
+import { SETTINGS_PANEL_ICONS } from "../../../shared/lib/settings-panel-icons";
 import { Panel } from "../../../shared/ui/panel";
 
 type DiagnosticsActionsPanelProps = {
@@ -10,8 +11,12 @@ type DiagnosticsActionsPanelProps = {
   diagnosticsTitle: string;
   diagnosticsDescription: string;
   diagnosticsTone: "neutral" | "ready" | "attention";
+  diagnosticsDetails?: string[];
   currentCoverDomain: string | null;
   availableCoverDomains: string[];
+  collapsible?: boolean;
+  defaultOpen?: boolean;
+  storageKey?: string;
   onCheckStatus: () => void;
   onRotateSni: (domain: string) => void;
 };
@@ -23,8 +28,12 @@ export function DiagnosticsActionsPanel({
   diagnosticsTitle,
   diagnosticsDescription,
   diagnosticsTone,
+  diagnosticsDetails,
   currentCoverDomain,
   availableCoverDomains,
+  collapsible,
+  defaultOpen,
+  storageKey,
   onCheckStatus,
   onRotateSni,
 }: DiagnosticsActionsPanelProps) {
@@ -74,6 +83,11 @@ export function DiagnosticsActionsPanel({
       title="Diagnostics"
       subtitle="Use these actions when you need extra server details or want to switch the active cover domain."
       className="bg-[#161616]"
+      collapsible={collapsible}
+      defaultOpen={defaultOpen}
+      storageKey={storageKey}
+      allowOverflow
+      iconSrc={collapsible ? SETTINGS_PANEL_ICONS.diagnostics : undefined}
     >
       <div className="flex flex-col gap-3">
         <div
@@ -90,6 +104,18 @@ export function DiagnosticsActionsPanel({
           </div>
           <div className="mt-2 text-sm font-semibold text-zinc-100">{diagnosticsTitle}</div>
           <p className="mt-2 text-sm leading-6 text-zinc-400">{diagnosticsDescription}</p>
+          {diagnosticsDetails && diagnosticsDetails.length > 0 ? (
+            <div className="mt-3 space-y-2">
+              {diagnosticsDetails.map((detail) => (
+                <div
+                  key={detail}
+                  className="rounded-xl border border-zinc-800/80 bg-black/10 px-3 py-2 text-xs leading-5 text-zinc-300"
+                >
+                  {detail}
+                </div>
+              ))}
+            </div>
+          ) : null}
         </div>
 
         <Button
@@ -136,7 +162,7 @@ export function DiagnosticsActionsPanel({
             {isDropdownOpen ? (
               <div
                 role="listbox"
-                className="absolute z-20 mt-2 max-h-72 w-full overflow-y-auto rounded-2xl border border-zinc-800 bg-[#171818] p-2 shadow-2xl shadow-black/40"
+                className="absolute left-0 right-0 z-50 mt-2 max-h-[min(420px,70vh)] min-w-full overflow-y-auto overscroll-contain rounded-2xl border border-zinc-800 bg-[#171818] p-2 shadow-2xl shadow-black/50"
               >
                 {availableCoverDomains.map((domain) => {
                   const isCurrent = domain === currentCoverDomain;
@@ -157,8 +183,8 @@ export function DiagnosticsActionsPanel({
                         }
                       }}
                     >
-                      <div className="min-w-0">
-                        <div className="truncate text-sm font-semibold">{domain}</div>
+                      <div className="min-w-0 pr-3">
+                        <div className="break-all text-sm font-semibold">{domain}</div>
                         <div
                           className={`mt-1 text-xs leading-5 ${
                             isCurrent ? "text-emerald-300" : "text-zinc-500"

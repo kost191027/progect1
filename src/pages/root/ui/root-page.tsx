@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type TouchEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 
 import { useControlCenter } from "../../../features/control-center/model/use-control-center";
@@ -11,9 +11,12 @@ import { InviteLinkModal } from "../../../shared/ui/invite-link-modal";
 
 export function RootPage() {
   const controlCenter = useControlCenter();
+  const touchStartXRef = useRef<number | null>(null);
+  const touchStartYRef = useRef<number | null>(null);
   const [activeScreen, setActiveScreen] = useState<ScreenId>(() =>
     window.localStorage.getItem("rkn.has-completed-first-start") === "true" ? "power" : "settings",
   );
+  const screenOrder: ScreenId[] = ["settings", "power", "info"];
 
   useEffect(() => {
     if (controlCenter.hasCompletedFirstStart) {
@@ -37,10 +40,67 @@ export function RootPage() {
     };
   }, []);
 
+  const handleTouchStart = (event: TouchEvent<HTMLDivElement>) => {
+    if (!controlCenter.isAndroidRuntime) {
+      return;
+    }
+
+    const touch = event.touches[0];
+    touchStartXRef.current = touch.clientX;
+    touchStartYRef.current = touch.clientY;
+  };
+
+  const handleTouchEnd = (event: TouchEvent<HTMLDivElement>) => {
+    if (!controlCenter.isAndroidRuntime) {
+      return;
+    }
+
+    const startX = touchStartXRef.current;
+    const startY = touchStartYRef.current;
+    touchStartXRef.current = null;
+    touchStartYRef.current = null;
+
+    if (startX === null || startY === null) {
+      return;
+    }
+
+    const touch = event.changedTouches[0];
+    const deltaX = touch.clientX - startX;
+    const deltaY = touch.clientY - startY;
+
+    if (Math.abs(deltaX) < 60 || Math.abs(deltaX) <= Math.abs(deltaY)) {
+      return;
+    }
+
+    const currentIndex = screenOrder.indexOf(activeScreen);
+    if (currentIndex === -1) {
+      return;
+    }
+
+    if (deltaX < 0 && currentIndex < screenOrder.length - 1) {
+      setActiveScreen(screenOrder[currentIndex + 1]);
+      return;
+    }
+
+    if (deltaX > 0 && currentIndex > 0) {
+      setActiveScreen(screenOrder[currentIndex - 1]);
+    }
+  };
+
   return (
-    <main className="min-h-screen bg-[#111111] px-4 py-5 font-sans text-white selection:bg-green-500/30 sm:px-6 sm:py-6 lg:px-8">
-      <div className="mx-auto flex min-h-screen w-full max-w-[980px] flex-col">
-        <div className="flex-1">
+    <main
+      className={`min-h-dvh bg-[#111111] px-4 font-sans text-white selection:bg-green-500/30 sm:px-5 lg:px-6 ${
+        controlCenter.isAndroidRuntime
+          ? "pb-[calc(env(safe-area-inset-bottom)+1rem)] pt-[calc(env(safe-area-inset-top)+1rem)]"
+          : "py-4 sm:py-5"
+      }`}
+    >
+      <div className="mx-auto flex min-h-dvh w-full max-w-[1100px] flex-col">
+        <div
+          className="min-h-0 flex-1 overflow-y-auto"
+          onTouchStart={handleTouchStart}
+          onTouchEnd={handleTouchEnd}
+        >
           {activeScreen === "settings" && <HomePage controlCenter={controlCenter} />}
           {activeScreen === "power" && (
             <PowerScreen
@@ -56,6 +116,7 @@ export function RootPage() {
               guardState={controlCenter.guardState}
               statusSummary={controlCenter.statusSummary}
               powerQuickStatus={controlCenter.powerQuickStatus}
+              isAndroidRuntime={controlCenter.isAndroidRuntime}
               onStart={controlCenter.startTunnel}
               onStop={controlCenter.stopTunnel}
             />
@@ -85,8 +146,12 @@ export function RootPage() {
       !controlCenter.isInviteModalOpen ? (
         <BlockingModal
           title="Configuration refresh required"
-          description="The master app changed or removed this subordinate configuration. Request a fresh invite link from the administrator, then refresh this device before starting the tunnel again."
-          actionLabel="Paste Fresh Invite Link"
+          description={
+            controlCenter.isAndroidRuntime
+              ? "The master app changed or removed this phone configuration. Request a fresh phone link from the administrator, then refresh this phone before starting protection again."
+              : "The master app changed or removed this subordinate configuration. Request a fresh invite link from the administrator, then refresh this device before starting the tunnel again."
+          }
+          actionLabel={controlCenter.isAndroidRuntime ? "Paste Fresh Link" : "Paste Fresh Invite Link"}
           isBusy={controlCenter.isImportingInvite}
           onAction={controlCenter.openInviteLinkModal}
         />
@@ -94,14 +159,20 @@ export function RootPage() {
 
       {controlCenter.isInviteModalOpen ? (
         <InviteLinkModal
-          title="Import invite link"
-          description="Paste the share link from the master app. This device will rebuild its local client config without using SSH credentials."
+          title={controlCenter.isAndroidRuntime ? "Import phone link" : "Import invite link"}
+          description={
+            controlCenter.isAndroidRuntime
+              ? "Paste the phone link from the master app. This phone will rebuild its local client config without using SSH credentials."
+              : "Paste the share link from the master app. This device will rebuild its local client config without using SSH credentials."
+          }
           value={controlCenter.inviteLinkInput}
           errorMessage={controlCenter.inviteLinkError}
           statusMessage={
             controlCenter.isImportingInvite
               ? "Valid invite link detected. Importing automatically..."
-              : "The clipboard is checked when this window opens. A valid invite link imports automatically as soon as it appears here."
+              : controlCenter.isAndroidRuntime
+                ? "The clipboard is checked when this window opens. A valid phone link imports automatically as soon as it appears here."
+                : "The clipboard is checked when this window opens. A valid invite link imports automatically as soon as it appears here."
           }
           isBusy={controlCenter.isImportingInvite}
           onChange={controlCenter.setInviteLinkInput}

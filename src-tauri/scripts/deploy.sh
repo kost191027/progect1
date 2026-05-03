@@ -81,8 +81,10 @@ echo "[INFO] Target container name: $CONTAINER_NAME"
 if ! command -v docker &> /dev/null; then
     echo "[INFO] Docker not found. Installing..."
     export NEEDRESTART_MODE=a
+    export DEBIAN_FRONTEND=noninteractive
     curl -fsSL https://get.docker.com -o get-docker.sh
-    sh get-docker.sh >/dev/null 2>&1
+    echo "[INFO] Running Docker installer. This can take a few minutes on a fresh VPS..."
+    sh get-docker.sh
     rm get-docker.sh
     echo "[INFO] Docker installed. Verifying..."
     docker version --format '{{.Server.Version}}' || { echo "[ERROR] Docker install failed"; exit 1; }

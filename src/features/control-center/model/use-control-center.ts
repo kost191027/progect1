@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { getLocalDeviceReference, isAndroidClient } from "../../../shared/lib/runtime-platform";
 
 export type GuardState = "inactive" | "active" | "engaged";
 export type UserFacingState =
@@ -27,6 +28,7 @@ export type DiagnosticsSummary = {
   title: string;
   description: string;
   tone: "neutral" | "ready" | "attention";
+  details?: string[];
 };
 
 export type SavedServerProfile = {
@@ -87,12 +89,46 @@ type InviteRemoteSyncEvent = {
   message: string;
 };
 
+type AndroidRuntimeContext = {
+  backend_hint: string;
+  session_id: string;
+  tun_fd: number;
+  tun_state: string;
+  tun_address: string;
+  tun_prefix_length: number;
+  tun_route: string;
+  tun_mtu: number;
+  config_path: string;
+  backend_config_path: string;
+  log_path: string;
+  protect_api_available: boolean;
+  backend_session_state: string;
+  backend_session_id: string;
+  backend_session_context_path: string;
+  backend_session_config_path: string;
+  backend_session_log_path: string;
+  consumer_tag: string;
+  consumer_claim_state: string;
+  consumer_claim_path: string;
+  consumer_launch_state: string;
+  consumer_launch_path: string;
+  consumer_launch_runtime: string;
+  consumer_launch_selection: string;
+  consumer_launch_summary: string;
+  consumer_session_dir: string;
+  tun_fd_ownership: string;
+};
+
 const MAX_LOG_BUFFER = 800;
+const LOG_FLUSH_INTERVAL_MS = 120;
 const HAS_COMPLETED_FIRST_START_KEY = "rkn.has-completed-first-start";
 const LAST_DEPLOYED_AT_KEY = "rkn.last-deployed-at";
 const APP_ROLE_KEY = "rkn.app-role";
 const SUBORDINATE_HOST_KEY = "rkn.subordinate-host";
 const SUBORDINATE_COVER_DOMAIN_KEY = "rkn.subordinate-cover-domain";
+const SERVER_DRAFT_HOST_KEY = "rkn.server-draft.host";
+const SERVER_DRAFT_USER_KEY = "rkn.server-draft.user";
+const SERVER_DRAFT_PASSWORD_KEY = "rkn.server-draft.password";
 const EMPTY_WARP_PROFILE_STATUS: LocalWarpProfileStatus = {
   has_profile: false,
   endpoint: null,
@@ -132,6 +168,13 @@ function profilesMatch(
   );
 }
 
+function shouldConfirmProfileReplacement(
+  currentProfile: SavedServerProfile | null,
+  nextProfile: SavedServerProfile,
+) {
+  return currentProfile !== null && !profilesMatch(currentProfile, nextProfile);
+}
+
 function stripLogPrefix(message: string) {
   return message
     .replace(/^\[(SYSTEM|WARN|ERROR|MAIN ERROR)\]\s*/i, "")
@@ -168,7 +211,13 @@ function latestLogMatching(logs: string[], marker: string) {
   return null;
 }
 
+function isAndroidTunHandoffError(message: string) {
+  return message.includes("Android TUN handoff is not implemented in the current runtime");
+}
+
 export function useControlCenter() {
+  const localDeviceReference = getLocalDeviceReference();
+  const isAndroidRuntime = isAndroidClient();
   const [isRunning, setIsRunning] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
@@ -181,10 +230,18 @@ export function useControlCenter() {
   const [isStopping, setIsStopping] = useState(false);
   const [guardState, setGuardState] = useState<GuardState>("inactive");
   const [host, setHost] = useState(() => {
-    return window.localStorage.getItem(SUBORDINATE_HOST_KEY) ?? "";
+    return (
+      window.localStorage.getItem(SUBORDINATE_HOST_KEY) ??
+      window.localStorage.getItem(SERVER_DRAFT_HOST_KEY) ??
+      ""
+    );
   });
-  const [user, setUser] = useState("root");
-  const [password, setPassword] = useState("");
+  const [user, setUser] = useState(() => {
+    return window.localStorage.getItem(SERVER_DRAFT_USER_KEY) ?? "root";
+  });
+  const [password, setPassword] = useState(() => {
+    return window.localStorage.getItem(SERVER_DRAFT_PASSWORD_KEY) ?? "";
+  });
   const [savedProfile, setSavedProfile] = useState<SavedServerProfile | null>(null);
   const [currentCoverDomain, setCurrentCoverDomain] = useState<string | null>(() => {
     return window.localStorage.getItem(SUBORDINATE_COVER_DOMAIN_KEY);
@@ -209,6 +266,10 @@ export function useControlCenter() {
   const [isWindowsRuntime, setIsWindowsRuntime] = useState(false);
   const [windowsRuntimeMode, setWindowsRuntimeMode] = useState<WindowsRuntimeMode>("tun");
   const [isSavingWindowsRuntimeMode, setIsSavingWindowsRuntimeMode] = useState(false);
+  const [isAwaitingAndroidVpnPermission, setIsAwaitingAndroidVpnPermission] =
+    useState(false);
+  const [androidRuntimeContext, setAndroidRuntimeContext] =
+    useState<AndroidRuntimeContext | null>(null);
   const [warpProfileInput, setWarpProfileInput] = useState("");
   const [warpProfileMessage, setWarpProfileMessage] = useState<string | null>(null);
   const [isCreatingWarpProfile, setIsCreatingWarpProfile] = useState(false);
@@ -229,10 +290,16 @@ export function useControlCenter() {
       ? "subordinate"
       : "master";
   });
+  const pendingLogsRef = useRef<string[]>([]);
+  const logFlushTimerRef = useRef<number | null>(null);
 
-  function appendLog(message: string) {
+  function commitLogs(messages: string[]) {
+    if (messages.length === 0) {
+      return;
+    }
+
     setLogs((prev) => {
-      const nextLogs = [...prev, message];
+      const nextLogs = [...prev, ...messages];
 
       if (nextLogs.length <= MAX_LOG_BUFFER) {
         return nextLogs;
@@ -242,17 +309,59 @@ export function useControlCenter() {
       return nextLogs.slice(-MAX_LOG_BUFFER);
     });
 
-    if (isErrorLog(message)) {
-      setLastError(stripLogPrefix(message));
+    for (const message of messages) {
+      if (isErrorLog(message)) {
+        setLastError(stripLogPrefix(message));
+        continue;
+      }
+
+      if (
+        message.startsWith("[SYSTEM]") ||
+        message.startsWith("[WARN]") ||
+        message.startsWith("---")
+      ) {
+        setLastUserMessage(stripLogPrefix(message));
+      }
+    }
+  }
+
+  function flushPendingLogs() {
+    if (logFlushTimerRef.current !== null) {
+      window.clearTimeout(logFlushTimerRef.current);
+      logFlushTimerRef.current = null;
+    }
+
+    if (pendingLogsRef.current.length === 0) {
       return;
     }
 
-    if (
-      message.startsWith("[SYSTEM]") ||
-      message.startsWith("[WARN]") ||
-      message.startsWith("---")
-    ) {
-      setLastUserMessage(stripLogPrefix(message));
+    const messages = pendingLogsRef.current;
+    pendingLogsRef.current = [];
+    commitLogs(messages);
+  }
+
+  function appendLog(message: string) {
+    pendingLogsRef.current.push(message);
+    if (logFlushTimerRef.current !== null) {
+      return;
+    }
+
+    logFlushTimerRef.current = window.setTimeout(() => {
+      flushPendingLogs();
+    }, LOG_FLUSH_INTERVAL_MS);
+  }
+
+  async function refreshAndroidRuntimeContext() {
+    if (!isAndroidRuntime) {
+      setAndroidRuntimeContext(null);
+      return;
+    }
+
+    try {
+      const snapshot = await invoke<AndroidRuntimeContext | null>("get_android_runtime_context");
+      setAndroidRuntimeContext(snapshot);
+    } catch {
+      // Android runtime context is best-effort diagnostics only.
     }
   }
 
@@ -262,9 +371,45 @@ export function useControlCenter() {
     });
 
     return () => {
+      flushPendingLogs();
       unlisten.then((cleanup) => cleanup());
     };
   }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadExistingLogTail() {
+      try {
+        const tail = await invoke<string[]>("get_tunnel_log_tail", { maxLines: 180 });
+        if (!isMounted || tail.length === 0) {
+          return;
+        }
+
+        commitLogs(tail);
+      } catch {
+        // Log history is best-effort only.
+      }
+    }
+
+    void loadExistingLogTail();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(SERVER_DRAFT_HOST_KEY, host);
+  }, [host]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SERVER_DRAFT_USER_KEY, user);
+  }, [user]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SERVER_DRAFT_PASSWORD_KEY, password);
+  }, [password]);
 
   useEffect(() => {
     const unlisten = listen<InviteRemoteSyncEvent>("invite-remote-sync", (event) => {
@@ -362,6 +507,25 @@ export function useControlCenter() {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    void refreshAndroidRuntimeContext();
+  }, [isAndroidRuntime]);
+
+  useEffect(() => {
+    if (!isAndroidRuntime || logs.length === 0) {
+      return;
+    }
+
+    const latestLine = logs[logs.length - 1] ?? "";
+    if (
+      latestLine.includes("Android TUN handoff checkpoint reached") ||
+      latestLine.includes("Android VpnService established a real TUN interface") ||
+      latestLine.includes("Android launch paths:")
+    ) {
+      void refreshAndroidRuntimeContext();
+    }
+  }, [isAndroidRuntime, logs]);
 
   useEffect(() => {
     let isMounted = true;
@@ -544,6 +708,9 @@ export function useControlCenter() {
       setIsStarting(false);
       setIsStopping(false);
       if (event.payload) {
+        setIsAwaitingAndroidVpnPermission(false);
+      }
+      if (event.payload) {
         setLastError(null);
         setLastUserMessage("Tunnel is active and ready to carry protected traffic.");
         setHasCompletedFirstStart(true);
@@ -555,6 +722,70 @@ export function useControlCenter() {
       unlisten.then((cleanup) => cleanup());
     };
   }, []);
+
+  useEffect(() => {
+    if (!isAndroidRuntime || !isAwaitingAndroidVpnPermission) {
+      return;
+    }
+
+    let cancelled = false;
+    let resumeInFlight = false;
+
+    async function resumeIfPermissionGranted() {
+      if (cancelled || resumeInFlight) {
+        return;
+      }
+
+      resumeInFlight = true;
+      try {
+        const granted = await invoke<boolean>("get_android_vpn_permission_status");
+        if (!granted || cancelled) {
+          return;
+        }
+
+        setIsAwaitingAndroidVpnPermission(false);
+        setIsStarting(true);
+        setLastError(null);
+        setLastUserMessage(
+          "Android VPN permission granted. Continuing protection start automatically.",
+        );
+        appendLog(
+          "[SYSTEM] Android VPN permission granted. Continuing protection start automatically.",
+        );
+
+        try {
+          await invoke("start_tunnel");
+          appendLog("[SYSTEM] Tunnel routing active.");
+        } catch (error) {
+          appendLog(`[ERROR] starting tunnel: ${error}`);
+          setIsStarting(false);
+        }
+      } finally {
+        resumeInFlight = false;
+      }
+    }
+
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        void resumeIfPermissionGranted();
+      }
+    };
+
+    const intervalId = window.setInterval(() => {
+      void resumeIfPermissionGranted();
+    }, 900);
+
+    window.addEventListener("focus", handleVisibility);
+    document.addEventListener("visibilitychange", handleVisibility);
+    void resumeIfPermissionGranted();
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", handleVisibility);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [isAndroidRuntime, isAwaitingAndroidVpnPermission]);
 
   useEffect(() => {
     const unlisten = listen<string>("tunnel-guard-state", (event) => {
@@ -604,19 +835,37 @@ export function useControlCenter() {
     try {
       await invoke("start_tunnel");
       appendLog("[SYSTEM] Tunnel routing active.");
+      await refreshAndroidRuntimeContext();
     } catch (error) {
+      const message = String(error);
+      if (
+        isAndroidRuntime &&
+        message.includes("Android VPN permission requested.")
+      ) {
+        setIsAwaitingAndroidVpnPermission(true);
+      }
+
+      if (isAndroidRuntime && isAndroidTunHandoffError(message)) {
+        setLastUserMessage(
+          "The phone already created a real VPN interface. The remaining blocker is the Android-native handoff backend that still has to consume this interface.",
+        );
+      }
+
       appendLog(`[ERROR] starting tunnel: ${error}`);
+      await refreshAndroidRuntimeContext();
       setIsStarting(false);
     }
   }
 
   async function stopTunnel() {
+    setIsAwaitingAndroidVpnPermission(false);
     setIsStopping(true);
     setLastUserMessage("Stopping the tunnel and removing local routing.");
 
     try {
       await invoke("stop_tunnel");
       appendLog("[SYSTEM] Tunnel routing stopped.");
+      await refreshAndroidRuntimeContext();
     } catch (error) {
       appendLog(`[ERROR] stopping tunnel: ${error}`);
       setIsStopping(false);
@@ -645,6 +894,25 @@ export function useControlCenter() {
       userMessage: string;
     },
   ) {
+    if (shouldConfirmProfileReplacement(savedProfile, profile)) {
+      const confirmed = window.confirm(
+        [
+          `This will replace the active server profile on this device.`,
+          `Current: ${savedProfile?.host ?? "unknown"}`,
+          `Next: ${profile.host}`,
+          `The previous local profile is backed up before deploy.`,
+          `Continue?`,
+        ].join("\n"),
+      );
+
+      if (!confirmed) {
+        appendLog(
+          `[SYSTEM] Deploy cancelled. The active local server profile remains ${savedProfile?.host ?? "unchanged"}.`,
+        );
+        return;
+      }
+    }
+
     setIsDeploying(true);
     setLastError(null);
     setLocalDataResetMessage(null);
@@ -684,7 +952,7 @@ export function useControlCenter() {
 
     if (!profile) {
       appendLog(
-        "[MAIN ERROR] No saved server profile is available on this Mac. Re-enter the server details before refreshing the configuration.",
+        `[MAIN ERROR] No saved server profile is available on ${localDeviceReference}. Re-enter the server details before refreshing the configuration.`,
       );
       return;
     }
@@ -915,7 +1183,7 @@ export function useControlCenter() {
       setLocalWarpProfileStatus(status);
       setWarpProfileInput("");
       setWarpProfileMessage(
-        "Local WARP profile created automatically from the current server. Future deploys on this Mac will reuse it first.",
+        `Local WARP profile created automatically from the current server. Future deploys on ${localDeviceReference} will reuse it first.`,
       );
       appendLog(
         "[SYSTEM] Local WARP profile created automatically from the current server.",
@@ -940,9 +1208,9 @@ export function useControlCenter() {
       setLocalWarpProfileStatus(EMPTY_WARP_PROFILE_STATUS);
       setWarpProfileInput("");
       setWarpProfileMessage(
-        "Imported WARP profile removed from this Mac. Future deploys will use automatic bootstrap unless you import a profile again.",
+        `Imported WARP profile removed from ${localDeviceReference}. Future deploys will use automatic bootstrap unless you import a profile again.`,
       );
-      appendLog("[SYSTEM] Imported local WARP profile removed from this Mac.");
+      appendLog(`[SYSTEM] Imported local WARP profile removed from ${localDeviceReference}.`);
     } catch (error) {
       appendLog(`[MAIN ERROR] Failed to clear the local WARP profile: ${error}`);
     } finally {
@@ -1083,7 +1351,7 @@ export function useControlCenter() {
     setWarpProfileMessage(null);
     setLocalDataResetMessage(null);
     setLastUserMessage(
-      "Removing the saved local server profile, client config, and imported WARP profile from this Mac.",
+      `Removing the saved local server profile, client config, and imported WARP profile from ${localDeviceReference}.`,
     );
     appendLog("--- RESETTING LOCAL APP DATA ---");
 
@@ -1125,13 +1393,16 @@ export function useControlCenter() {
       window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
       window.localStorage.removeItem(LAST_DEPLOYED_AT_KEY);
       window.localStorage.removeItem(HAS_COMPLETED_FIRST_START_KEY);
+      window.localStorage.removeItem(SERVER_DRAFT_HOST_KEY);
+      window.localStorage.removeItem(SERVER_DRAFT_USER_KEY);
+      window.localStorage.removeItem(SERVER_DRAFT_PASSWORD_KEY);
       setLocalDataResetMessage(
-        "Local data reset completed. This Mac is back in a clean state and ready for a fresh Deploy.",
+        `Local data reset completed. ${isAndroidRuntime ? "This phone" : "This Mac"} is back in a clean state and ready for a fresh Deploy.`,
       );
       closeInviteLinkModal();
       appendLog("[SYSTEM] Local data reset completed.");
       setLastUserMessage(
-        "Local server profile, client config, and imported WARP profile were removed from this Mac. Enter server details again to deploy a fresh config.",
+        `Local server profile, client config, and imported WARP profile were removed from ${localDeviceReference}. Enter server details again to deploy a fresh config.`,
       );
     } catch (error) {
       appendLog(`[MAIN ERROR] Local data reset failed: ${error}`);
@@ -1168,16 +1439,20 @@ export function useControlCenter() {
     if (isDeploying) {
       return {
         state: "deploying",
-        title: "Deploying server",
-        description: "The app is connecting over SSH, updating the transport stack, and preparing a fresh client config.",
+        title: isAndroidRuntime ? "Syncing phone with server" : "Deploying server",
+        description: isAndroidRuntime
+          ? "The phone is connecting over SSH, updating the transport stack, and preparing a fresh mobile client config."
+          : "The app is connecting over SSH, updating the transport stack, and preparing a fresh client config.",
       };
     }
 
     if (isStarting) {
       return {
         state: "connecting",
-        title: "Starting tunnel",
-        description: "The app is requesting permissions, launching sing-box, and waiting for the tunnel to become active.",
+        title: isAndroidRuntime ? "Starting protection" : "Starting tunnel",
+        description: isAndroidRuntime
+          ? "The phone is preparing permissions, launching sing-box, and waiting for protection to become active."
+          : "The app is requesting permissions, launching sing-box, and waiting for the tunnel to become active.",
       };
     }
 
@@ -1186,7 +1461,9 @@ export function useControlCenter() {
         state: "engaged",
         title: "Protection degraded",
         description:
-          "The proxy path is unhealthy. Safe direct routes may still work, while protected traffic stays blocked instead of leaking.",
+          isAndroidRuntime
+            ? "The proxy path is unhealthy. Some safe direct routes may still work, while protected phone traffic stays blocked instead of leaking."
+            : "The proxy path is unhealthy. Safe direct routes may still work, while protected traffic stays blocked instead of leaking.",
       };
     }
 
@@ -1194,29 +1471,44 @@ export function useControlCenter() {
       return {
         state: "protected",
         title: "Protected",
-        description: "The tunnel is running and the proxy path is currently healthy.",
+        description: isAndroidRuntime
+          ? "Phone protection is running and the proxy path is currently healthy."
+          : "The tunnel is running and the proxy path is currently healthy.",
       };
     }
 
     if (appRole === "master" && requiresRedeploy) {
       return {
         state: "error",
-        title: "Deploy required",
+        title: isAndroidRuntime ? "Sync required" : "Deploy required",
         description:
-          "Another client changed the active cover domain. Run Deploy on this device before starting the tunnel again.",
+          isAndroidRuntime
+            ? "Another client changed the active cover domain. Run Deploy on this phone before starting protection again."
+            : "Another client changed the active cover domain. Run Deploy on this device before starting the tunnel again.",
       };
     }
 
     if (appRole === "subordinate" && requiresInviteRefresh) {
       return {
         state: "error",
-        title: "Invite link update required",
+        title: isAndroidRuntime ? "Phone link update required" : "Invite link update required",
         description:
-          "The master app changed the transport configuration. Paste a fresh invite link on this device before starting the tunnel again.",
+          isAndroidRuntime
+            ? "The master app changed the transport configuration. Paste a fresh phone link on this phone before starting protection again."
+            : "The master app changed the transport configuration. Paste a fresh invite link on this device before starting the tunnel again.",
       };
     }
 
     if (lastError && !isRunning) {
+      if (isAndroidRuntime && isAndroidTunHandoffError(lastError)) {
+        return {
+          state: "error",
+          title: "Android handoff required",
+          description:
+            "VpnService and the mobile TUN interface are ready. The remaining blocker is the Android-native backend that must take over this interface for real protected traffic.",
+        };
+      }
+
       return {
         state: "error",
         title: "Attention needed",
@@ -1226,10 +1518,11 @@ export function useControlCenter() {
 
     return {
       state: "inactive",
-      title: "Tunnel inactive",
+      title: isAndroidRuntime ? "Protection inactive" : "Tunnel inactive",
       description: lastUserMessage,
     };
   }, [
+    isAndroidRuntime,
     appRole,
     guardState,
     isDeploying,
@@ -1274,10 +1567,18 @@ export function useControlCenter() {
   const serverStatusSummary = useMemo<ServerStatusSummary>(() => {
     if (appRole === "subordinate") {
       return {
-        title: requiresInviteRefresh ? "Needs fresh invite link" : "Managed by master app",
+        title: requiresInviteRefresh
+          ? isAndroidRuntime
+            ? "Needs fresh phone link"
+            : "Needs fresh invite link"
+          : "Managed by master app",
         description: requiresInviteRefresh
-          ? "This invite link is no longer accepted by the master app. Ask for a fresh invite link, or unlink this app and configure it as a master app again."
-          : "This installation is meant to receive and refresh its client config from a master app. Server deploy and SNI rotation stay disabled here.",
+          ? isAndroidRuntime
+            ? "This phone link is no longer accepted by the master app. Ask for a fresh phone link, or unlink this phone and configure it as a master app again."
+            : "This invite link is no longer accepted by the master app. Ask for a fresh invite link, or unlink this app and configure it as a master app again."
+          : isAndroidRuntime
+            ? "This phone is meant to receive and refresh its client config from a master app. Server deploy and SNI rotation stay disabled here."
+            : "This installation is meant to receive and refresh its client config from a master app. Server deploy and SNI rotation stay disabled here.",
         tone: requiresInviteRefresh ? "attention" : "ready",
       };
     }
@@ -1293,34 +1594,40 @@ export function useControlCenter() {
     if (!savedProfile) {
       return {
         title: "Ready for first deploy",
-        description: "The current server details are filled in. Deploy will prepare the node and create a client config.",
+        description: isAndroidRuntime
+          ? "The current server details are filled in. Deploy will prepare the node and create a phone client config."
+          : "The current server details are filled in. Deploy will prepare the node and create a client config.",
         tone: "neutral",
       };
     }
 
     if (!profilesMatch(savedProfile, currentProfile)) {
       return {
-        title: "Needs deploy",
-        description: "The server details were changed locally. Run Deploy to apply the new configuration.",
+        title: isAndroidRuntime ? "Needs sync" : "Needs deploy",
+        description: isAndroidRuntime
+          ? "The server details were changed locally. Run Deploy to sync the phone with the new configuration."
+          : "The server details were changed locally. Run Deploy to apply the new configuration.",
         tone: "attention",
       };
     }
 
     if (requiresRedeploy) {
       return {
-        title: "Needs deploy",
+        title: isAndroidRuntime ? "Needs sync" : "Needs deploy",
         description:
-          "Another client changed the active cover domain. Run Deploy on this Mac to refresh the local client config before starting the tunnel.",
+          `Another client changed the active cover domain. Run Deploy on ${localDeviceReference} to refresh the local client config before starting the tunnel.`,
         tone: "attention",
       };
     }
 
     return {
       title: "Configured",
-      description: "The current server profile matches the last successful deploy and is ready to use.",
+      description: isAndroidRuntime
+        ? "The current server profile matches the last successful deploy and is ready to protect this phone."
+        : "The current server profile matches the last successful deploy and is ready to use.",
       tone: "ready",
     };
-  }, [appRole, currentProfile, host, password, requiresRedeploy, savedProfile, user]);
+  }, [appRole, currentProfile, host, isAndroidRuntime, password, requiresRedeploy, savedProfile, user]);
 
   const diagnosticsSummary = useMemo<DiagnosticsSummary>(() => {
     const runtimeHealth = latestLogMatching(logs, "Runtime health:");
@@ -1329,6 +1636,43 @@ export function useControlCenter() {
     const warpKeepalive = latestLogMatching(logs, "WARP peer keepalive:");
     const shadowTlsNoise = latestLogMatching(logs, "ShadowTLS noise:");
     const coexistenceSnapshot = latestLogMatching(logs, "Coexistence snapshot:");
+
+    if (
+      isAndroidRuntime &&
+      androidRuntimeContext?.backend_hint === "android_native_handoff_required"
+    ) {
+      return {
+        title: "Android handoff checkpoint",
+        description:
+          "VpnService already owns the mobile TUN interface. The remaining blocker is the next 6A.4.1 backend that must consume this Android-owned interface instead of the standalone CLI path.",
+        tone: "attention",
+        details: [
+          `Handoff session: ${androidRuntimeContext.session_id}`,
+          `TUN state: ${androidRuntimeContext.tun_state}`,
+          `TUN fd: ${androidRuntimeContext.tun_fd}`,
+          `TUN address: ${androidRuntimeContext.tun_address}/${androidRuntimeContext.tun_prefix_length}`,
+          `TUN route: ${androidRuntimeContext.tun_route}`,
+          `TUN mtu: ${androidRuntimeContext.tun_mtu}`,
+          `Config: ${androidRuntimeContext.config_path}`,
+          `Backend config: ${androidRuntimeContext.backend_config_path}`,
+          `Log: ${androidRuntimeContext.log_path}`,
+          `Protect API: ${androidRuntimeContext.protect_api_available ? "available" : "unavailable"}`,
+          `Backend session: ${androidRuntimeContext.backend_session_state}`,
+          `Backend session id: ${androidRuntimeContext.backend_session_id}`,
+          `Backend session context: ${androidRuntimeContext.backend_session_context_path}`,
+          `Consumer tag: ${androidRuntimeContext.consumer_tag || "not prepared"}`,
+          `Consumer claim: ${androidRuntimeContext.consumer_claim_state}`,
+          `Consumer claim path: ${androidRuntimeContext.consumer_claim_path || "not created"}`,
+          `Consumer seam: ${androidRuntimeContext.consumer_launch_state || "idle"}`,
+          `Consumer runtime: ${androidRuntimeContext.consumer_launch_runtime || "unknown"}`,
+          `Consumer selection: ${androidRuntimeContext.consumer_launch_selection || "not resolved"}`,
+          `Consumer summary: ${androidRuntimeContext.consumer_launch_summary || "not available"}`,
+          `Consumer session dir: ${androidRuntimeContext.consumer_session_dir || "not created"}`,
+          `TUN fd ownership: ${androidRuntimeContext.tun_fd_ownership || "not specified"}`,
+          `Consumer seam status: ${androidRuntimeContext.consumer_launch_path || "not created"}`,
+        ],
+      };
+    }
 
     if (!runtimeHealth && !warpRouting && !shadowTlsNoise && !coexistenceSnapshot) {
       return {
@@ -1364,20 +1708,20 @@ export function useControlCenter() {
           .join(" "),
       tone: "ready",
     };
-  }, [logs]);
+  }, [androidRuntimeContext, isAndroidRuntime, logs]);
 
   const powerQuickStatus = useMemo(() => {
     if (isDeploying) {
-      return "Deploying server";
+      return isAndroidRuntime ? "Syncing phone" : "Deploying server";
     }
 
     if (appRole === "subordinate") {
       if (requiresInviteRefresh) {
-        return "Needs fresh invite";
+        return isAndroidRuntime ? "Needs fresh link" : "Needs fresh invite";
       }
 
       if (isStarting) {
-        return "Connecting";
+        return isAndroidRuntime ? "Starting protection" : "Connecting";
       }
 
       if (isRunning && guardState === "engaged") {
@@ -1388,19 +1732,19 @@ export function useControlCenter() {
         return "Protected";
       }
 
-      return "Ready to start";
+      return isAndroidRuntime ? "Ready to protect" : "Ready to start";
     }
 
     if (!savedProfile || !profilesMatch(savedProfile, currentProfile)) {
-      return "Needs deploy";
+      return isAndroidRuntime ? "Needs sync" : "Needs deploy";
     }
 
     if (requiresRedeploy) {
-      return "Needs deploy";
+      return isAndroidRuntime ? "Needs sync" : "Needs deploy";
     }
 
     if (isStarting) {
-      return "Connecting";
+      return isAndroidRuntime ? "Starting protection" : "Connecting";
     }
 
     if (isRunning && guardState === "engaged") {
@@ -1411,11 +1755,12 @@ export function useControlCenter() {
       return "Protected";
     }
 
-    return "Ready to start";
+    return isAndroidRuntime ? "Ready to protect" : "Ready to start";
   }, [
     appRole,
     currentProfile,
     guardState,
+    isAndroidRuntime,
     isDeploying,
     isRunning,
     isStarting,
@@ -1447,6 +1792,8 @@ export function useControlCenter() {
     localWarpProfileStatus,
     isWindowsRuntime,
     windowsRuntimeMode,
+    isAndroidRuntime,
+    localDeviceReference,
     isSavingWindowsRuntimeMode,
     warpProfileInput,
     warpProfileMessage,

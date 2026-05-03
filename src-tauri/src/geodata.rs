@@ -112,9 +112,36 @@ fn local_rule_set_path(app: &AppHandle, tag: &str) -> Result<PathBuf, String> {
     Ok(local_rule_set_dir(app)?.join(format!("{tag}.srs")))
 }
 
+#[cfg(target_os = "android")]
+fn bundled_rule_set_bytes(tag: &str) -> Option<&'static [u8]> {
+    match tag {
+        "geoip-ru" => Some(include_bytes!("../assets/rule-set/geoip-ru.srs")),
+        "geosite-category-gov-ru" => Some(include_bytes!(
+            "../assets/rule-set/geosite-category-gov-ru.srs"
+        )),
+        "geosite-yandex" => Some(include_bytes!("../assets/rule-set/geosite-yandex.srs")),
+        "geosite-vk" => Some(include_bytes!("../assets/rule-set/geosite-vk.srs")),
+        GOOGLE_RULE_SET_TAG => Some(include_bytes!("../assets/rule-set/geosite-google.srs")),
+        _ => None,
+    }
+}
+
+fn write_rule_set_file(path: &PathBuf, bytes: &[u8]) -> Result<(), String> {
+    let temp_path = path.with_extension("tmp");
+    std::fs::write(&temp_path, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&temp_path, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 async fn download_rule_set_file(url: &str, path: &PathBuf) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    let timeout = Duration::from_secs(8);
+    #[cfg(not(target_os = "android"))]
+    let timeout = Duration::from_secs(20);
+
     let client = Client::builder()
-        .timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(timeout)
         .build()
         .map_err(|e| e.to_string())?;
     let response = client.get(url).send().await.map_err(|e| e.to_string())?;
@@ -123,13 +150,7 @@ async fn download_rule_set_file(url: &str, path: &PathBuf) -> Result<(), String>
     }
 
     let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    let temp_path = path.with_extension("tmp");
-    tokio::fs::write(&temp_path, &bytes)
-        .await
-        .map_err(|e| e.to_string())?;
-    tokio::fs::rename(&temp_path, path)
-        .await
-        .map_err(|e| e.to_string())?;
+    write_rule_set_file(path, &bytes)?;
     Ok(())
 }
 
@@ -147,6 +168,46 @@ pub async fn ensure_local_client_rule_sets(
         };
 
         let path = local_rule_set_path(app, tag)?;
+        #[cfg(target_os = "android")]
+        if let Some(bytes) = bundled_rule_set_bytes(rule_set.tag) {
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SYSTEM] Restoring bundled local rule-set {} for Android runtime...",
+                    rule_set.tag
+                ),
+            );
+
+            match write_rule_set_file(&path, bytes) {
+                Ok(()) => {
+                    let _ = app.emit(
+                        "tunnel-log",
+                        format!(
+                            "[SYSTEM] Bundled local rule-set {} restored at {}.",
+                            rule_set.tag,
+                            path.display()
+                        ),
+                    );
+                }
+                Err(error) => {
+                    let _ = app.emit(
+                        "tunnel-log",
+                        format!(
+                            "[WARN] Failed to restore bundled local rule-set {}: {}. Falling back to suffix-only rules for now.",
+                            rule_set.tag, error
+                        ),
+                    );
+                    continue;
+                }
+            }
+
+            assets.push(LocalRuleSetAsset {
+                tag: rule_set.tag,
+                path,
+            });
+            continue;
+        }
+
         if !path.exists() {
             let _ = app.emit(
                 "tunnel-log",

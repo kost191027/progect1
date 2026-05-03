@@ -1,0 +1,62 @@
+name: Android Test Build
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+defaults:
+  run:
+    working-directory: .
+
+jobs:
+  android-test-scaffold:
+    name: Prepare Android Test Build Path
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Android test build prerequisites
+        shell: bash
+        run: |
+          missing=0
+
+          if [[ ! -d "src-tauri/gen/android" ]]; then
+            echo "Android scaffold is missing: src-tauri/gen/android"
+            missing=1
+          fi
+
+          if [[ ! -f "src-tauri/bins/sing-box-aarch64-linux-android" ]]; then
+            echo "Android sidecar is missing: src-tauri/bins/sing-box-aarch64-linux-android"
+            missing=1
+          fi
+
+          {
+            echo "## Android Test Build"
+            echo
+            echo "This workflow is intentionally staged early."
+            echo
+            echo "- It is reserved for the Android APK artifact pipeline after 6A.2 sidecar delivery is wired."
+            echo "- It stays separate from the desktop release workflow on purpose."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$missing" -ne 0 ]]; then
+            {
+              echo
+              echo "### Current status"
+              echo
+              echo "Android test build prerequisites are not complete yet."
+              echo "Once the Android sidecar is committed, this workflow can be extended into a real APK build pipeline."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo
+            echo "### Ready for next step"
+            echo
+            echo "Android scaffold and sidecar are present. The workflow can now be upgraded to a real APK artifact build."
+          } >> "$GITHUB_STEP_SUMMARY"

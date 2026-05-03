@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">RKN</string>
+    <string name="main_activity_title">RKN</string>
+    <string name="android_tunnel_notification_channel_name">RKN tunnel runtime</string>
+    <string name="android_tunnel_notification_channel_description">Keeps the Android tunnel runtime visible while background work is active.</string>
+    <string name="android_tunnel_notification_title">RKN is active</string>
+    <string name="android_tunnel_notification_text">The Android tunnel runtime foundation is alive. Full VPN wiring comes next.</string>
+    <string name="android_tunnel_notification_action_open">Open app</string>
+    <string name="android_tunnel_notification_action_stop">Stop</string>
+</resources>

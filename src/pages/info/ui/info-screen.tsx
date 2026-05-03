@@ -1,5 +1,8 @@
 import { APP_BUILD, APP_VERSION } from "../../../shared/config/app-info";
+import { getLocalDeviceReference } from "../../../shared/lib/runtime-platform";
 import { ScreenHeader } from "../../../shared/ui/screen-header";
+
+const localDeviceReference = getLocalDeviceReference();
 
 const faqItems = [
   {
@@ -8,7 +11,7 @@ const faqItems = [
   },
   {
     title: "Is the app private and safe to use?",
-    body: "The app talks directly to your server over SSH and does not use a third-party backend for your server credentials or tunnel traffic. For convenience, the current MVP stores the last successful server credentials locally on this Mac so you do not need to type them every launch. They are not synced to cloud services, and the traffic itself is handled by sing-box on your device and your own server.",
+    body: `The app talks directly to your server over SSH and does not use a third-party backend for your server credentials or tunnel traffic. For convenience, the current MVP stores the last successful server credentials locally on ${localDeviceReference} so you do not need to type them every launch. They are not synced to cloud services, and the traffic itself is handled by sing-box on your device and your own server.`,
   },
   {
     title: "What server is recommended?",
@@ -39,6 +42,10 @@ const faqItems = [
     body: "Yes. RKN now supports both macOS and Windows desktop builds. On Windows, the app uses the same deploy and tunnel flow, but the local tunnel start may require administrator confirmation and can be affected by Windows Firewall, antivirus checks, or Wintun driver policies on the current machine.",
   },
   {
+    title: "Does the app support Android?",
+    body: "Yes. Android support is now being built as a real mobile client path, not just a wrapped desktop shell. The current track already covers packaging, sidecar delivery, and on-device visual smoke tests. Full mobile tunnel behavior will keep expanding as the Android VPN runtime and lifecycle work lands in the next implementation steps.",
+  },
+  {
     title: "What about distribution and licenses?",
     body: "This build is intended for a self-hosted workflow. Third-party components, including sing-box, keep their own upstream licenses and notices. If you redistribute packaged builds, preserve those notices and review the final licensing policy for the project build you ship.",
   },
@@ -46,7 +53,7 @@ const faqItems = [
 
 export function InfoScreen() {
   return (
-    <section className="flex flex-col gap-4 rounded-2xl border border-zinc-800 bg-[#161717] px-6 py-6 sm:px-8">
+    <section className="flex flex-col gap-4 lg:gap-5">
       <ScreenHeader
         screenName="Info"
         title="Setup notes and FAQ"
@@ -79,7 +86,7 @@ export function InfoScreen() {
         ))}
       </div>
 
-      <footer className="pt-2 text-xs text-zinc-500">
+      <footer className="pt-2 text-center text-xs text-zinc-500">
         Version {APP_VERSION} | Build {APP_BUILD}
       </footer>
     </section>

@@ -17,8 +17,9 @@ use super::{
     acquire_remote_mutation_lock, clear_cached_transport_bootstrap, connect_ssh_session,
     ensure_local_client_rule_sets_sync, ensure_master_role, load_cached_transport_bootstrap,
     load_remote_container_name, load_remote_transport_bootstrap, local_client_config_path,
-    remove_saved_server_profile, save_backend_app_role, save_cached_transport_bootstrap,
-    BackendAppRole, LocalInstallationState, RemoteInviteRecord, RemoteTransportBootstrap,
+    pinned_sing_box_image_for_routing_mode, remove_saved_server_profile, save_backend_app_role,
+    save_cached_transport_bootstrap, BackendAppRole, LocalInstallationState, RemoteInviteRecord,
+    RemoteTransportBootstrap,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,16 +160,27 @@ pub(crate) fn resolve_master_ss_transport(
     remote_bootstrap: &RemoteTransportBootstrap,
 ) -> Result<(String, String, String), String> {
     if !remote_bootstrap.ss_server_password.is_empty() {
-        let (_, master_user_password) = split_multi_user_ss_password(&remote_bootstrap.ss_password)
-            .ok_or_else(|| {
-                "Remote bootstrap is missing the master multi-user Shadowsocks password."
-                    .to_string()
-            })?;
+        let master_user_password = if let Some((_, master_user_password)) =
+            split_multi_user_ss_password(&remote_bootstrap.ss_password)
+        {
+            master_user_password
+        } else {
+            let _ = app.emit(
+                    "tunnel-log",
+                    "[SSH WARN] Remote bootstrap has a server Shadowsocks password but the master client password is still in the legacy single-password format. Migrating this device to a multi-user Shadowsocks credential while preserving the server password."
+                        .to_string(),
+                );
+            tauri::async_runtime::block_on(crate::generator::generate_ss_password(app))?
+        };
+        let master_combined_password = compose_multi_user_ss_password(
+            &remote_bootstrap.ss_server_password,
+            &master_user_password,
+        );
 
         return Ok((
             remote_bootstrap.ss_server_password.clone(),
             master_user_password,
-            remote_bootstrap.ss_password.clone(),
+            master_combined_password,
         ));
     }
 
@@ -283,7 +295,11 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
     let synced_invites = build_remote_invites_from_records(&records, &remote_bootstrap)?;
     let (ss_server_password, master_ss_user_password, master_combined_password) =
         resolve_master_ss_transport(app, &remote_bootstrap)?;
-    let warp_config = ensure_remote_warp_config(app, &sess)?;
+    let warp_config = if remote_bootstrap.routing_mode == "warp" {
+        Some(ensure_remote_warp_config(app, &sess)?)
+    } else {
+        None
+    };
     let server_cfg =
         crate::generator::build_server_config_with_invites(crate::generator::ServerConfigParams {
             master_shadow_pass: &remote_bootstrap.shadow_pass,
@@ -291,14 +307,16 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
             master_ss_user_password: &master_ss_user_password,
             external_port: remote_bootstrap.external_port,
             internal_ss_port: remote_bootstrap.internal_ss_port,
+            routing_mode: &remote_bootstrap.routing_mode,
             cover_domain: &remote_bootstrap.cover_domain,
             fallback_cover_domains: &remote_bootstrap.fallback_cover_domains,
             issued_invites: &synced_invites,
-            warp: &warp_config,
+            warp: warp_config.as_ref(),
         });
     let bootstrap_cfg = json!({
         "external_port": remote_bootstrap.external_port,
         "internal_ss_port": remote_bootstrap.internal_ss_port,
+        "routing_mode": remote_bootstrap.routing_mode,
         "cover_domain": remote_bootstrap.cover_domain,
         "fallback_cover_domains": remote_bootstrap.fallback_cover_domains,
         "shadow_pass": remote_bootstrap.shadow_pass,
@@ -314,6 +332,7 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
             container_name: &container_name,
             external_port: remote_bootstrap.external_port,
             internal_ss_port: remote_bootstrap.internal_ss_port,
+            sing_box_image: pinned_sing_box_image_for_routing_mode(&remote_bootstrap.routing_mode),
             server_cfg: &server_cfg,
             bootstrap_cfg: &bootstrap_cfg,
         },

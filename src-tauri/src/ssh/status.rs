@@ -6,9 +6,10 @@ use super::invite::resolve_master_ss_transport;
 use super::warp::{ensure_remote_warp_config, load_saved_server_profile};
 use super::{
     acquire_remote_mutation_lock, build_rotated_cover_domain_history, connect_ssh_session,
-    emit_ssh_stage, ensure_local_client_rule_sets_sync, ensure_master_role,
-    load_local_client_transport_state, load_remote_container_name, load_remote_transport_bootstrap,
-    monitored_port_pattern, run_remote_command, save_cached_transport_bootstrap,
+    connect_ssh_session_quiet, emit_ssh_stage, ensure_local_client_rule_sets_sync,
+    ensure_master_role, load_local_client_transport_state, load_remote_container_name,
+    load_remote_transport_bootstrap, monitored_port_pattern,
+    pinned_sing_box_image_for_routing_mode, run_remote_command, save_cached_transport_bootstrap,
     LocalClientTransportState, RemoteTransportBootstrap, TransportStateSnapshot,
 };
 
@@ -25,7 +26,10 @@ fn local_transport_requires_redeploy(
         || local_state.ss_password != remote_bootstrap.ss_password
 }
 
-fn load_transport_state_snapshot_sync(app: &AppHandle) -> Result<TransportStateSnapshot, String> {
+fn load_transport_state_snapshot_sync(
+    app: &AppHandle,
+    emit_ssh_logs: bool,
+) -> Result<TransportStateSnapshot, String> {
     let available_cover_domains = crate::generator::available_cover_domains();
     let local_state = load_local_client_transport_state(app)?;
 
@@ -38,7 +42,11 @@ fn load_transport_state_snapshot_sync(app: &AppHandle) -> Result<TransportStateS
         });
     };
 
-    let sess = connect_ssh_session(app, &profile.host, &profile.user, &profile.password)?;
+    let sess = if emit_ssh_logs {
+        connect_ssh_session(app, &profile.host, &profile.user, &profile.password)?
+    } else {
+        connect_ssh_session_quiet(app, &profile.host, &profile.user, &profile.password)?
+    };
     let remote_bootstrap = load_remote_transport_bootstrap(&sess)?;
 
     let Some(remote_bootstrap) = remote_bootstrap else {
@@ -63,24 +71,46 @@ fn load_transport_state_snapshot_sync(app: &AppHandle) -> Result<TransportStateS
     })
 }
 
+#[cfg(target_os = "android")]
 pub(crate) async fn ensure_local_transport_is_current(app: &AppHandle) -> Result<(), String> {
     let check_app = app.clone();
     let snapshot_result = tauri::async_runtime::spawn_blocking(move || {
-        load_transport_state_snapshot_sync(&check_app)
+        load_transport_state_snapshot_sync(&check_app, true)
     })
     .await
     .unwrap();
 
+    ensure_transport_snapshot_current(app, snapshot_result, true)
+}
+
+pub(crate) async fn ensure_local_transport_is_current_quiet(app: &AppHandle) -> Result<(), String> {
+    let check_app = app.clone();
+    let snapshot_result = tauri::async_runtime::spawn_blocking(move || {
+        load_transport_state_snapshot_sync(&check_app, false)
+    })
+    .await
+    .unwrap();
+
+    ensure_transport_snapshot_current(app, snapshot_result, false)
+}
+
+fn ensure_transport_snapshot_current(
+    app: &AppHandle,
+    snapshot_result: Result<TransportStateSnapshot, String>,
+    emit_warning: bool,
+) -> Result<(), String> {
     let snapshot = match snapshot_result {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            let _ = app.emit(
-                "tunnel-log",
-                format!(
-                    "[WARN] Unable to verify whether this device is in sync with the remote transport before starting the tunnel: {}",
-                    error
-                ),
-            );
+            if emit_warning {
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[WARN] Unable to verify whether this device is in sync with the remote transport: {}",
+                        error
+                    ),
+                );
+            }
             return Ok(());
         }
     };
@@ -141,6 +171,9 @@ fn summarize_server_status_output(stdout: &str) -> Vec<String> {
     let warp_enabled = stdout.contains(r#""tag": "warp""#)
         && (stdout.contains(r#""final": "warp""#) || stdout.contains(r#""outbound": "warp""#));
     let fatal_count = stdout.matches("FATAL").count();
+    let local_address_schema_error = stdout.contains(r#"unknown field "local_address""#);
+    let external_port_not_listening =
+        stdout.contains("external port") && stdout.contains("is not listening");
     let hmac_mismatch_count = stdout
         .matches("client hello verify failed: hmac mismatch")
         .count();
@@ -202,6 +235,20 @@ fn summarize_server_status_output(stdout: &str) -> Vec<String> {
         ));
     }
 
+    if local_address_schema_error {
+        summary.push(
+            "Server config compatibility: WARP local_address requires the pinned server sing-box v1.10.7 runtime. Run Deploy/Update to repair the RKN container image/config pair."
+                .to_string(),
+        );
+    }
+
+    if external_port_not_listening {
+        summary.push(
+            "Server transport unhealthy: the selected external port is not listening. Deploy/Update should recreate the RKN container or choose the next free port."
+                .to_string(),
+        );
+    }
+
     let transport_noise_count =
         hmac_mismatch_count + unexpected_session_count + unexpected_eof_count;
     if transport_noise_count > 0 && fatal_count == 0 {
@@ -209,6 +256,13 @@ fn summarize_server_status_output(stdout: &str) -> Vec<String> {
             "ShadowTLS noise: {} external handshake mismatch / scan event(s) seen recently. These warnings are usually background internet noise unless the client itself is failing.",
             transport_noise_count
         ));
+    }
+
+    if hmac_mismatch_count > 0 && !running {
+        summary.push(
+            "ShadowTLS health: handshake mismatches are present while the runtime is unhealthy; refresh local config from the remote bootstrap before rotating credentials."
+                .to_string(),
+        );
     }
 
     if !known_service_matches.is_empty() {
@@ -228,7 +282,7 @@ fn summarize_server_status_output(stdout: &str) -> Vec<String> {
 pub async fn get_transport_state_snapshot(
     app: AppHandle,
 ) -> Result<TransportStateSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(move || load_transport_state_snapshot_sync(&app))
+    tauri::async_runtime::spawn_blocking(move || load_transport_state_snapshot_sync(&app, true))
         .await
         .unwrap()
 }
@@ -241,7 +295,10 @@ pub async fn check_server_status(app: AppHandle) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _ = app.emit(
             "tunnel-log",
-            format!("--- [SSH] Checking server status on {}:22 ---", profile.host),
+            format!(
+                "--- [SSH] Checking server status on {} (ports 22/2222) ---",
+                profile.host
+            ),
         );
 
         let sess = connect_ssh_session(&app, &profile.host, &profile.user, &profile.password)?;
@@ -282,11 +339,11 @@ fi
         for line in summarize_server_status_output(&stdout) {
             let _ = app.emit("tunnel-log", format!("[SYSTEM] {}", line));
         }
-        for line in stdout.lines() {
-            if !line.trim().is_empty() {
-                let _ = app.emit("tunnel-log", format!("[SERVER STATUS] {}", line));
-            }
-        }
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Full server diagnostic dump was collected and returned to the diagnostic view without streaming every line into the live tunnel log."
+                .to_string(),
+        );
 
         if exit_status == 0 {
             Ok(stdout)
@@ -395,7 +452,15 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
 
         let (ss_server_password, master_ss_user_password, master_combined_password) =
             resolve_master_ss_transport(&rotate_app, &remote_bootstrap)?;
-        let warp_config = ensure_remote_warp_config(&rotate_app, &sess)?;
+        let warp_config = if remote_bootstrap.routing_mode == "warp" {
+            Some(ensure_remote_warp_config(&rotate_app, &sess)?)
+        } else {
+            let _ = rotate_app.emit(
+                "tunnel-log",
+                "[SYSTEM] Remote server currently uses direct egress. Preserving that mode during cover-domain rotation.".to_string(),
+            );
+            None
+        };
         let server_cfg = crate::generator::build_server_config_with_invites(
             crate::generator::ServerConfigParams {
                 master_shadow_pass: &remote_bootstrap.shadow_pass,
@@ -403,10 +468,11 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
                 master_ss_user_password: &master_ss_user_password,
                 external_port: remote_bootstrap.external_port,
                 internal_ss_port: remote_bootstrap.internal_ss_port,
+                routing_mode: &remote_bootstrap.routing_mode,
                 cover_domain,
                 fallback_cover_domains: &fallback_cover_domains,
                 issued_invites: &remote_bootstrap.issued_invites,
-                warp: &warp_config,
+                warp: warp_config.as_ref(),
             },
         );
         let local_rule_sets = ensure_local_client_rule_sets_sync(&rotate_app)?;
@@ -421,6 +487,7 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
         let bootstrap_cfg = json!({
             "external_port": remote_bootstrap.external_port,
             "internal_ss_port": remote_bootstrap.internal_ss_port,
+            "routing_mode": remote_bootstrap.routing_mode,
             "cover_domain": cover_domain,
             "fallback_cover_domains": fallback_cover_domains,
             "shadow_pass": remote_bootstrap.shadow_pass,
@@ -442,6 +509,9 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
                 container_name: &container_name,
                 external_port: remote_bootstrap.external_port,
                 internal_ss_port: remote_bootstrap.internal_ss_port,
+                sing_box_image: pinned_sing_box_image_for_routing_mode(
+                    &remote_bootstrap.routing_mode,
+                ),
                 server_cfg: &server_cfg,
                 bootstrap_cfg: &bootstrap_cfg,
             },
@@ -454,6 +524,7 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
         let rotated_bootstrap = super::RemoteTransportBootstrap {
             external_port: remote_bootstrap.external_port,
             internal_ss_port: remote_bootstrap.internal_ss_port,
+            routing_mode: remote_bootstrap.routing_mode,
             cover_domain: cover_domain.to_string(),
             fallback_cover_domains,
             shadow_pass: remote_bootstrap.shadow_pass,
