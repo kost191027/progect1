@@ -8,6 +8,7 @@ mod warp;
 pub(crate) use invite::clear_issued_invites;
 #[cfg(target_os = "android")]
 pub(crate) use status::ensure_local_transport_is_current;
+#[cfg(not(target_os = "android"))]
 pub(crate) use status::ensure_local_transport_is_current_quiet;
 pub(crate) use warp::clear_local_warp_profile_sync;
 
