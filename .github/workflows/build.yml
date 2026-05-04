@@ -88,7 +88,20 @@ jobs:
           echo "VITE_APP_VERSION=${version}" >> "$GITHUB_ENV"
 
       - name: Build Tauri release
-        run: npm run tauri build -- --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set +e
+          npm run tauri build -- --target ${{ matrix.target }}
+          status=$?
+          set -e
+
+          if [[ "${status}" -eq 0 ]]; then
+            exit 0
+          fi
+
+          echo "Tauri macOS bundle failed once. Retrying the same build after cleaning the transient bundle directory..."
+          rm -rf "src-tauri/target/${{ matrix.target }}/release/bundle"
+          npm run tauri build -- --target ${{ matrix.target }}
 
       - name: Normalize release asset names
         id: package
@@ -349,10 +362,50 @@ jobs:
         run: npm run android:doctor
 
       - name: Build Android APK
-        run: npm run tauri:android:build:apk
+        shell: bash
+        run: |
+          set +e
+          npm run tauri:android:build:apk
+          status=$?
+          set -e
+
+          if [[ "${status}" -eq 0 ]]; then
+            exit 0
+          fi
+
+          echo "::group::Android Gradle failure diagnostics"
+          src-tauri/gen/android/gradlew \
+            --project-dir src-tauri/gen/android \
+            :app:assembleUniversalRelease \
+            --stacktrace \
+            --warning-mode all \
+            --console=plain || true
+          echo "::endgroup::"
+
+          exit "${status}"
 
       - name: Build Android AAB
-        run: npm run tauri:android:build:aab
+        shell: bash
+        run: |
+          set +e
+          npm run tauri:android:build:aab
+          status=$?
+          set -e
+
+          if [[ "${status}" -eq 0 ]]; then
+            exit 0
+          fi
+
+          echo "::group::Android Gradle bundle diagnostics"
+          src-tauri/gen/android/gradlew \
+            --project-dir src-tauri/gen/android \
+            :app:bundleUniversalRelease \
+            --stacktrace \
+            --warning-mode all \
+            --console=plain || true
+          echo "::endgroup::"
+
+          exit "${status}"
 
       - name: Normalize Android release asset names
         id: package
