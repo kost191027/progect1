@@ -24,6 +24,7 @@ const androidPlatform = process.env.RKN_LIBBOX_ANDROID_PLATFORM || "android/arm6
 const includeTailscale = process.env.RKN_LIBBOX_WITH_TAILSCALE === "1";
 const requiredAar = join(appLibsDir, "libbox.aar");
 const requiredLegacyAar = join(appLibsDir, "libbox-legacy.aar");
+const pinnedNdkVersion = "29.0.14206865";
 
 const fallbackJavaHomes = [
   "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home",
@@ -34,13 +35,12 @@ const fallbackJavaHomes = [
 const fallbackAndroidHome = existsSync("/usr/local/share/android-commandlinetools")
   ? "/usr/local/share/android-commandlinetools"
   : "";
-const fallbackNdkHome = existsSync(
-  "/usr/local/share/android-commandlinetools/ndk/29.0.14206865/source.properties",
-)
-  ? "/usr/local/share/android-commandlinetools/ndk/29.0.14206865"
-  : existsSync("/usr/local/share/android-ndk/source.properties")
-    ? "/usr/local/share/android-ndk"
-    : "";
+const fallbackNdkHomes = [
+  `/usr/local/lib/android/sdk/ndk/${pinnedNdkVersion}`,
+  `/opt/android-sdk/ndk/${pinnedNdkVersion}`,
+  `/usr/local/share/android-commandlinetools/ndk/${pinnedNdkVersion}`,
+  "/usr/local/share/android-ndk",
+];
 
 function firstExistingDir(candidates) {
   return candidates.find((candidate) => candidate && existsSync(candidate)) || "";
@@ -52,6 +52,10 @@ function isSupportedJavaHome(javaHome) {
   }
 
   return javaHome.includes("17") || javaHome.includes("21");
+}
+
+function isNdkHome(candidate) {
+  return Boolean(candidate && existsSync(join(candidate, "source.properties")));
 }
 
 function log(message) {
@@ -103,10 +107,14 @@ function ensureToolchainEnv() {
     process.env.ANDROID_HOME ||
     process.env.ANDROID_SDK_ROOT ||
     fallbackAndroidHome;
-  const ndkHome =
-    process.env.NDK_HOME ||
-    process.env.ANDROID_NDK_HOME ||
-    fallbackNdkHome;
+  const ndkHome = firstExistingDir([
+    process.env.RKN_ANDROID_NDK_HOME,
+    androidHome ? join(androidHome, "ndk", pinnedNdkVersion) : "",
+    process.env.ANDROID_NDK_HOME,
+    process.env.NDK_HOME,
+    process.env.NDK,
+    ...fallbackNdkHomes,
+  ].filter(isNdkHome));
 
   if (!javaHome) {
     throw new Error("JAVA_HOME is missing or unsupported; no JDK 17/21 fallback was found.");

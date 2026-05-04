@@ -264,6 +264,10 @@ jobs:
       ANDROID_NATIVE_BACKEND_RUNTIME: libbox
       RKN_LIBBOX_ANDROID_PLATFORM: android/arm64
       RKN_LIBBOX_WITH_TAILSCALE: "0"
+      RKN_ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
+      ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
+      NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
+      NDK: /usr/local/lib/android/sdk/ndk/29.0.14206865
 
     steps:
       - name: Checkout
@@ -299,6 +303,7 @@ jobs:
             "platforms;android-35" \
             "build-tools;35.0.0" \
             "ndk;29.0.14206865"
+          test -f "${RKN_ANDROID_NDK_HOME}/source.properties"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
