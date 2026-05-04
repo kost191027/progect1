@@ -262,6 +262,8 @@ jobs:
       VITE_APP_BUILD: ${{ github.run_number }}
       VITE_GITHUB_RUN_NUMBER: ${{ github.run_number }}
       ANDROID_NATIVE_BACKEND_RUNTIME: libbox
+      RKN_LIBBOX_ANDROID_PLATFORM: android/arm64
+      RKN_LIBBOX_WITH_TAILSCALE: "0"
 
     steps:
       - name: Checkout

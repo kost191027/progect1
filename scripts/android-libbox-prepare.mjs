@@ -1,4 +1,11 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +20,8 @@ const singBoxDir = join(tempRoot, "sing-box");
 const sfaDir = join(tempRoot, "sing-box-for-android");
 const singBoxRef = process.env.RKN_LIBBOX_SING_BOX_REF || "v1.13.5";
 const sfaRef = process.env.RKN_LIBBOX_SFA_REF || "";
+const androidPlatform = process.env.RKN_LIBBOX_ANDROID_PLATFORM || "android/arm64";
+const includeTailscale = process.env.RKN_LIBBOX_WITH_TAILSCALE === "1";
 const requiredAar = join(appLibsDir, "libbox.aar");
 const requiredLegacyAar = join(appLibsDir, "libbox-legacy.aar");
 
@@ -164,6 +173,38 @@ function ensureGomobileInit() {
   });
 }
 
+function patchSingBoxLibboxBuild() {
+  const buildScriptPath = join(singBoxDir, "cmd", "internal", "build_libbox", "main.go");
+  let source = readFileSync(buildScriptPath, "utf8");
+  let patched = source;
+
+  if (!includeTailscale) {
+    const tailscaleTagsLine =
+      '\tsharedTags = append(sharedTags, "with_tailscale", "ts_omit_logtail", "ts_omit_ssh", "ts_omit_drive", "ts_omit_taildrop", "ts_omit_webclient", "ts_omit_doctor", "ts_omit_capture", "ts_omit_kube", "ts_omit_aws", "ts_omit_synology", "ts_omit_bird")\n';
+    const rknTailscaleComment =
+      "\t// RKN Android does not use sing-box Tailscale endpoints; excluding these tags keeps CI deterministic.\n";
+
+    if (patched.includes(tailscaleTagsLine)) {
+      patched = patched.replace(tailscaleTagsLine, rknTailscaleComment);
+    } else if (patched.includes('"with_tailscale"')) {
+      throw new Error(
+        "Unable to patch upstream build_libbox Tailscale tags; upstream changed the expected tag line.",
+      );
+    }
+  }
+
+  if (patched !== source) {
+    writeFileSync(buildScriptPath, patched);
+    log("Patched upstream build_libbox for RKN Android runtime (Tailscale tags disabled).");
+  } else {
+    log(
+      includeTailscale
+        ? "Keeping upstream build_libbox Tailscale tags because RKN_LIBBOX_WITH_TAILSCALE=1."
+        : "No upstream Tailscale tag patch was needed.",
+    );
+  }
+}
+
 function copyBuiltAar(sourcePath, targetPath) {
   mkdirSync(dirname(targetPath), { recursive: true });
   copyFileSync(sourcePath, targetPath);
@@ -175,15 +216,17 @@ function main() {
   ensureToolchainEnv();
   mkdirSync(tempRoot, { recursive: true });
   log(`Using sing-box ref: ${singBoxRef}`);
+  log(`Using Android libbox platform: ${androidPlatform}`);
   ensureClone(singBoxDir, "https://github.com/SagerNet/sing-box.git", singBoxRef);
   ensureClone(sfaDir, "https://github.com/SagerNet/sing-box-for-android.git", sfaRef);
+  patchSingBoxLibboxBuild();
 
   ensureGoTool("gomobile");
   ensureGoTool("gobind");
   ensureGomobileInit();
 
   log("Building libbox AARs via official upstream path (go run ./cmd/internal/build_libbox -target android)...");
-  run("go", ["run", "./cmd/internal/build_libbox", "-target", "android"], {
+  run("go", ["run", "./cmd/internal/build_libbox", "-target", "android", "-platform", androidPlatform], {
     cwd: singBoxDir,
     env: process.env,
   });
