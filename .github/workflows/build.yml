@@ -123,15 +123,12 @@ jobs:
           fi
 
           dmg_name="RKN-${version}-${{ matrix.arch }}.dmg"
-          dmg_alias_name="RKN-latest-${{ matrix.arch }}.dmg"
           app_zip_name="RKN-${version}-${{ matrix.arch }}-app.zip"
 
           cp "${dmg_src}" "${release_dir}/${dmg_name}"
-          cp "${dmg_src}" "${release_dir}/${dmg_alias_name}"
           ditto -c -k --sequesterRsrc --keepParent "${app_src}" "${release_dir}/${app_zip_name}"
 
           echo "dmg_path=${release_dir}/${dmg_name}" >> "$GITHUB_OUTPUT"
-          echo "dmg_alias_path=${release_dir}/${dmg_alias_name}" >> "$GITHUB_OUTPUT"
           echo "app_zip_path=${release_dir}/${app_zip_name}" >> "$GITHUB_OUTPUT"
 
       - name: Upload macOS bundle artifacts
@@ -141,7 +138,6 @@ jobs:
           name: RKN-${{ steps.meta.outputs.version }}-${{ matrix.arch }}
           path: |
             ${{ steps.package.outputs.dmg_path }}
-            ${{ steps.package.outputs.dmg_alias_path }}
             ${{ steps.package.outputs.app_zip_path }}
           retention-days: 14
           compression-level: 0
@@ -158,11 +154,8 @@ jobs:
 
             - `RKN-${{ steps.meta.outputs.version }}-x64.dmg` — Intel Mac
             - `RKN-${{ steps.meta.outputs.version }}-arm64.dmg` — Apple Silicon (M-series)
-            - `RKN-latest-x64.dmg` — stable Intel download link
-            - `RKN-latest-arm64.dmg` — stable Apple Silicon download link
           files: |
             ${{ steps.package.outputs.dmg_path }}
-            ${{ steps.package.outputs.dmg_alias_path }}
 
   build-windows:
     name: Build Windows x64
@@ -240,13 +233,10 @@ jobs:
           fi
 
           setup_name="RKN-${version}-x64-setup.exe"
-          setup_alias_name="RKN-latest-x64-setup.exe"
 
           cp "${setup_src}" "${release_dir}/${setup_name}"
-          cp "${setup_src}" "${release_dir}/${setup_alias_name}"
 
           echo "setup_path=${release_dir}/${setup_name}" >> "$GITHUB_OUTPUT"
-          echo "setup_alias_path=${release_dir}/${setup_alias_name}" >> "$GITHUB_OUTPUT"
 
       - name: Upload Windows bundle artifacts
         if: github.ref_type != 'tag'
@@ -255,7 +245,6 @@ jobs:
           name: RKN-${{ steps.meta.outputs.version }}-windows-x64
           path: |
             ${{ steps.package.outputs.setup_path }}
-            ${{ steps.package.outputs.setup_alias_path }}
           retention-days: 14
           compression-level: 0
 
@@ -266,7 +255,6 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: |
             ${{ steps.package.outputs.setup_path }}
-            ${{ steps.package.outputs.setup_alias_path }}
 
   build-android:
     name: Build Android arm64
@@ -431,19 +419,13 @@ jobs:
           fi
 
           apk_name="RKN-${version}-android-arm64.apk"
-          apk_alias_name="RKN-latest-android-arm64.apk"
           aab_name="RKN-${version}-android-arm64.aab"
-          aab_alias_name="RKN-latest-android-arm64.aab"
 
           cp "${apk_src}" "${release_dir}/${apk_name}"
-          cp "${apk_src}" "${release_dir}/${apk_alias_name}"
           cp "${aab_src}" "${release_dir}/${aab_name}"
-          cp "${aab_src}" "${release_dir}/${aab_alias_name}"
 
           echo "apk_path=${release_dir}/${apk_name}" >> "$GITHUB_OUTPUT"
-          echo "apk_alias_path=${release_dir}/${apk_alias_name}" >> "$GITHUB_OUTPUT"
           echo "aab_path=${release_dir}/${aab_name}" >> "$GITHUB_OUTPUT"
-          echo "aab_alias_path=${release_dir}/${aab_alias_name}" >> "$GITHUB_OUTPUT"
 
       - name: Upload Android bundle artifacts
         if: github.ref_type != 'tag'
@@ -452,9 +434,7 @@ jobs:
           name: RKN-${{ steps.meta.outputs.version }}-android-arm64
           path: |
             ${{ steps.package.outputs.apk_path }}
-            ${{ steps.package.outputs.apk_alias_path }}
             ${{ steps.package.outputs.aab_path }}
-            ${{ steps.package.outputs.aab_alias_path }}
           retention-days: 14
           compression-level: 0
 
@@ -465,6 +445,4 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: |
             ${{ steps.package.outputs.apk_path }}
-            ${{ steps.package.outputs.apk_alias_path }}
             ${{ steps.package.outputs.aab_path }}
-            ${{ steps.package.outputs.aab_alias_path }}

@@ -1,20 +1,26 @@
 # RKN
 
-**Recursive Kinetic Network** is a self-managed stealth gateway client for macOS, Windows and Android.
+**Recursive Kinetic Network** is a self-managed stealth gateway client for macOS, Windows, and Android.
 
 It combines a lightweight desktop shell, a high-performance native backend, and a flexible network core to give the user a simple flow:
 
 `enter server -> deploy node -> start tunnel -> stay protected`
 
 <p>
-  <a href="https://github.com/kost191027/progect1/releases/latest/download/RKN-latest-x64.dmg">
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-x64.dmg">
     <img alt="Download for Intel Mac" src="https://img.shields.io/badge/Download%20for-Intel%20Mac-1F2937?style=for-the-badge&logo=apple&logoColor=white">
   </a>
-  <a href="https://github.com/kost191027/progect1/releases/latest/download/RKN-latest-arm64.dmg">
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-arm64.dmg">
     <img alt="Download for Apple Silicon" src="https://img.shields.io/badge/Download%20for-Apple%20Silicon-111827?style=for-the-badge&logo=apple&logoColor=white">
   </a>
-  <a href="https://github.com/kost191027/progect1/releases/latest/download/RKN-latest-x64-setup.exe">
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-x64-setup.exe">
     <img alt="Download for Windows" src="https://img.shields.io/badge/Download%20for-Windows-0F172A?style=for-the-badge&logo=windows11&logoColor=white">
+  </a>
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-android-arm64.apk">
+    <img alt="Download Android APK" src="https://img.shields.io/badge/Download%20Android-APK-14532D?style=for-the-badge&logo=android&logoColor=white">
+  </a>
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-android-arm64.aab">
+    <img alt="Download Android AAB" src="https://img.shields.io/badge/Download%20Android-AAB-1B5E20?style=for-the-badge&logo=android&logoColor=white">
   </a>
 </p>
 
@@ -31,14 +37,51 @@ sudo xattr -rd com.apple.quarantine "/Applications/RKN.app"
 Then launch `RKN.app` again from `Applications`.
 
 <p>
-  <img alt="Tauri v2" src="https://img.shields.io/badge/Tauri-v2-24C8DB?style=flat-square&logo=tauri&logoColor=white">
-  <img alt="Rust" src="https://img.shields.io/badge/Rust-backend-000000?style=flat-square&logo=rust&logoColor=white">
-  <img alt="React" src="https://img.shields.io/badge/React-frontend-61DAFB?style=flat-square&logo=react&logoColor=0B0F16">
-  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.x-3178C6?style=flat-square&logo=typescript&logoColor=white">
-  <img alt="sing-box" src="https://img.shields.io/badge/sing--box-core-111111?style=flat-square">
-  <img alt="ShadowTLS" src="https://img.shields.io/badge/ShadowTLS-stealth-2F855A?style=flat-square">
-  <img alt="Shadowsocks 2022" src="https://img.shields.io/badge/Shadowsocks--2022-transport-1F6FEB?style=flat-square">
-  <img alt="macOS and Windows" src="https://img.shields.io/badge/macOS%20%2B%20Windows-supported-1D1D1F?style=flat-square&logo=windows11&logoColor=white">
+  <a href="https://tauri.app/">
+    <img alt="Tauri v2" src="https://img.shields.io/badge/Tauri-v2-24C8DB?style=flat-square&logo=tauri&logoColor=white">
+  </a>
+  <a href="https://www.rust-lang.org/">
+    <img alt="Rust" src="https://img.shields.io/badge/Rust-backend-000000?style=flat-square&logo=rust&logoColor=white">
+  </a>
+  <a href="https://react.dev/">
+    <img alt="React" src="https://img.shields.io/badge/React-frontend-61DAFB?style=flat-square&logo=react&logoColor=0B0F16">
+  </a>
+  <a href="https://www.typescriptlang.org/">
+    <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.x-3178C6?style=flat-square&logo=typescript&logoColor=white">
+  </a>
+  <a href="https://vite.dev/">
+    <img alt="Vite" src="https://img.shields.io/badge/Vite-build-646CFF?style=flat-square&logo=vite&logoColor=white">
+  </a>
+  <a href="https://tailwindcss.com/">
+    <img alt="Tailwind CSS" src="https://img.shields.io/badge/Tailwind-CSS-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white">
+  </a>
+  <a href="https://sing-box.sagernet.org/">
+    <img alt="sing-box" src="https://img.shields.io/badge/sing--box-core-111111?style=flat-square">
+  </a>
+  <a href="https://sing-box.sagernet.org/configuration/inbound/shadowtls/">
+    <img alt="ShadowTLS" src="https://img.shields.io/badge/ShadowTLS-stealth-2F855A?style=flat-square">
+  </a>
+  <a href="https://shadowsocks.org/doc/sip022.html">
+    <img alt="Shadowsocks 2022" src="https://img.shields.io/badge/Shadowsocks--2022-transport-1F6FEB?style=flat-square">
+  </a>
+  <a href="https://www.android.com/">
+    <img alt="Android" src="https://img.shields.io/badge/Android-arm64-3DDC84?style=flat-square&logo=android&logoColor=0B0F16">
+  </a>
+  <a href="https://www.docker.com/">
+    <img alt="Docker" src="https://img.shields.io/badge/Docker-server%20deploy-2496ED?style=flat-square&logo=docker&logoColor=white">
+  </a>
+  <a href="https://www.wireguard.com/">
+    <img alt="WireGuard" src="https://img.shields.io/badge/WireGuard-WARP-88171A?style=flat-square&logo=wireguard&logoColor=white">
+  </a>
+  <a href="https://github.com/features/actions">
+    <img alt="GitHub Actions" src="https://img.shields.io/badge/GitHub%20Actions-CI%2FCD-2088FF?style=flat-square&logo=githubactions&logoColor=white">
+  </a>
+  <a href="https://developer.apple.com/macos/">
+    <img alt="macOS" src="https://img.shields.io/badge/macOS-x64%20%2B%20arm64-1D1D1F?style=flat-square&logo=apple&logoColor=white">
+  </a>
+  <a href="https://www.microsoft.com/windows/">
+    <img alt="Windows" src="https://img.shields.io/badge/Windows-x64-0078D4?style=flat-square&logo=windows11&logoColor=white">
+  </a>
 </p>
 
 ## Overview
@@ -133,6 +176,12 @@ The app currently ships with a minimal 3-screen desktop UX:
 
 ## Supported platforms and system requirements
 
+RKN now ships release artifacts for three product tracks:
+
+- **macOS**: the most mature desktop target and the primary daily-driver path.
+- **Windows**: the supported x64 desktop target with its own elevation and local security considerations.
+- **Android**: the first stable mobile target, currently focused on arm64 devices and the native `libbox` runtime path.
+
 ### Desktop OS
 
 - macOS:
@@ -144,6 +193,14 @@ The app currently ships with a minimal 3-screen desktop UX:
   - x64 is the primary release target
   - administrator rights available for tunnel startup
   - Windows Firewall and local security software must allow the app to start the bundled network core
+
+### Android
+
+- Android arm64 device
+- Android 10 or newer is recommended
+- VPN permission must be approved by the user
+- the release APK is intended for direct installation from GitHub Releases
+- the AAB is published for distribution/testing workflows that expect an Android App Bundle
 
 ### Server requirements
 
@@ -162,6 +219,75 @@ The app currently ships with a minimal 3-screen desktop UX:
 - If third-party antivirus or endpoint protection blocks the app, the sidecar binary, or TUN creation, add an exception for the installed RKN app folder and retry the tunnel start.
 - If a corporate firewall, endpoint agent, or local filtering product interferes with Wintun/TUN traffic, test first on a clean personal machine before assuming the server is broken.
 - If the tunnel starts but traffic does not pass, check the in-app diagnostics first, then temporarily disable conflicting security software for a controlled test.
+
+## Android
+
+Android is no longer just a future track. Version `0.1.7` includes the first stable Android release path.
+
+The Android build uses:
+
+- Tauri Android shell
+- Rust backend compiled for `aarch64-linux-android`
+- `libbox` as the preferred native mobile runtime
+- Android-side bundled rule-set restoration for offline startup
+- a native backend launch seam designed for the mobile runtime lifecycle
+
+The Android target is still younger than the desktop app, but the core loop is now present:
+
+`enter server -> deploy or attach -> create client config -> start protected mobile tunnel`
+
+Important Android notes:
+
+- The release currently targets **Android arm64**.
+- The app may ask for Android VPN permission before routing traffic.
+- Android can suspend background work more aggressively than desktop operating systems, so tunnel recovery and lifecycle behavior are treated as a separate hardening track.
+- If traffic starts but local/direct routing is wrong, check bundled rule-set restoration and DNS behavior first.
+- The Android developer loop is documented in [`docs/android-dev-loop.md`](docs/android-dev-loop.md).
+
+Local Android development commands:
+
+```bash
+npm run android:doctor
+npm run android:libbox:prepare
+npm run tauri:android:dev
+npm run tauri:android:run
+npm run tauri:android:build:apk
+npm run tauri:android:build:aab
+```
+
+The Android release artifacts are:
+
+- `RKN-<version>-android-arm64.apk`
+- `RKN-<version>-android-arm64.aab`
+
+## Windows
+
+Windows is a supported desktop release target, not a cosmetic rebuild of the macOS app.
+
+The Windows build includes:
+
+- Tauri v2 desktop shell
+- Rust backend
+- bundled Windows `sing-box` sidecar
+- x64 installer packaging
+- administrator elevation for tunnel startup
+- Windows-specific CI coverage
+
+The everyday user path is the same as macOS:
+
+`install -> enter server -> deploy or attach -> start tunnel`
+
+Important Windows notes:
+
+- The primary release target is **Windows x64**.
+- Windows Defender Firewall may ask whether the app or bundled network core can communicate on the current network.
+- Third-party antivirus, endpoint protection, or corporate policy tools can block the sidecar process or TUN/Wintun behavior.
+- If tunnel startup fails on Windows, first check administrator elevation, firewall prompts, and security software quarantine.
+- Windows arm64 is not a primary release target yet.
+
+The Windows release artifacts are:
+
+- `RKN-<version>-x64-setup.exe`
 
 ## Architecture
 
@@ -184,6 +310,7 @@ The app currently ships with a minimal 3-screen desktop UX:
 ### Network core
 
 - **sing-box** sidecar
+- **libbox** native runtime on Android
 - **ShadowTLS**
 - **Shadowsocks-2022**
 
@@ -274,18 +401,20 @@ Important notes:
 
 ## Release strategy
 
-The current desktop release targets are:
+The current release targets are:
 
 - **macOS x64**
 - **macOS arm64**
 - **Windows x64**
+- **Android arm64 APK**
+- **Android arm64 AAB**
 
 Later candidates:
 
 - **macOS universal**
 - **Windows arm64** if packaging and QA demand it
-
-Android and iOS are future product tracks, not simple rebuild targets.
+- broader Android ABI coverage if real device testing demands it
+- iOS as a separate future product track
 
 ## Build outputs
 
@@ -295,6 +424,8 @@ The project currently builds into:
 - `.dmg`
 - `.exe`
 - `.msi` or NSIS installer, depending on the active Windows bundle target
+- `.apk`
+- `.aab`
 
 Typical macOS release artifacts:
 
@@ -305,7 +436,11 @@ Typical macOS release artifacts:
 Typical Windows release artifacts:
 
 - `RKN-<version>-x64-setup.exe`
-- `RKN-<version>-x64.msi`
+
+Typical Android release artifacts:
+
+- `RKN-<version>-android-arm64.apk`
+- `RKN-<version>-android-arm64.aab`
 
 The final size is driven mostly by the bundled `sing-box` sidecar.
 
@@ -354,10 +489,12 @@ GitHub Actions is used for:
 
 - validation checks
 - macOS release builds
+- Windows release builds
+- Android APK/AAB release builds
 - build metadata injection
 - artifact publishing
 
-The current release direction is GitHub Releases with attached build assets.
+The current release direction is GitHub Releases with attached build assets for macOS, Windows, and Android.
 
 ## Release QA
 
@@ -384,12 +521,15 @@ The goal is to make deployment, activation, and status understandable in seconds
 
 ## Current status
 
-RKN is in MVP hardening and release preparation:
+RKN is in MVP hardening after the first multi-platform release:
 
 - core deploy flow exists
 - local tunnel control exists
 - tray mode exists
 - release packaging exists
-- CI build automation is being finalized
+- macOS release builds are working
+- Windows x64 release builds are working
+- Android arm64 APK/AAB release builds are working
+- the first stable Android path is available for real-device testing
 
-The main engineering constraint at this stage is preserving the already stable network path while improving packaging, release quality, and delivery.
+The main engineering constraint at this stage is preserving the already stable desktop network path while hardening Android lifecycle behavior, Windows edge cases, release quality, and delivery.
