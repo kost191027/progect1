@@ -1,41 +1,5 @@
 # RKN
 
-**Recursive Kinetic Network** is a self-managed stealth gateway client for macOS, Windows, and Android.
-
-It combines a lightweight desktop shell, a high-performance native backend, and a flexible network core to give the user a simple flow:
-
-`enter server -> deploy node -> start tunnel -> stay protected`
-
-<p>
-  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-x64.dmg">
-    <img alt="Download for Intel Mac" src="https://img.shields.io/badge/Download%20for-Intel%20Mac-1F2937?style=for-the-badge&logo=apple&logoColor=white">
-  </a>
-  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-arm64.dmg">
-    <img alt="Download for Apple Silicon" src="https://img.shields.io/badge/Download%20for-Apple%20Silicon-111827?style=for-the-badge&logo=apple&logoColor=white">
-  </a>
-  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-x64-setup.exe">
-    <img alt="Download for Windows" src="https://img.shields.io/badge/Download%20for-Windows-0F172A?style=for-the-badge&logo=windows11&logoColor=white">
-  </a>
-  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-android-arm64.apk">
-    <img alt="Download Android APK" src="https://img.shields.io/badge/Download%20Android-APK-14532D?style=for-the-badge&logo=android&logoColor=white">
-  </a>
-  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-android-arm64.aab">
-    <img alt="Download Android AAB" src="https://img.shields.io/badge/Download%20Android-AAB-1B5E20?style=for-the-badge&logo=android&logoColor=white">
-  </a>
-</p>
-
-## First launch on macOS
-
-If macOS says that **RKN is damaged and cannot be opened**, do not worry. This is a standard warning for unsigned or not-yet-notarized builds.
-
-After copying the app into `Applications`, run:
-
-```bash
-sudo xattr -rd com.apple.quarantine "/Applications/RKN.app"
-```
-
-Then launch `RKN.app` again from `Applications`.
-
 <p>
   <a href="https://tauri.app/">
     <img alt="Tauri v2" src="https://img.shields.io/badge/Tauri-v2-24C8DB?style=flat-square&logo=tauri&logoColor=white">
@@ -83,6 +47,42 @@ Then launch `RKN.app` again from `Applications`.
     <img alt="Windows" src="https://img.shields.io/badge/Windows-x64-0078D4?style=flat-square&logo=windows11&logoColor=white">
   </a>
 </p>
+
+**Recursive Kinetic Network** is a self-managed stealth gateway client for macOS, Windows, and Android.
+
+It combines a lightweight desktop shell, a high-performance native backend, and a flexible network core to give the user a simple flow:
+
+`enter server -> deploy node -> start tunnel -> stay protected`
+
+<p>
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-x64.dmg">
+    <img alt="Download for Intel Mac" src="https://img.shields.io/badge/Download%20for-Intel%20Mac-1F2937?style=for-the-badge&logo=apple&logoColor=white">
+  </a>
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-arm64.dmg">
+    <img alt="Download for Apple Silicon" src="https://img.shields.io/badge/Download%20for-Apple%20Silicon-111827?style=for-the-badge&logo=apple&logoColor=white">
+  </a>
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-x64-setup.exe">
+    <img alt="Download for Windows" src="https://img.shields.io/badge/Download%20for-Windows-0F172A?style=for-the-badge&logo=windows11&logoColor=white">
+  </a>
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-android-arm64.apk">
+    <img alt="Download Android APK" src="https://img.shields.io/badge/Download%20Android-APK-14532D?style=for-the-badge&logo=android&logoColor=white">
+  </a>
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.7/RKN-0.1.7-android-arm64.aab">
+    <img alt="Download Android AAB" src="https://img.shields.io/badge/Download%20Android-AAB-1B5E20?style=for-the-badge&logo=android&logoColor=white">
+  </a>
+</p>
+
+## First launch on macOS
+
+If macOS says that **RKN is damaged and cannot be opened**, do not worry. This is a standard warning for unsigned or not-yet-notarized builds.
+
+After copying the app into `Applications`, run:
+
+```bash
+sudo xattr -rd com.apple.quarantine "/Applications/RKN.app"
+```
+
+Then launch `RKN.app` again from `Applications`.
 
 ## Overview
 
