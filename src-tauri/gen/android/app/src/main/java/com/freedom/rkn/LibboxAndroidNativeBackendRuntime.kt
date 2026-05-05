@@ -104,7 +104,7 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             // 6A.4.1 DoD #3: before we touch libbox again, synchronously drain any
             // runtime state left over from a previous session. Without this, the
             // previous CommandServer may still be alive inside the Go runtime, and
-            // reloadSetupOptions / startOrReloadService below will deadlock on the
+            // setup / startOrReloadService below can deadlock on the
             // libbox JNI side, leaving the launch thread stuck forever.
             drainLingeringRuntimeStates(bundle.runtimeLogPath, bundle.sessionId)
 
@@ -238,7 +238,7 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
     ) {
         val baseDir = File(context.filesDir, "libbox/base").apply { mkdirs() }
         val tempDir = File(context.cacheDir, "libbox/temp").apply { mkdirs() }
-        val workingDir = File(bundle.sessionDir, "libbox-work").apply { mkdirs() }
+        val workingDir = File(context.filesDir, "libbox/work").apply { mkdirs() }
         val options = SetupOptions().apply {
             basePath = baseDir.absolutePath
             workingPath = workingDir.absolutePath
@@ -246,7 +246,6 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             fixAndroidStack = true
             logMaxLines = 3_000
             debug = BuildConfig.DEBUG
-            crashReportSource = TAG
         }
 
         // Platform helpers are process-scoped and do not need setupLock.
@@ -262,13 +261,11 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             if (setupInitialized) {
                 writeRuntimeLog(
                     bundle.runtimeLogPath,
-                    "step: Libbox.reloadSetupOptions begin",
+                    "step: Libbox.setup already initialized; reusing process-wide setup options",
                     "base=${baseDir.absolutePath}",
                     "working=${workingDir.absolutePath}",
                     "temp=${tempDir.absolutePath}",
                 )
-                Libbox.reloadSetupOptions(options)
-                writeRuntimeLog(bundle.runtimeLogPath, "step: Libbox.reloadSetupOptions done")
             } else {
                 writeRuntimeLog(
                     bundle.runtimeLogPath,
@@ -291,7 +288,7 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
      * without hanging state. The stop path itself has a bounded wait for responsiveness, so
      * state can occasionally outlive a user-initiated Stop. Before we bootstrap a new libbox
      * session we must make sure no previous CommandServer is still alive inside the Go
-     * runtime — otherwise `Libbox.reloadSetupOptions` and `startOrReloadService` deadlock
+     * runtime — otherwise `Libbox.setup` and `startOrReloadService` can deadlock
      * and the launch thread is stuck forever, which is exactly the
      * "stayed in a pending launch state" failure the Rust side reports.
      */
@@ -548,13 +545,6 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             )
         }
 
-        override fun triggerNativeCrash() {
-            writeRuntimeLog(
-                bundle.runtimeLogPath,
-                "libbox requested triggerNativeCrash(), ignored in RKN runtime.",
-            )
-        }
-
         override fun writeDebugMessage(message: String) {
             writeRuntimeLog(bundle.runtimeLogPath, "[libbox-debug] $message")
             Log.d(TAG, message)
@@ -709,20 +699,6 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
                 }
             }
             return SimpleStringIterator(certificates)
-        }
-
-        override fun startNeighborMonitor(listener: io.nekohasekai.libbox.NeighborUpdateListener) {
-            writeRuntimeLog(
-                bundle.runtimeLogPath,
-                "libbox requested neighbor monitor; current RKN runtime keeps this as a no-op first iteration.",
-            )
-        }
-
-        override fun closeNeighborMonitor(listener: io.nekohasekai.libbox.NeighborUpdateListener) {
-        }
-
-        override fun registerMyInterface(name: String) {
-            writeRuntimeLog(bundle.runtimeLogPath, "registerMyInterface($name)")
         }
 
         override fun sendNotification(notification: Notification) {
