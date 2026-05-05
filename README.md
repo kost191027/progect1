@@ -1,6 +1,6 @@
 # RKN
 
-**Recursive Kinetic Network** is a self-managed stealth gateway client for macOS and Windows.
+**Recursive Kinetic Network** is a self-managed stealth gateway client for macOS, Windows and Android.
 
 It combines a lightweight desktop shell, a high-performance native backend, and a flexible network core to give the user a simple flow:
 
