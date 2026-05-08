@@ -83,6 +83,7 @@ pub(crate) async fn ensure_local_transport_is_current(app: &AppHandle) -> Result
     ensure_transport_snapshot_current(app, snapshot_result, true)
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) async fn ensure_local_transport_is_current_quiet(app: &AppHandle) -> Result<(), String> {
     let check_app = app.clone();
     let snapshot_result = tauri::async_runtime::spawn_blocking(move || {

@@ -829,6 +829,27 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         route.insert("final".to_string(), serde_json::json!("proxy"));
     }
 
+    let route_rule_sets = cfg
+        .get("route")
+        .and_then(|value| value.get("rule_set"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut direct_dns_rule_set_tags = Vec::<String>::new();
+    let mut google_dns_rule_set_available = false;
+    for rule_set in route_rule_sets {
+        let tag = rule_set
+            .get("tag")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if tag == crate::geodata::GOOGLE_RULE_SET_TAG {
+            google_dns_rule_set_available = true;
+        }
+        if crate::geodata::DIRECT_ROUTE_RULE_SET_TAGS.contains(&tag) && !tag.starts_with("geoip-") {
+            direct_dns_rule_set_tags.push(tag.to_string());
+        }
+    }
+
     if let Some(dns) = cfg.get_mut("dns").and_then(|value| value.as_object_mut()) {
         dns.insert(
             "servers".to_string(),
@@ -858,30 +879,7 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             }),
         ];
 
-        let route_rule_sets = cfg
-            .get("route")
-            .and_then(|value| value.get("rule_set"))
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut direct_dns_rule_set_tags = Vec::<String>::new();
-        let mut google_rule_set_available = false;
-        for rule_set in route_rule_sets {
-            let tag = rule_set
-                .get("tag")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            if tag == crate::geodata::GOOGLE_RULE_SET_TAG {
-                google_rule_set_available = true;
-            }
-            if crate::geodata::DIRECT_ROUTE_RULE_SET_TAGS.contains(&tag)
-                && !tag.starts_with("geoip-")
-            {
-                direct_dns_rule_set_tags.push(tag.to_string());
-            }
-        }
-
-        if google_rule_set_available {
+        if google_dns_rule_set_available {
             dns_rules.insert(
                 0,
                 serde_json::json!({
