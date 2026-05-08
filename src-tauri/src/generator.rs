@@ -438,6 +438,7 @@ pub fn build_client_config(
       "auto_route": true,
       "strict_route": true,
       "stack": "system",
+      "mtu": 1280,
       "endpoint_independent_nat": true
     });
 

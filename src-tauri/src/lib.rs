@@ -682,7 +682,7 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 // interface-bound forwarders while we stabilize the mobile tunnel.
                 object.insert("strict_route".to_string(), serde_json::json!(false));
                 object.insert("stack".to_string(), serde_json::json!("gvisor"));
-                object.insert("mtu".to_string(), serde_json::json!(1400));
+                object.insert("mtu".to_string(), serde_json::json!(1280));
             }
         }
     }
@@ -2066,6 +2066,35 @@ fn reset_guard_state(state: &AppState) {
     *state.proxy_failure_count.lock().unwrap() = 0;
     *state.proxy_failure_window_started.lock().unwrap() = None;
     *state.kill_switch_engaged.lock().unwrap() = false;
+}
+
+fn release_guard_after_quiet_period(app: &AppHandle, state: &AppState) {
+    const PROXY_GUARD_QUIET_RELEASE: Duration = Duration::from_secs(90);
+
+    let should_release = {
+        let engaged = *state.kill_switch_engaged.lock().unwrap();
+        if !engaged {
+            false
+        } else {
+            state
+                .proxy_failure_window_started
+                .lock()
+                .unwrap()
+                .map(|started| started.elapsed() >= PROXY_GUARD_QUIET_RELEASE)
+                .unwrap_or(false)
+        }
+    };
+
+    if !should_release {
+        return;
+    }
+
+    reset_guard_state(state);
+    emit_guard_state(app, "active");
+    let _ = app.emit(
+        "tunnel-log",
+        "[GUARD] Proxy path has been quiet since the degraded burst. Clearing the runtime guard state; the tunnel remains active.",
+    );
 }
 
 fn register_proxy_failure(app: &AppHandle, state: &AppState) {
@@ -5131,6 +5160,11 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                 break;
             }
 
+            {
+                let state = app.state::<AppState>();
+                release_guard_after_quiet_period(&app, &state);
+            }
+
             let elapsed = last_tick.elapsed();
             last_tick = std::time::Instant::now();
             let current_fingerprint = current_network_fingerprint();
@@ -5886,14 +5920,44 @@ pub(crate) async fn restart_tunnel_if_running(
     };
 
     let _ = app.emit("tunnel-log", format!("[SYSTEM] {}", reason));
-    {
-        let mut guard = state.singbox_pid.lock().unwrap();
-        *guard = None;
-    }
 
     let new_pid = match restart_tunnel_process(app, old_pid).await {
         Ok(pid) => pid,
         Err(error) => {
+            let old_runtime_still_alive = {
+                #[cfg(target_os = "android")]
+                {
+                    if is_android_native_backend_pid(old_pid) {
+                        android_native_backend_status_state()
+                            .map(|state| android_backend_state_is_ready(&state))
+                            .unwrap_or(false)
+                    } else {
+                        process_exists(old_pid)
+                    }
+                }
+
+                #[cfg(not(target_os = "android"))]
+                {
+                    process_exists(old_pid)
+                }
+            };
+
+            if old_runtime_still_alive {
+                {
+                    let mut guard = state.singbox_pid.lock().unwrap();
+                    *guard = Some(old_pid);
+                }
+                let _ = save_tunnel_pid(app, old_pid);
+                finish_recovery(&state);
+                emit_tunnel_state(app, true);
+                refresh_tray_toggle_item(app);
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Tunnel restart did not complete, but the previous runtime is still alive. Keeping it tracked instead of leaving an orphaned tunnel state.",
+                );
+                return Err(error);
+            }
+
             set_network_fingerprint(&state, None);
             clear_saved_tunnel_pid(app);
             finish_recovery(&state);
