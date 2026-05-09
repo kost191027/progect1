@@ -81,6 +81,24 @@ val androidBundledSingboxSource = file("../../../bins/sing-box-aarch64-linux-and
 val androidBundledSingboxTarget =
     file("src/main/jniLibs/arm64-v8a/libsingbox.so")
 
+tasks.register("removeICloudDuplicateAndroidArtifacts") {
+    doLast {
+        listOf(
+            file("src/main/java"),
+            file("src/main/assets"),
+            file("build"),
+        ).forEach { root ->
+            if (root.exists()) {
+                fileTree(root) {
+                    include("**/* 2.*")
+                }.files.forEach { duplicate ->
+                    duplicate.delete()
+                }
+            }
+        }
+    }
+}
+
 tasks.register("prepareAndroidSingboxSidecar") {
     inputs.file(androidBundledSingboxSource)
     outputs.file(androidBundledSingboxTarget)
@@ -104,6 +122,7 @@ tasks.register("prepareAndroidSingboxSidecar") {
 }
 
 tasks.named("preBuild").configure {
+    dependsOn("removeICloudDuplicateAndroidArtifacts")
     dependsOn("prepareAndroidSingboxSidecar")
 }
 
