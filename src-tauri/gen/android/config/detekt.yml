@@ -1,0 +1,73 @@
+build:
+  maxIssues: 0
+
+config:
+  validation: true
+  warningsAsErrors: false
+
+complexity:
+  ComplexCondition:
+    active: true
+    threshold: 5
+  CyclomaticComplexMethod:
+    active: true
+    threshold: 45
+  LongMethod:
+    active: true
+    threshold: 220
+  LongParameterList:
+    active: true
+    functionThreshold: 8
+    constructorThreshold: 10
+  NestedBlockDepth:
+    active: true
+    threshold: 5
+  TooManyFunctions:
+    active: true
+    thresholdInFiles: 35
+    thresholdInClasses: 25
+    thresholdInInterfaces: 15
+    thresholdInObjects: 35
+    thresholdInEnums: 15
+
+empty-blocks:
+  EmptyFunctionBlock:
+    active: false
+
+exceptions:
+  TooGenericExceptionCaught:
+    active: false
+  SwallowedException:
+    active: false
+
+naming:
+  FunctionNaming:
+    active: true
+  VariableNaming:
+    active: true
+  MatchingDeclarationName:
+    active: true
+
+potential-bugs:
+  UnsafeCallOnNullableType:
+    active: true
+  CastNullableToNonNullableType:
+    active: true
+
+style:
+  MagicNumber:
+    active: false
+  MaxLineLength:
+    active: false
+  ReturnCount:
+    active: true
+    max: 8
+  ThrowsCount:
+    active: true
+    max: 3
+  UnusedPrivateMember:
+    active: true
+  UnusedParameter:
+    active: false
+  UseCheckOrError:
+    active: false

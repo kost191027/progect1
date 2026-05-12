@@ -1,7 +1,7 @@
 package com.freedom.rkn
 
-import org.json.JSONObject
 import java.io.File
+import org.json.JSONObject
 
 data class AndroidNativeBackendLaunchBundlePayload(
     val sessionId: String,
@@ -22,7 +22,7 @@ data class AndroidNativeBackendLaunchBundlePayload(
     val runtimeLogPath: String,
     val runtimeStatusPath: String,
     val tunFdOwnership: String,
-    val protectApiAvailable: Boolean,
+    val protectApiAvailable: Boolean
 ) {
     companion object {
         fun fromFile(path: String): AndroidNativeBackendLaunchBundlePayload {
@@ -47,7 +47,7 @@ data class AndroidNativeBackendLaunchBundlePayload(
                 runtimeLogPath = payload.optString("runtime_log_path"),
                 runtimeStatusPath = payload.optString("runtime_status_path"),
                 tunFdOwnership = payload.optString("tun_fd_ownership"),
-                protectApiAvailable = payload.optBoolean("protect_api_available", false),
+                protectApiAvailable = payload.optBoolean("protect_api_available", false)
             )
         }
     }
@@ -59,7 +59,7 @@ data class AndroidNativeBackendRunningHandle(
     val consumerTag: String,
     val sessionDir: String,
     val runtimeLogPath: String,
-    val runtimeStatusPath: String,
+    val runtimeStatusPath: String
 )
 
 data class AndroidNativeBackendLaunchResult(
@@ -68,46 +68,41 @@ data class AndroidNativeBackendLaunchResult(
     val runtimeName: String,
     val backendConfigSummary: String = "",
     val runtimeSelection: String = "",
-    val runningHandle: AndroidNativeBackendRunningHandle? = null,
+    val runningHandle: AndroidNativeBackendRunningHandle? = null
 ) {
     fun toJson(
         launchBundlePath: String,
         statusPath: String,
-        bundle: AndroidNativeBackendLaunchBundlePayload,
-    ): JSONObject {
-        return JSONObject().apply {
-            put("phase", phase)
-            put("detail", detail)
-            put("runtime_name", runtimeName)
-            put("backend_config_summary", backendConfigSummary)
-            put("runtime_selection", runtimeSelection)
-            put("session_id", bundle.sessionId)
-            put("consumer_tag", bundle.consumerTag)
-            put("launch_bundle_path", launchBundlePath)
-            put("claim_path", bundle.claimPath)
-            put("status_path", statusPath)
-            put("tun_fd", bundle.tunFd)
-            put("tun_state", bundle.tunState)
-            put("context_path", bundle.contextPath)
-            put("backend_config_path", bundle.backendConfigPath)
-            put("log_path", bundle.logPath)
-            put("session_dir", bundle.sessionDir)
-            put("runtime_log_path", bundle.runtimeLogPath)
-            put("runtime_status_path", bundle.runtimeStatusPath)
-            put("tun_fd_ownership", bundle.tunFdOwnership)
-        }
+        bundle: AndroidNativeBackendLaunchBundlePayload
+    ): JSONObject = JSONObject().apply {
+        put("phase", phase)
+        put("detail", detail)
+        put("runtime_name", runtimeName)
+        put("backend_config_summary", backendConfigSummary)
+        put("runtime_selection", runtimeSelection)
+        put("session_id", bundle.sessionId)
+        put("consumer_tag", bundle.consumerTag)
+        put("launch_bundle_path", launchBundlePath)
+        put("claim_path", bundle.claimPath)
+        put("status_path", statusPath)
+        put("tun_fd", bundle.tunFd)
+        put("tun_state", bundle.tunState)
+        put("context_path", bundle.contextPath)
+        put("backend_config_path", bundle.backendConfigPath)
+        put("log_path", bundle.logPath)
+        put("session_dir", bundle.sessionDir)
+        put("runtime_log_path", bundle.runtimeLogPath)
+        put("runtime_status_path", bundle.runtimeStatusPath)
+        put("tun_fd_ownership", bundle.tunFdOwnership)
     }
 }
 
-data class AndroidNativeBackendAvailability(
-    val available: Boolean,
-    val detail: String,
-)
+data class AndroidNativeBackendAvailability(val available: Boolean, val detail: String)
 
 data class AndroidNativeBackendRuntimeSelection(
     val runtime: AndroidNativeBackendRuntime,
     val preferredRuntime: String,
-    val selectionSummary: String,
+    val selectionSummary: String
 )
 
 interface AndroidNativeBackendRuntime {
@@ -116,12 +111,12 @@ interface AndroidNativeBackendRuntime {
 
     fun availability(
         context: android.content.Context,
-        bundle: AndroidNativeBackendLaunchBundlePayload,
+        bundle: AndroidNativeBackendLaunchBundlePayload
     ): AndroidNativeBackendAvailability
 
     fun launch(
         context: android.content.Context,
-        bundle: AndroidNativeBackendLaunchBundlePayload,
+        bundle: AndroidNativeBackendLaunchBundlePayload
     ): AndroidNativeBackendLaunchResult
 
     fun stop(handle: AndroidNativeBackendRunningHandle): String

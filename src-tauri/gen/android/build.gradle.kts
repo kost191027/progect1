@@ -1,7 +1,7 @@
 buildscript {
     repositories {
-        google()
         mavenCentral()
+        google()
     }
     dependencies {
         classpath("com.android.tools.build:gradle:8.11.0")
@@ -19,4 +19,3 @@ allprojects {
 tasks.register("clean").configure {
     delete("build")
 }
-

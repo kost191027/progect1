@@ -73,3 +73,31 @@ jobs:
 
       - name: Rust cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+  android-kotlin-quality:
+    runs-on: ubuntu-latest
+    env:
+      VITE_APP_BUILD: ${{ github.run_number }}
+      VITE_GITHUB_RUN_NUMBER: ${{ github.run_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Android Kotlin quality gate
+        run: npm run android:kotlin:check

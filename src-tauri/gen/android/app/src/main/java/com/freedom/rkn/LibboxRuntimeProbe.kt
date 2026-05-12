@@ -6,7 +6,7 @@ import java.io.File
 
 data class LibboxRuntimeProbeResult(
     val nativeLibraries: List<String>,
-    val candidateClasses: List<String>,
+    val candidateClasses: List<String>
 ) {
     fun summary(): String {
         val nativeSummary = if (nativeLibraries.isEmpty()) {
@@ -28,7 +28,7 @@ object LibboxRuntimeProbe {
         listOf(
             "io.nekohasekai",
             "libbox",
-            "sagernet",
+            "sagernet"
         )
 
     fun inspect(context: Context): LibboxRuntimeProbeResult {
@@ -36,7 +36,7 @@ object LibboxRuntimeProbe {
         val candidateClasses = inspectCandidateClasses(context)
         return LibboxRuntimeProbeResult(
             nativeLibraries = nativeLibraries,
-            candidateClasses = candidateClasses,
+            candidateClasses = candidateClasses
         )
     }
 
@@ -57,15 +57,15 @@ object LibboxRuntimeProbe {
             ?: emptyList()
     }
 
-    private fun inspectCandidateClasses(context: Context): List<String> {
-        return runCatching {
-            val dexFile = DexFile(context.packageCodePath)
-            dexFile.entries().asSequence()
-                .filter { entry -> classHints.any { hint -> entry.contains(hint, ignoreCase = true) } }
-                .take(20)
-                .toList()
-        }.getOrElse {
-            emptyList()
-        }
+    private fun inspectCandidateClasses(context: Context): List<String> = runCatching {
+        val dexFile = DexFile(context.packageCodePath)
+        dexFile.entries().asSequence()
+            .filter { entry ->
+                classHints.any { hint -> entry.contains(hint, ignoreCase = true) }
+            }
+            .take(20)
+            .toList()
+    }.getOrElse {
+        emptyList()
     }
 }

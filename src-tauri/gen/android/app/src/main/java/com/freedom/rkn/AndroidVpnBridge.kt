@@ -4,20 +4,16 @@ import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 
 object AndroidVpnBridge {
     @JvmStatic
-    fun getNativeLibraryDir(context: Context): String {
-        return context.applicationInfo.nativeLibraryDir ?: ""
-    }
+    fun getNativeLibraryDir(context: Context): String =
+        context.applicationInfo.nativeLibraryDir ?: ""
 
     @JvmStatic
-    fun isVpnPermissionGranted(context: Context): Boolean {
-        return VpnService.prepare(context) == null
-    }
+    fun isVpnPermissionGranted(context: Context): Boolean = VpnService.prepare(context) == null
 
     @JvmStatic
     fun requestVpnPermission(activity: Activity): Boolean {
@@ -43,39 +39,26 @@ object AndroidVpnBridge {
     }
 
     @JvmStatic
-    fun isTunnelInterfaceReady(context: Context): Boolean {
-        return AndroidTunnelService.isTunnelInterfaceReady()
-    }
+    fun isTunnelInterfaceReady(context: Context): Boolean =
+        AndroidTunnelService.isTunnelInterfaceReady()
 
     @JvmStatic
-    fun getTunnelDebugState(context: Context): String {
-        return AndroidTunnelService.getTunnelDebugState()
-    }
+    fun getTunnelDebugState(context: Context): String = AndroidTunnelService.getTunnelDebugState()
 
     @JvmStatic
-    fun peekTunnelFd(context: Context): Int {
-        return AndroidTunnelService.peekTunnelFd()
-    }
+    fun peekTunnelFd(context: Context): Int = AndroidTunnelService.peekTunnelFd()
 
     @JvmStatic
-    fun getTunnelAddress(context: Context): String {
-        return AndroidTunnelService.getTunnelAddress()
-    }
+    fun getTunnelAddress(context: Context): String = AndroidTunnelService.getTunnelAddress()
 
     @JvmStatic
-    fun getTunnelPrefixLength(context: Context): Int {
-        return AndroidTunnelService.getTunnelPrefixLength()
-    }
+    fun getTunnelPrefixLength(context: Context): Int = AndroidTunnelService.getTunnelPrefixLength()
 
     @JvmStatic
-    fun getTunnelRoute(context: Context): String {
-        return AndroidTunnelService.getTunnelRoute()
-    }
+    fun getTunnelRoute(context: Context): String = AndroidTunnelService.getTunnelRoute()
 
     @JvmStatic
-    fun getTunnelMtu(context: Context): Int {
-        return AndroidTunnelService.getTunnelMtu()
-    }
+    fun getTunnelMtu(context: Context): Int = AndroidTunnelService.getTunnelMtu()
 
     @JvmStatic
     fun registerBackendHandoffSession(
@@ -84,28 +67,24 @@ object AndroidVpnBridge {
         contextPath: String,
         backendConfigPath: String,
         logPath: String,
-        tunFd: Int,
-    ): String {
-        return AndroidTunnelService.registerBackendHandoffSession(
-            sessionId = sessionId,
-            contextPath = contextPath,
-            backendConfigPath = backendConfigPath,
-            logPath = logPath,
-            tunFd = tunFd,
-        )
-    }
+        tunFd: Int
+    ): String = AndroidTunnelService.registerBackendHandoffSession(
+        sessionId = sessionId,
+        contextPath = contextPath,
+        backendConfigPath = backendConfigPath,
+        logPath = logPath,
+        tunFd = tunFd
+    )
 
     @JvmStatic
     fun claimBackendHandoffSession(
         context: Context,
         sessionId: String,
-        consumerTag: String,
-    ): String {
-        return AndroidTunnelService.claimBackendHandoffSession(
-            sessionId = sessionId,
-            consumerTag = consumerTag,
-        )
-    }
+        consumerTag: String
+    ): String = AndroidTunnelService.claimBackendHandoffSession(
+        sessionId = sessionId,
+        consumerTag = consumerTag
+    )
 
     @JvmStatic
     fun updateBackendHandoffSessionState(
@@ -113,60 +92,53 @@ object AndroidVpnBridge {
         sessionId: String,
         consumerTag: String,
         phase: String,
-        detail: String,
-    ): String {
-        return AndroidTunnelService.updateBackendHandoffSessionState(
-            sessionId = sessionId,
-            consumerTag = consumerTag,
-            phase = phase,
-            detail = detail,
-        )
-    }
+        detail: String
+    ): String = AndroidTunnelService.updateBackendHandoffSessionState(
+        sessionId = sessionId,
+        consumerTag = consumerTag,
+        phase = phase,
+        detail = detail
+    )
 
     @JvmStatic
-    fun getBackendHandoffState(context: Context): String {
-        return AndroidTunnelService.getBackendHandoffState()
-    }
+    fun getBackendHandoffState(context: Context): String =
+        AndroidTunnelService.getBackendHandoffState()
 
     @JvmStatic
-    fun getBackendHandoffSessionId(context: Context): String {
-        return AndroidTunnelService.getBackendHandoffSessionId()
-    }
+    fun getBackendHandoffSessionId(context: Context): String =
+        AndroidTunnelService.getBackendHandoffSessionId()
 
     @JvmStatic
-    fun getBackendHandoffContextPath(context: Context): String {
-        return AndroidTunnelService.getBackendHandoffContextPath()
-    }
+    fun getBackendHandoffContextPath(context: Context): String =
+        AndroidTunnelService.getBackendHandoffContextPath()
 
     @JvmStatic
-    fun getBackendHandoffConfigPath(context: Context): String {
-        return AndroidTunnelService.getBackendHandoffConfigPath()
-    }
+    fun getBackendHandoffConfigPath(context: Context): String =
+        AndroidTunnelService.getBackendHandoffConfigPath()
 
     @JvmStatic
-    fun getBackendHandoffLogPath(context: Context): String {
-        return AndroidTunnelService.getBackendHandoffLogPath()
-    }
+    fun getBackendHandoffLogPath(context: Context): String =
+        AndroidTunnelService.getBackendHandoffLogPath()
 
     @JvmStatic
-    fun startNativeBackendSeam(context: Context, claimPath: String): String {
-        return AndroidNativeBackendSeam.startClaimedSession(context, claimPath)
-    }
+    fun startNativeBackendSeam(context: Context, claimPath: String): String =
+        AndroidNativeBackendSeam.startClaimedSession(context, claimPath)
 
     @JvmStatic
-    fun getNativeBackendStatusPath(context: Context): String {
-        return AndroidNativeBackendSeam.getStatusPath(context)
-    }
+    fun abortNativeBackendSession(context: Context, sessionId: String, reason: String): String =
+        AndroidNativeBackendSeam.abortClaimedSession(context, sessionId, reason)
 
     @JvmStatic
-    fun getNativeBackendStatusState(context: Context): String {
-        return AndroidNativeBackendSeam.getStatusState(context)
-    }
+    fun getNativeBackendStatusPath(context: Context): String =
+        AndroidNativeBackendSeam.getStatusPath(context)
 
     @JvmStatic
-    fun protectSocketFd(context: Context, fd: Int): Boolean {
-        return AndroidTunnelService.protectSocketFd(fd)
-    }
+    fun getNativeBackendStatusState(context: Context): String =
+        AndroidNativeBackendSeam.getStatusState(context)
+
+    @JvmStatic
+    fun protectSocketFd(context: Context, fd: Int): Boolean =
+        AndroidTunnelService.protectSocketFd(fd)
 
     @JvmStatic
     fun writeClipboardText(context: Context, text: String) {

@@ -8,3 +8,9 @@ echo "⚙️ Running Rust Formatting & Clippy (Backend)..."
 cd src-tauri
 cargo fmt --check
 cargo clippy -- -D warnings
+cd ..
+
+if git diff --cached --name-only | grep -Eq '^(src-tauri/gen/android/.*\.(kt|kts)|src-tauri/gen/android/config/detekt\.yml|src-tauri/gen/android/\.editorconfig|scripts/run-android-gradle\.mjs)$'; then
+  echo "⚙️ Running Android Kotlin quality gate..."
+  npm run android:kotlin:check
+fi

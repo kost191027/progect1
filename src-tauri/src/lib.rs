@@ -633,6 +633,63 @@ fn trim_utf8_bom(value: &str) -> &str {
 #[cfg(target_os = "android")]
 const ANDROID_PROXY_FALLBACK_MODE: bool = false;
 
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AndroidLocalProxyInboundViolation {
+    inbound_type: String,
+    listen: String,
+    listen_port: String,
+}
+
+#[cfg(any(target_os = "android", test))]
+fn find_android_local_proxy_inbound_violation(
+    parsed: &serde_json::Value,
+) -> Option<AndroidLocalProxyInboundViolation> {
+    let inbounds = parsed.get("inbounds").and_then(|value| value.as_array())?;
+
+    for inbound in inbounds {
+        let inbound_type = inbound
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let listen = inbound
+            .get("listen")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        let is_proxy_inbound = matches!(inbound_type, "socks" | "mixed" | "http");
+        let is_localhost_listener = matches!(listen, "127.0.0.1" | "::1" | "localhost");
+
+        if is_proxy_inbound || is_localhost_listener {
+            let listen_port = inbound
+                .get("listen_port")
+                .and_then(|value| value.as_u64())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            return Some(AndroidLocalProxyInboundViolation {
+                inbound_type: inbound_type.to_string(),
+                listen: if listen.is_empty() {
+                    "default".to_string()
+                } else {
+                    listen.to_string()
+                },
+                listen_port,
+            });
+        }
+    }
+
+    None
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_local_proxy_inbound_error(violation: &AndroidLocalProxyInboundViolation) -> String {
+    format!(
+        "[SECURITY] Android security policy blocked a local proxy inbound (type='{}', listen='{}', port={}). RKN mobile currently permits only VPN/TUN-style inbounds; localhost proxy fallback must go through an explicit security review before it can be enabled.",
+        violation.inbound_type, violation.listen, violation.listen_port
+    )
+}
+
 #[cfg(target_os = "android")]
 fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Result<String, String> {
     if ANDROID_PROXY_FALLBACK_MODE {
@@ -685,6 +742,10 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 object.insert("mtu".to_string(), serde_json::json!(1280));
             }
         }
+    }
+
+    if let Some(violation) = find_android_local_proxy_inbound_violation(&cfg) {
+        return Err(android_local_proxy_inbound_error(&violation));
     }
 
     if let Some(outbounds) = cfg
@@ -3440,6 +3501,69 @@ fn android_start_native_backend_seam(claim_path: &str) -> Result<String, String>
 }
 
 #[cfg(target_os = "android")]
+fn android_abort_native_backend_session(session_id: &str, reason: &str) -> Result<String, String> {
+    with_android_activity(|env, activity| {
+        let class_loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )
+            .map_err(|e| format!("Failed to access Android app class loader: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android app class loader: {}", e))?;
+        let class_name = env
+            .new_string("com.freedom.rkn.AndroidVpnBridge")
+            .map_err(|e| format!("Failed to allocate Android bridge class name: {}", e))?;
+        let bridge = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&JObject::from(class_name))],
+            )
+            .map_err(|e| format!("Failed to load Android VPN bridge class: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
+        let bridge = jni::objects::JClass::from(bridge);
+        let java_session_id = env
+            .new_string(session_id)
+            .map_err(|e| format!("Failed to allocate Android abort session id: {}", e))?;
+        let java_reason = env
+            .new_string(reason)
+            .map_err(|e| format!("Failed to allocate Android abort reason: {}", e))?;
+        let value = env
+            .call_static_method(
+                bridge,
+                "abortNativeBackendSession",
+                "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &[
+                    JValue::Object(&activity),
+                    JValue::Object(&JObject::from(java_session_id)),
+                    JValue::Object(&JObject::from(java_reason)),
+                ],
+            )
+            .map_err(|e| format!("Failed to abort Android native backend session: {}", e))?
+            .l()
+            .map_err(|e| {
+                format!(
+                    "Failed to decode Android native backend abort result: {}",
+                    e
+                )
+            })?;
+        let java_string = jni::objects::JString::from(value);
+        let resolved = env
+            .get_string(&java_string)
+            .map_err(|e| format!("Failed to read Android native backend abort result: {}", e))?
+            .to_string_lossy()
+            .into_owned();
+
+        Ok(resolved)
+    })
+}
+
+#[cfg(target_os = "android")]
 #[allow(dead_code)]
 fn android_protect_socket_fd(fd: i32) -> Result<bool, String> {
     with_android_activity(|env, activity| {
@@ -3884,10 +4008,12 @@ async fn start_android_native_backend_consumer_seam_inner(
             }
         }
 
-        return Err(format!(
+        let reason = format!(
             "Android native backend stayed in a pending launch state for too long. status_path={}, runtime={}, detail={}",
             status_path, runtime_name, detail
-        ));
+        );
+        let _ = android_abort_native_backend_session(&runtime_context.session_id, &reason);
+        return Err(reason);
     }
 
     Ok(AndroidNativeBackendLaunchSnapshot {
@@ -3948,36 +4074,8 @@ fn ensure_android_config_has_no_local_proxy_inbounds(config_path: &str) -> Resul
         )
     })?;
 
-    let Some(inbounds) = parsed.get("inbounds").and_then(|value| value.as_array()) else {
-        return Ok(());
-    };
-
-    for inbound in inbounds {
-        let inbound_type = inbound
-            .get("type")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let listen = inbound
-            .get("listen")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-
-        let is_local_proxy_inbound = matches!(inbound_type, "socks" | "mixed" | "http");
-        let is_localhost_listener = matches!(listen, "127.0.0.1" | "::1" | "localhost");
-
-        if is_local_proxy_inbound || is_localhost_listener {
-            let listen_port = inbound
-                .get("listen_port")
-                .and_then(|value| value.as_u64())
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            return Err(format!(
-                "Android security policy blocked a localhost proxy inbound (type='{}', listen='{}', port={}). RKN mobile currently permits only VPN/TUN-style inbounds to avoid localhost proxy leaks across apps.",
-                inbound_type,
-                if listen.is_empty() { "default" } else { listen },
-                listen_port
-            ));
-        }
+    if let Some(violation) = find_android_local_proxy_inbound_violation(&parsed) {
+        return Err(android_local_proxy_inbound_error(&violation));
     }
 
     Ok(())
@@ -4037,7 +4135,15 @@ fn prepare_android_runtime_launch(
         )
     })?;
     let android_config_path = local_data.join("client_config_android.json");
-    let runtime_cfg = build_android_runtime_client_config(&raw, log_path)?;
+    let runtime_cfg = match build_android_runtime_client_config(&raw, log_path) {
+        Ok(config) => config,
+        Err(error) => {
+            if error.starts_with("[SECURITY]") {
+                let _ = app.emit("tunnel-log", error.clone());
+            }
+            return Err(error);
+        }
+    };
     std::fs::write(&android_config_path, &runtime_cfg).map_err(|e| {
         format!(
             "Failed to write Android runtime client config {}: {}",
@@ -5340,7 +5446,7 @@ fn spawn_post_start_transport_sync_check(app: AppHandle, pid: u32) {
 
 #[cfg(target_os = "android")]
 async fn wait_for_android_backend_shutdown(app: &AppHandle) {
-    for _ in 0..15 {
+    for _ in 0..60 {
         let backend_state =
             android_native_backend_status_state().unwrap_or_else(|_| "unknown".to_string());
         let tun_ready = android_tun_interface_ready().unwrap_or(false);
@@ -5397,11 +5503,43 @@ fn clear_android_native_backend_runtime_artifacts(app: &AppHandle) {
     let _ = persist_android_runtime_context(&local_data, &snapshot);
 }
 
+#[cfg(target_os = "android")]
+async fn rollback_android_tunnel_start_failure(app: &AppHandle, reason: &str) {
+    if let Ok(local_data) = app.path().app_local_data_dir() {
+        if let Ok(Some(snapshot)) = load_android_runtime_context(&local_data) {
+            if !snapshot.session_id.is_empty() {
+                let _ = android_abort_native_backend_session(&snapshot.session_id, reason);
+            }
+        }
+    }
+
+    let _ = stop_android_tunnel_service();
+    wait_for_android_backend_shutdown(app).await;
+    clear_android_native_backend_runtime_artifacts(app);
+}
+
+async fn verify_tunnel_start_or_cleanup(
+    app: &AppHandle,
+    state: &AppState,
+    pid: u32,
+    log_path: &str,
+) -> Result<(), String> {
+    let result = verify_tunnel_start(app, state, pid, log_path).await;
+    #[cfg(target_os = "android")]
+    if let Err(error) = result.as_ref() {
+        rollback_android_tunnel_start_failure(app, error).await;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "windows")]
     use super::parse_windows_network_fingerprint_json;
-    use super::{escape_applescript, shell_single_quote};
+    use super::{
+        android_local_proxy_inbound_error, escape_applescript,
+        find_android_local_proxy_inbound_violation, shell_single_quote,
+    };
 
     #[test]
     fn escape_applescript_preserves_shell_special_chars_inside_string_literal() {
@@ -5421,6 +5559,81 @@ mod tests {
         let quoted = shell_single_quote(input);
 
         assert_eq!(quoted, r#"'/tmp/test'"'"'s "path" $(whoami) `id`'"#);
+    }
+
+    #[test]
+    fn android_local_proxy_guard_allows_tun_only_config() {
+        let config = serde_json::json!({
+            "inbounds": [
+                {
+                    "type": "tun",
+                    "tag": "tun-in"
+                }
+            ]
+        });
+
+        assert!(find_android_local_proxy_inbound_violation(&config).is_none());
+    }
+
+    #[test]
+    fn android_local_proxy_guard_blocks_mixed_localhost_inbound() {
+        let config = serde_json::json!({
+            "inbounds": [
+                {
+                    "type": "mixed",
+                    "listen": "127.0.0.1",
+                    "listen_port": 2080
+                }
+            ]
+        });
+
+        let violation = find_android_local_proxy_inbound_violation(&config)
+            .expect("mixed localhost inbound must be blocked on Android");
+
+        assert_eq!(violation.inbound_type, "mixed");
+        assert_eq!(violation.listen, "127.0.0.1");
+        assert_eq!(violation.listen_port, "2080");
+        assert!(android_local_proxy_inbound_error(&violation).starts_with("[SECURITY]"));
+    }
+
+    #[test]
+    fn android_local_proxy_guard_blocks_http_and_socks_proxy_inbounds() {
+        for inbound_type in ["http", "socks"] {
+            let config = serde_json::json!({
+                "inbounds": [
+                    {
+                        "type": inbound_type,
+                        "listen": "0.0.0.0",
+                        "listen_port": 18080
+                    }
+                ]
+            });
+
+            let violation = find_android_local_proxy_inbound_violation(&config)
+                .expect("proxy inbound must be blocked on Android even when it is not explicitly bound to 127.0.0.1");
+
+            assert_eq!(violation.inbound_type, inbound_type);
+        }
+    }
+
+    #[test]
+    fn android_local_proxy_guard_blocks_any_localhost_listener() {
+        for listen in ["127.0.0.1", "::1", "localhost"] {
+            let config = serde_json::json!({
+                "inbounds": [
+                    {
+                        "type": "custom-fallback",
+                        "listen": listen,
+                        "listen_port": 19090
+                    }
+                ]
+            });
+
+            let violation = find_android_local_proxy_inbound_violation(&config)
+                .expect("localhost listeners must stay blocked until a reviewed Android fallback mode exists");
+
+            assert_eq!(violation.listen, listen);
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -5504,7 +5717,7 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         Ok(pid) => pid,
         Err(error) => {
             #[cfg(target_os = "android")]
-            let _ = stop_android_tunnel_service();
+            rollback_android_tunnel_start_failure(&app, &error).await;
             return Err(error);
         }
     };
@@ -5521,12 +5734,8 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         },
     );
 
-    verify_tunnel_start(&app, &state, pid, tunnel_log_path())
-        .await
-        .inspect_err(|_| {
-            #[cfg(target_os = "android")]
-            let _ = stop_android_tunnel_service();
-        })?;
+    verify_tunnel_start_or_cleanup(&app, &state, pid, tunnel_log_path()).await?;
+
     spawn_log_reader(app.clone(), pid, tunnel_log_path());
     spawn_process_exit_monitor(app.clone(), pid);
     spawn_network_recovery_monitor(app.clone(), pid);

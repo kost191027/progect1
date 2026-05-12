@@ -19,6 +19,7 @@ object AndroidLocalResolver : LocalDNSTransport {
             isDaemon = true
         }
     }
+
     @Volatile
     private var appContextRef: android.content.Context? = null
 
@@ -26,9 +27,8 @@ object AndroidLocalResolver : LocalDNSTransport {
         appContextRef = context.applicationContext
     }
 
-    private fun appContext(): android.content.Context {
-        return appContextRef ?: error("AndroidLocalResolver is not initialized yet.")
-    }
+    private fun appContext(): android.content.Context =
+        appContextRef ?: error("AndroidLocalResolver is not initialized yet.")
 
     override fun raw(): Boolean = true
 
@@ -69,7 +69,7 @@ object AndroidLocalResolver : LocalDNSTransport {
             DnsResolver.FLAG_NO_RETRY,
             dnsExecutor,
             signal,
-            callback,
+            callback
         )
 
         if (!latch.await(DNS_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
@@ -128,7 +128,7 @@ object AndroidLocalResolver : LocalDNSTransport {
                 DnsResolver.FLAG_NO_RETRY,
                 dnsExecutor,
                 signal,
-                callback,
+                callback
             )
         } else {
             DnsResolver.getInstance().query(
@@ -137,7 +137,7 @@ object AndroidLocalResolver : LocalDNSTransport {
                 DnsResolver.FLAG_NO_RETRY,
                 dnsExecutor,
                 signal,
-                callback,
+                callback
             )
         }
 
