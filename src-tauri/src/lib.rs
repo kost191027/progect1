@@ -630,7 +630,7 @@ fn trim_utf8_bom(value: &str) -> &str {
     value.strip_prefix('\u{feff}').unwrap_or(value)
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 const ANDROID_PROXY_FALLBACK_MODE: bool = false;
 
 #[cfg(any(target_os = "android", test))]
@@ -690,7 +690,182 @@ fn android_local_proxy_inbound_error(violation: &AndroidLocalProxyInboundViolati
     )
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
+fn android_rule_has_action(rule: &serde_json::Value, action: &str) -> bool {
+    rule.get("action").and_then(|value| value.as_str()) == Some(action)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_rule_routes_rule_set_to(rule: &serde_json::Value, tag: &str, outbound: &str) -> bool {
+    if !android_rule_has_action(rule, "route") {
+        return false;
+    }
+
+    if rule.get("outbound").and_then(|value| value.as_str()) != Some(outbound) {
+        return false;
+    }
+
+    rule.get("rule_set")
+        .and_then(|value| value.as_array())
+        .map(|rule_sets| rule_sets.iter().any(|value| value.as_str() == Some(tag)))
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_dns_rule_uses_server(rule: &serde_json::Value, tag: &str, server: &str) -> bool {
+    if rule.get("server").and_then(|value| value.as_str()) != Some(server) {
+        return false;
+    }
+
+    rule.get("rule_set")
+        .and_then(|value| value.as_array())
+        .map(|rule_sets| rule_sets.iter().any(|value| value.as_str() == Some(tag)))
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_route_policy_error(message: &str) -> String {
+    format!("[ANDROID ROUTE] Android runtime route policy is incomplete: {message}")
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_direct_rule_set_dns_server() -> &'static str {
+    // Android's local resolver can be affected by Private DNS, captive portals,
+    // and vendor VPN routing quirks. Keep RU routing direct, but resolve through
+    // the protected remote resolver so geodata does not fail before routing.
+    "remote-dns"
+}
+
+#[cfg(any(target_os = "android", test))]
+fn inject_android_local_rule_sets(
+    raw_config: &str,
+    local_rule_sets: &[crate::geodata::LocalRuleSetAsset],
+) -> Result<String, String> {
+    let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
+        format!(
+            "Failed to parse generated client config while injecting Android rule-sets: {}",
+            e
+        )
+    })?;
+
+    let route = cfg
+        .get_mut("route")
+        .and_then(|value| value.as_object_mut())
+        .ok_or_else(|| {
+            android_route_policy_error("missing route section while injecting Android rule-sets")
+        })?;
+    let rule_set_entries = local_rule_sets
+        .iter()
+        .map(|rule_set| {
+            serde_json::json!({
+                "tag": rule_set.tag,
+                "type": "local",
+                "format": "binary",
+                "path": rule_set.path.to_string_lossy().to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    route.insert("rule_set".to_string(), serde_json::json!(rule_set_entries));
+
+    serde_json::to_string_pretty(&cfg).map_err(|e| {
+        format!(
+            "Failed to serialize generated client config after injecting Android rule-sets: {}",
+            e
+        )
+    })
+}
+
+#[cfg(any(target_os = "android", test))]
+fn validate_android_runtime_route_policy(cfg: &serde_json::Value) -> Result<(), String> {
+    let route = cfg
+        .get("route")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| android_route_policy_error("missing route section"))?;
+    let dns = cfg
+        .get("dns")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| android_route_policy_error("missing dns section"))?;
+    let route_rules = route
+        .get("rules")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| android_route_policy_error("missing route.rules"))?;
+    let dns_rules = dns
+        .get("rules")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| android_route_policy_error("missing dns.rules"))?;
+    let route_rule_sets = route
+        .get("rule_set")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let route_rule_set_tags = route_rule_sets
+        .iter()
+        .filter_map(|rule_set| rule_set.get("tag").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+
+    if route.get("final").and_then(|value| value.as_str()) != Some("proxy") {
+        return Err(android_route_policy_error("route.final must stay proxy"));
+    }
+
+    if dns.get("final").and_then(|value| value.as_str()) != Some("remote-dns") {
+        return Err(android_route_policy_error("dns.final must stay remote-dns"));
+    }
+
+    let has_dns_hijack = route_rules
+        .iter()
+        .any(|rule| android_rule_has_action(rule, "hijack-dns"));
+    if !has_dns_hijack {
+        return Err(android_route_policy_error("missing hijack-dns route rule"));
+    }
+
+    if route_rule_set_tags.contains(&crate::geodata::GOOGLE_RULE_SET_TAG) {
+        let google_routes_proxy = route_rules.iter().any(|rule| {
+            android_rule_routes_rule_set_to(rule, crate::geodata::GOOGLE_RULE_SET_TAG, "proxy")
+        });
+        let google_dns_remote = dns_rules.iter().any(|rule| {
+            android_dns_rule_uses_server(rule, crate::geodata::GOOGLE_RULE_SET_TAG, "remote-dns")
+        });
+
+        if !google_routes_proxy || !google_dns_remote {
+            return Err(android_route_policy_error(
+                "Google rule-set must route and resolve through proxy",
+            ));
+        }
+    }
+
+    let direct_rule_tags = route_rule_set_tags
+        .iter()
+        .copied()
+        .filter(|tag| crate::geodata::DIRECT_ROUTE_RULE_SET_TAGS.contains(tag))
+        .collect::<Vec<_>>();
+    if !direct_rule_tags.is_empty() {
+        let routes_direct = direct_rule_tags.iter().all(|tag| {
+            route_rules
+                .iter()
+                .any(|rule| android_rule_routes_rule_set_to(rule, tag, "direct"))
+        });
+        let dns_server = android_direct_rule_set_dns_server();
+        let dns_local = direct_rule_tags
+            .iter()
+            .filter(|tag| !tag.starts_with("geoip-"))
+            .all(|tag| {
+                dns_rules
+                    .iter()
+                    .any(|rule| android_dns_rule_uses_server(rule, tag, dns_server))
+            });
+
+        if !routes_direct || !dns_local {
+            return Err(android_route_policy_error(
+                "RU rule-sets must route direct and use the Android direct rule-set DNS server for domain rule-sets",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", test))]
 fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Result<String, String> {
     if ANDROID_PROXY_FALLBACK_MODE {
         return build_android_proxy_runtime_client_config(raw_config, log_path);
@@ -844,12 +1019,6 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 "port": 53,
                 "action": "hijack-dns"
             }),
-            serde_json::json!({
-                "network": "udp",
-                "port": 443,
-                "action": "reject",
-                "method": "default"
-            }),
         ];
 
         if google_rule_set_available {
@@ -885,6 +1054,13 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 "outbound": "direct"
             }));
         }
+
+        route_rules.push(serde_json::json!({
+            "network": "udp",
+            "port": 443,
+            "action": "reject",
+            "method": "default"
+        }));
 
         route.insert("rules".to_string(), serde_json::json!(route_rules));
         route.insert("final".to_string(), serde_json::json!("proxy"));
@@ -929,6 +1105,7 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 }
             ]),
         );
+        let android_direct_dns_server = android_direct_rule_set_dns_server();
         let mut dns_rules = vec![
             serde_json::json!({
                 "domain_suffix": crate::geodata::PROXY_PRIORITY_DOMAIN_SUFFIXES,
@@ -936,7 +1113,7 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             }),
             serde_json::json!({
                 "domain_suffix": crate::geodata::CURATED_RU_DOMAIN_SUFFIXES,
-                "server": "local-dns"
+                "server": android_direct_dns_server
             }),
         ];
 
@@ -953,7 +1130,7 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         if !direct_dns_rule_set_tags.is_empty() {
             dns_rules.push(serde_json::json!({
                 "rule_set": direct_dns_rule_set_tags,
-                "server": "local-dns"
+                "server": android_direct_dns_server
             }));
         }
 
@@ -962,11 +1139,13 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         dns.insert("strategy".to_string(), serde_json::json!("ipv4_only"));
     }
 
+    validate_android_runtime_route_policy(&cfg)?;
+
     serde_json::to_string_pretty(&cfg)
         .map_err(|e| format!("Failed to serialize Android runtime client config: {}", e))
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 fn build_android_proxy_runtime_client_config(
     raw_config: &str,
     log_path: &str,
@@ -1080,7 +1259,7 @@ fn build_android_proxy_runtime_client_config(
     })
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 fn validate_android_rule_set_file(path: &str) -> Result<(), String> {
     let mut magic = [0_u8; 4];
     let mut file = std::fs::File::open(path).map_err(|e| {
@@ -3183,6 +3362,16 @@ fn android_tun_mtu() -> Result<i32, String> {
 }
 
 #[cfg(target_os = "android")]
+fn android_private_dns_summary() -> Result<String, String> {
+    android_bridge_string("getPrivateDnsSummary")
+}
+
+#[cfg(target_os = "android")]
+fn android_active_network_summary() -> Result<String, String> {
+    android_bridge_string("getActiveNetworkSummary")
+}
+
+#[cfg(target_os = "android")]
 fn android_register_backend_handoff_session(
     session_id: &str,
     context_path: &str,
@@ -4120,7 +4309,7 @@ fn run_android_singbox_preflight(singbox_path: &str, config_path: &str) -> Resul
 }
 
 #[cfg(target_os = "android")]
-fn prepare_android_runtime_launch(
+async fn prepare_android_runtime_launch(
     app: &AppHandle,
     local_data: &std::path::Path,
     config_path: &std::path::Path,
@@ -4134,6 +4323,24 @@ fn prepare_android_runtime_launch(
             e
         )
     })?;
+    let local_rule_sets = crate::geodata::ensure_local_client_rule_sets(app).await?;
+    if local_rule_sets.is_empty() {
+        return Err(android_route_policy_error(
+            "no local Android rule-set assets were prepared; refusing to start without geodata-backed route policy",
+        ));
+    }
+    let raw = inject_android_local_rule_sets(&raw, &local_rule_sets)?;
+    let _ = app.emit(
+        "tunnel-log",
+        format!(
+            "[SYSTEM] Android route rule-sets prepared locally: {}.",
+            local_rule_sets
+                .iter()
+                .map(|rule_set| rule_set.tag)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
     let android_config_path = local_data.join("client_config_android.json");
     let runtime_cfg = match build_android_runtime_client_config(&raw, log_path) {
         Ok(config) => config,
@@ -4426,7 +4633,9 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                 &config_path,
                 log_path,
                 announce_prompt,
-            )? {
+            )
+            .await?
+            {
                 AndroidRuntimeLaunchPlan::TunHandoffRequired {
                     tun_fd,
                     config_path,
@@ -4698,7 +4907,9 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
                 );
             }
 
-            match prepare_android_runtime_launch(app, &local_data, &config_path, log_path, false)? {
+            match prepare_android_runtime_launch(app, &local_data, &config_path, log_path, false)
+                .await?
+            {
                 AndroidRuntimeLaunchPlan::TunHandoffRequired {
                     tun_fd,
                     config_path,
@@ -5537,9 +5748,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::parse_windows_network_fingerprint_json;
     use super::{
-        android_local_proxy_inbound_error, escape_applescript,
-        find_android_local_proxy_inbound_violation, shell_single_quote,
+        android_local_proxy_inbound_error, build_android_runtime_client_config, escape_applescript,
+        find_android_local_proxy_inbound_violation, inject_android_local_rule_sets,
+        shell_single_quote, validate_android_runtime_route_policy,
     };
+    use crate::android_direct_rule_set_dns_server;
 
     #[test]
     fn escape_applescript_preserves_shell_special_chars_inside_string_literal() {
@@ -5636,6 +5849,215 @@ mod tests {
         }
     }
 
+    fn write_test_srs(tag: &str) -> String {
+        let dir =
+            std::env::temp_dir().join(format!("rkn-android-route-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test rule-set dir must be created");
+        let path = dir.join(format!("{tag}.srs"));
+        std::fs::write(&path, b"SRS\x00test").expect("test SRS file must be written");
+        path.to_string_lossy().to_string()
+    }
+
+    fn android_policy_base_config() -> String {
+        serde_json::json!({
+            "log": {
+                "level": "info"
+            },
+            "dns": {
+                "servers": [
+                    {
+                        "type": "fakeip",
+                        "tag": "fakeip-dns",
+                        "inet4_range": "198.18.0.0/15"
+                    }
+                ],
+                "rules": [],
+                "final": "remote-dns"
+            },
+            "inbounds": [
+                {
+                    "type": "tun",
+                    "tag": "tun-in",
+                    "address": ["172.19.0.1/30"],
+                    "auto_route": true,
+                    "strict_route": true,
+                    "stack": "system",
+                    "sniff": true,
+                    "sniff_override_destination": true,
+                    "interface_name": "tun0"
+                }
+            ],
+            "outbounds": [
+                {
+                    "type": "shadowsocks",
+                    "tag": "proxy",
+                    "server": "203.0.113.10",
+                    "server_port": 4433,
+                    "multiplex": {
+                        "enabled": true
+                    }
+                },
+                {
+                    "type": "direct",
+                    "tag": "direct"
+                }
+            ],
+            "route": {
+                "rules": [],
+                "final": "proxy",
+                "rule_set": [
+                    {
+                        "tag": "geosite-google",
+                        "type": "local",
+                        "format": "binary",
+                        "path": write_test_srs("geosite-google")
+                    },
+                    {
+                        "tag": "geosite-category-ru",
+                        "type": "local",
+                        "format": "binary",
+                        "path": write_test_srs("geosite-category-ru")
+                    },
+                    {
+                        "tag": "geoip-ru",
+                        "type": "local",
+                        "format": "binary",
+                        "path": write_test_srs("geoip-ru")
+                    }
+                ]
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn android_runtime_config_preserves_split_tunnel_route_policy() {
+        let rendered = build_android_runtime_client_config(
+            &android_policy_base_config(),
+            "/data/user/0/com.freedom.rkn/files/rkn-tun.log",
+        )
+        .expect("Android runtime config should be generated");
+        let config = serde_json::from_str::<serde_json::Value>(&rendered)
+            .expect("Android runtime config should stay valid JSON");
+
+        validate_android_runtime_route_policy(&config)
+            .expect("Android route/DNS policy should pass audit");
+
+        let tun = config["inbounds"]
+            .as_array()
+            .and_then(|items| items.first())
+            .expect("tun inbound should exist");
+        assert_eq!(tun["type"], "tun");
+        assert_eq!(tun["auto_route"], true);
+        assert_eq!(tun["strict_route"], false);
+        assert_eq!(tun["stack"], "gvisor");
+        assert_eq!(tun["mtu"], 1280);
+        assert!(tun.get("interface_name").is_none());
+        assert!(tun.get("sniff").is_none());
+
+        let route_rules = config["route"]["rules"]
+            .as_array()
+            .expect("route rules should be an array");
+        assert!(route_rules.iter().any(|rule| {
+            rule["rule_set"]
+                .as_array()
+                .is_some_and(|rule_sets| rule_sets.iter().any(|value| value == "geosite-google"))
+                && rule["outbound"] == "proxy"
+        }));
+        assert!(route_rules.iter().any(|rule| {
+            rule["rule_set"].as_array().is_some_and(|rule_sets| {
+                rule_sets.iter().any(|value| value == "geosite-category-ru")
+            }) && rule["outbound"] == "direct"
+        }));
+
+        let ru_route_index = route_rules
+            .iter()
+            .position(|rule| {
+                rule["rule_set"].as_array().is_some_and(|rule_sets| {
+                    rule_sets.iter().any(|value| value == "geosite-category-ru")
+                }) && rule["outbound"] == "direct"
+            })
+            .expect("RU geodata route rule should exist");
+        let udp_443_reject_index = route_rules
+            .iter()
+            .position(|rule| {
+                rule["action"] == "reject" && rule["network"] == "udp" && rule["port"] == 443
+            })
+            .expect("UDP/443 fallback reject should exist");
+        assert!(
+            ru_route_index < udp_443_reject_index,
+            "RU direct geodata must be evaluated before generic UDP/443 reject"
+        );
+
+        let dns_rules = config["dns"]["rules"]
+            .as_array()
+            .expect("dns rules should be an array");
+        assert!(dns_rules.iter().any(|rule| {
+            rule["rule_set"].as_array().is_some_and(|rule_sets| {
+                rule_sets.iter().any(|value| value == "geosite-category-ru")
+            }) && rule["server"] == android_direct_rule_set_dns_server()
+        }));
+    }
+
+    #[test]
+    fn android_runtime_config_fails_when_ru_rule_set_is_not_local_srs() {
+        let mut config = serde_json::from_str::<serde_json::Value>(&android_policy_base_config())
+            .expect("base config must parse");
+        config["route"]["rule_set"][1]["type"] = serde_json::json!("remote");
+
+        let error = build_android_runtime_client_config(
+            &config.to_string(),
+            "/data/user/0/com.freedom.rkn/files/rkn-tun.log",
+        )
+        .expect_err("Android runtime must reject remote rule-set entries");
+
+        assert!(error.contains("requires local rule-set entries"));
+    }
+
+    #[test]
+    fn android_rule_set_injection_replaces_stale_paths_before_runtime_audit() {
+        let mut config = serde_json::from_str::<serde_json::Value>(&android_policy_base_config())
+            .expect("base config must parse");
+        config["route"]["rule_set"] = serde_json::json!([
+            {
+                "tag": "geosite-category-ru",
+                "type": "local",
+                "format": "binary",
+                "path": "/stale/missing/geosite-category-ru.srs"
+            }
+        ]);
+        let ru_path = write_test_srs("geosite-category-ru-injected");
+        let google_path = write_test_srs("geosite-google-injected");
+        let assets = vec![
+            crate::geodata::LocalRuleSetAsset {
+                tag: "geosite-category-ru",
+                path: std::path::PathBuf::from(&ru_path),
+            },
+            crate::geodata::LocalRuleSetAsset {
+                tag: crate::geodata::GOOGLE_RULE_SET_TAG,
+                path: std::path::PathBuf::from(&google_path),
+            },
+        ];
+
+        let injected = inject_android_local_rule_sets(&config.to_string(), &assets)
+            .expect("Android rule-set injection should succeed");
+        let rendered = build_android_runtime_client_config(
+            &injected,
+            "/data/user/0/com.freedom.rkn/files/rkn-tun.log",
+        )
+        .expect("Android runtime config should use injected local rule-sets");
+        let runtime_config = serde_json::from_str::<serde_json::Value>(&rendered)
+            .expect("runtime config should parse");
+
+        assert!(runtime_config["route"]["rule_set"]
+            .as_array()
+            .expect("rule_set should stay an array")
+            .iter()
+            .any(|rule_set| rule_set["path"] == ru_path));
+        validate_android_runtime_route_policy(&runtime_config)
+            .expect("injected Android route policy should pass audit");
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn parse_windows_network_fingerprint_json_builds_stable_fingerprint() {
@@ -5671,6 +6093,8 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
 
     #[cfg(target_os = "android")]
     ssh::ensure_local_transport_is_current(&app).await?;
+
+    #[cfg(not(target_os = "android"))]
     crate::geodata::ensure_local_client_rule_sets(&app).await?;
 
     #[cfg(target_os = "android")]
@@ -5957,6 +6381,111 @@ async fn get_android_runtime_context(app: AppHandle) -> Result<Option<serde_json
     {
         let _ = app;
         Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn check_android_route_policy(app: AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        let config_path = local_data.join("client_config_android.json");
+        if !config_path.exists() {
+            return Err(
+                "Android runtime config is not available yet. Start Protection once or run Deploy/Update before checking route policy."
+                    .to_string(),
+            );
+        }
+
+        let raw = std::fs::read_to_string(&config_path).map_err(|error| {
+            format!(
+                "Failed to read Android runtime config {}: {}",
+                config_path.display(),
+                error
+            )
+        })?;
+        let config = serde_json::from_str::<serde_json::Value>(&raw).map_err(|error| {
+            format!(
+                "Failed to parse Android runtime config {}: {}",
+                config_path.display(),
+                error
+            )
+        })?;
+
+        if let Some(violation) = find_android_local_proxy_inbound_violation(&config) {
+            return Err(android_local_proxy_inbound_error(&violation));
+        }
+        validate_android_runtime_route_policy(&config)?;
+
+        let inbounds = config
+            .get("inbounds")
+            .and_then(|value| value.as_array())
+            .map(|value| value.len())
+            .unwrap_or(0);
+        let route_rules = config
+            .get("route")
+            .and_then(|value| value.get("rules"))
+            .and_then(|value| value.as_array())
+            .map(|value| value.len())
+            .unwrap_or(0);
+        let dns_rules = config
+            .get("dns")
+            .and_then(|value| value.get("rules"))
+            .and_then(|value| value.as_array())
+            .map(|value| value.len())
+            .unwrap_or(0);
+        let rule_sets = config
+            .get("route")
+            .and_then(|value| value.get("rule_set"))
+            .and_then(|value| value.as_array())
+            .map(|value| {
+                value
+                    .iter()
+                    .filter_map(|rule_set| {
+                        let tag = rule_set.get("tag").and_then(|tag| tag.as_str())?;
+                        let path = rule_set.get("path").and_then(|path| path.as_str())?;
+                        let size = std::fs::metadata(path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        Some(format!("{tag}:{size}b"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "none".to_string());
+        let private_dns =
+            android_private_dns_summary().unwrap_or_else(|error| format!("unavailable({})", error));
+        let network = android_active_network_summary()
+            .unwrap_or_else(|error| format!("unavailable({})", error));
+        let tun_state =
+            android_tunnel_debug_state().unwrap_or_else(|error| format!("unavailable({})", error));
+        let private_dns_note = if private_dns.starts_with("hostname:")
+            || private_dns.starts_with("strict:")
+        {
+            " Private DNS is strict; if DNS leaks or RU geodata look wrong, disable Android Private DNS for the test."
+        } else {
+            ""
+        };
+        let summary = format!(
+            "Android route policy OK. Config: {}. inbounds={}, route_rules={}, dns_rules={}, rule_sets=[{}], private_dns={}, network={}, tun_state={}.{}",
+            config_path.display(),
+            inbounds,
+            route_rules,
+            dns_rules,
+            rule_sets,
+            private_dns,
+            network,
+            tun_state,
+            private_dns_note
+        );
+
+        Ok(summary)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok("Android route policy diagnostics are only available on Android builds.".to_string())
     }
 }
 
@@ -6407,6 +6936,7 @@ pub fn run() {
             stop_tunnel,
             get_windows_runtime_mode,
             get_android_runtime_context,
+            check_android_route_policy,
             claim_android_backend_session,
             prepare_android_backend_consumer_handoff,
             start_android_native_backend_consumer_seam,

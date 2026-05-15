@@ -221,6 +221,7 @@ export function useControlCenter() {
   const [isRunning, setIsRunning] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
+  const [isCheckingAndroidRoutePolicy, setIsCheckingAndroidRoutePolicy] = useState(false);
   const [isRotatingSni, setIsRotatingSni] = useState(false);
   const [isResettingLocalData, setIsResettingLocalData] = useState(false);
   const [isGeneratingInvite, setIsGeneratingInvite] = useState(false);
@@ -1308,6 +1309,26 @@ export function useControlCenter() {
     }
   }
 
+  async function checkAndroidRoutePolicy() {
+    setIsCheckingAndroidRoutePolicy(true);
+    setLastUserMessage("Auditing Android DNS and route policy.");
+    appendLog("--- CHECKING ANDROID ROUTE POLICY ---");
+
+    try {
+      const summary = await invoke<string>("check_android_route_policy");
+      appendLog(`[SYSTEM] ${summary}`);
+      setLastError(null);
+      setLastUserMessage("Android route policy looks OK. Detailed rule-set data is in the activity log.");
+    } catch (error) {
+      const message = String(error);
+      appendLog(`[MAIN ERROR] Android route policy check failed: ${message}`);
+      setLastError(message);
+      setLastUserMessage("Android route policy check failed. See the activity log for details.");
+    } finally {
+      setIsCheckingAndroidRoutePolicy(false);
+    }
+  }
+
   async function rotateSni(targetDomain: string) {
     if (!targetDomain || targetDomain === currentCoverDomain) {
       return;
@@ -1641,11 +1662,16 @@ export function useControlCenter() {
       isAndroidRuntime &&
       androidRuntimeContext?.backend_hint === "android_native_handoff_required"
     ) {
+      const backendReady =
+        androidRuntimeContext.backend_session_state.startsWith("ready") ||
+        androidRuntimeContext.consumer_launch_state.startsWith("ready");
+
       return {
-        title: "Android handoff checkpoint",
-        description:
-          "VpnService already owns the mobile TUN interface. The remaining blocker is the next 6A.4.1 backend that must consume this Android-owned interface instead of the standalone CLI path.",
-        tone: "attention",
+        title: backendReady ? "Android native backend ready" : "Android handoff checkpoint",
+        description: backendReady
+          ? "VpnService owns the mobile TUN interface and the libbox backend has consumed the handoff session. Use Android route diagnostics for DNS/geodata checks."
+          : "VpnService already owns the mobile TUN interface. Waiting for the Android-native backend to consume this handoff session.",
+        tone: backendReady ? "ready" : "attention",
         details: [
           `Handoff session: ${androidRuntimeContext.session_id}`,
           `TUN state: ${androidRuntimeContext.tun_state}`,
@@ -1811,6 +1837,7 @@ export function useControlCenter() {
     isRunning,
     isDeploying,
     isCheckingStatus,
+    isCheckingAndroidRoutePolicy,
     isRotatingSni,
     isResettingLocalData,
     isGeneratingInvite,
@@ -1830,6 +1857,7 @@ export function useControlCenter() {
     stopTunnel,
     deployServer,
     checkServerStatus,
+    checkAndroidRoutePolicy,
     rotateSni,
     generateInviteLink,
     copyExistingInvite,

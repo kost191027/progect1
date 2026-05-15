@@ -58,12 +58,14 @@ export function SystemStatusPanel({
         <div
           className={`flex items-start justify-between rounded-xl border px-4 py-4 ${toneClasses[statusSummary.state]}`}
         >
-          <div>
+          <div className="min-w-0">
             <div className="text-xs font-bold uppercase tracking-wider text-zinc-500">
               {isAndroidRuntime ? "Current phone state" : "Current state"}
             </div>
             <div className="mt-1 text-base font-semibold text-white">{statusSummary.title}</div>
-            <p className="mt-2 max-w-xl text-sm leading-6 text-zinc-300">{statusSummary.description}</p>
+            <p className="mt-2 max-w-xl break-words text-sm leading-6 text-zinc-300">
+              {statusSummary.description}
+            </p>
           </div>
 
           <div

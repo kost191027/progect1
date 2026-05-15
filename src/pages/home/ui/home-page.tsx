@@ -208,7 +208,9 @@ export function HomePage({ controlCenter }: HomePageProps) {
       <DiagnosticsActionsPanel
         isDeploying={controlCenter.isDeploying}
         isCheckingStatus={controlCenter.isCheckingStatus}
+        isCheckingAndroidRoutePolicy={controlCenter.isCheckingAndroidRoutePolicy}
         isRotatingSni={controlCenter.isRotatingSni}
+        isAndroidRuntime={controlCenter.isAndroidRuntime}
         diagnosticsTitle={controlCenter.diagnosticsSummary.title}
         diagnosticsDescription={controlCenter.diagnosticsSummary.description}
         diagnosticsTone={controlCenter.diagnosticsSummary.tone}
@@ -216,6 +218,7 @@ export function HomePage({ controlCenter }: HomePageProps) {
         currentCoverDomain={controlCenter.currentCoverDomain}
         availableCoverDomains={controlCenter.availableCoverDomains}
         onCheckStatus={controlCenter.checkServerStatus}
+        onCheckAndroidRoutePolicy={controlCenter.checkAndroidRoutePolicy}
         onRotateSni={controlCenter.rotateSni}
         collapsible
         defaultOpen={false}

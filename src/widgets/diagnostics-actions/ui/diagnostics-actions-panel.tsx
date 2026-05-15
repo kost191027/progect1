@@ -7,7 +7,9 @@ import { Panel } from "../../../shared/ui/panel";
 type DiagnosticsActionsPanelProps = {
   isDeploying: boolean;
   isCheckingStatus: boolean;
+  isCheckingAndroidRoutePolicy: boolean;
   isRotatingSni: boolean;
+  isAndroidRuntime: boolean;
   diagnosticsTitle: string;
   diagnosticsDescription: string;
   diagnosticsTone: "neutral" | "ready" | "attention";
@@ -18,13 +20,16 @@ type DiagnosticsActionsPanelProps = {
   defaultOpen?: boolean;
   storageKey?: string;
   onCheckStatus: () => void;
+  onCheckAndroidRoutePolicy: () => void;
   onRotateSni: (domain: string) => void;
 };
 
 export function DiagnosticsActionsPanel({
   isDeploying,
   isCheckingStatus,
+  isCheckingAndroidRoutePolicy,
   isRotatingSni,
+  isAndroidRuntime,
   diagnosticsTitle,
   diagnosticsDescription,
   diagnosticsTone,
@@ -35,6 +40,7 @@ export function DiagnosticsActionsPanel({
   defaultOpen,
   storageKey,
   onCheckStatus,
+  onCheckAndroidRoutePolicy,
   onRotateSni,
 }: DiagnosticsActionsPanelProps) {
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
@@ -42,6 +48,7 @@ export function DiagnosticsActionsPanel({
   const isSelectDisabled =
     isDeploying ||
     isCheckingStatus ||
+    isCheckingAndroidRoutePolicy ||
     isRotatingSni ||
     availableCoverDomains.length === 0 ||
     !currentCoverDomain;
@@ -103,13 +110,15 @@ export function DiagnosticsActionsPanel({
             Latest verdict
           </div>
           <div className="mt-2 text-sm font-semibold text-zinc-100">{diagnosticsTitle}</div>
-          <p className="mt-2 text-sm leading-6 text-zinc-400">{diagnosticsDescription}</p>
+          <p className="mt-2 min-w-0 break-words text-sm leading-6 text-zinc-400">
+            {diagnosticsDescription}
+          </p>
           {diagnosticsDetails && diagnosticsDetails.length > 0 ? (
             <div className="mt-3 space-y-2">
               {diagnosticsDetails.map((detail) => (
                 <div
                   key={detail}
-                  className="rounded-xl border border-zinc-800/80 bg-black/10 px-3 py-2 text-xs leading-5 text-zinc-300"
+                  className="min-w-0 overflow-hidden break-all rounded-xl border border-zinc-800/80 bg-black/10 px-3 py-2 text-xs leading-5 text-zinc-300"
                 >
                   {detail}
                 </div>
@@ -122,11 +131,33 @@ export function DiagnosticsActionsPanel({
           variant="secondary"
           fullWidth
           className="py-3 text-sm"
-          disabled={isDeploying || isCheckingStatus || isRotatingSni}
+          disabled={
+            isDeploying ||
+            isCheckingStatus ||
+            isCheckingAndroidRoutePolicy ||
+            isRotatingSni
+          }
           onClick={onCheckStatus}
         >
           {isCheckingStatus ? "Checking..." : "Check Server Status"}
         </Button>
+
+        {isAndroidRuntime ? (
+          <Button
+            variant="secondary"
+            fullWidth
+            className="py-3 text-sm"
+            disabled={
+              isDeploying ||
+              isCheckingStatus ||
+              isCheckingAndroidRoutePolicy ||
+              isRotatingSni
+            }
+            onClick={onCheckAndroidRoutePolicy}
+          >
+            {isCheckingAndroidRoutePolicy ? "Auditing..." : "Check Android Route Policy"}
+          </Button>
+        ) : null}
 
         <div className="space-y-2">
           <div className="text-[11px] font-bold uppercase tracking-[0.22em] text-zinc-500">

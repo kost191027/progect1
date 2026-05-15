@@ -147,6 +147,17 @@ fn write_rule_set_file(path: &PathBuf, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+fn local_rule_set_file_is_usable(path: &std::path::Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+
+    let mut magic = [0_u8; 3];
+    use std::io::Read;
+    file.read_exact(&mut magic).is_ok() && magic == *b"SRS"
+}
+
 async fn download_rule_set_file(url: &str, path: &PathBuf) -> Result<(), String> {
     #[cfg(target_os = "android")]
     let timeout = Duration::from_secs(8);
@@ -186,17 +197,19 @@ pub async fn ensure_local_client_rule_sets(
         let path = local_rule_set_path(app, tag)?;
         #[cfg(target_os = "android")]
         if let Some(bytes) = bundled_rule_set_bytes(rule_set.tag) {
-            match write_rule_set_file(&path, bytes) {
-                Ok(()) => restored_bundled_count += 1,
-                Err(error) => {
-                    let _ = app.emit(
-                        "tunnel-log",
-                        format!(
-                            "[WARN] Failed to restore bundled local rule-set {}: {}. Falling back to suffix-only rules for now.",
-                            rule_set.tag, error
-                        ),
-                    );
-                    continue;
+            if !local_rule_set_file_is_usable(&path) {
+                match write_rule_set_file(&path, bytes) {
+                    Ok(()) => restored_bundled_count += 1,
+                    Err(error) => {
+                        let _ = app.emit(
+                            "tunnel-log",
+                            format!(
+                                "[WARN] Failed to restore bundled local rule-set {}: {}. Falling back to suffix-only rules for now.",
+                                rule_set.tag, error
+                            ),
+                        );
+                        continue;
+                    }
                 }
             }
 

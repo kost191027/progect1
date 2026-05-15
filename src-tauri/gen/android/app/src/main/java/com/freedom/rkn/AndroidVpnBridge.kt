@@ -4,8 +4,11 @@ import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
+import android.provider.Settings
 
 object AndroidVpnBridge {
     @JvmStatic
@@ -59,6 +62,47 @@ object AndroidVpnBridge {
 
     @JvmStatic
     fun getTunnelMtu(context: Context): Int = AndroidTunnelService.getTunnelMtu()
+
+    @JvmStatic
+    fun getPrivateDnsSummary(context: Context): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            return "unsupported"
+        }
+
+        val mode = Settings.Global.getString(
+            context.contentResolver,
+            PRIVATE_DNS_MODE_KEY
+        ) ?: "off"
+        val host = Settings.Global.getString(
+            context.contentResolver,
+            PRIVATE_DNS_SPECIFIER_KEY
+        ) ?: ""
+
+        return if (host.isBlank()) mode else "$mode:$host"
+    }
+
+    @JvmStatic
+    fun getActiveNetworkSummary(context: Context): String {
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = manager.activeNetwork ?: return "none"
+        val capabilities = manager.getNetworkCapabilities(network) ?: return "unknown"
+        val transports = mutableListOf<String>()
+
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            transports.add("wifi")
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+            transports.add("cellular")
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+            transports.add("vpn")
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+            transports.add("ethernet")
+        }
+
+        return if (transports.isEmpty()) "other" else transports.joinToString("+")
+    }
 
     @JvmStatic
     fun registerBackendHandoffSession(
@@ -158,4 +202,6 @@ object AndroidVpnBridge {
     }
 
     private const val VPN_PERMISSION_REQUEST_CODE = 6104
+    private const val PRIVATE_DNS_MODE_KEY = "private_dns_mode"
+    private const val PRIVATE_DNS_SPECIFIER_KEY = "private_dns_specifier"
 }
