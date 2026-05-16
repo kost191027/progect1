@@ -664,6 +664,73 @@ export function useControlCenter() {
   }, []);
 
   useEffect(() => {
+    if (isRunning) {
+      return;
+    }
+
+    let cancelled = false;
+    let restoreInFlight = false;
+
+    async function restoreAfterResume() {
+      if (cancelled || restoreInFlight || isRunning) {
+        return;
+      }
+
+      restoreInFlight = true;
+      try {
+        const pid = await invoke<number | null>("restore_tunnel_session");
+        if (cancelled || pid === null) {
+          return;
+        }
+
+        setIsRunning(true);
+        setGuardState("active");
+        setIsStarting(false);
+        setIsStopping(false);
+        setLastError(null);
+        setLastUserMessage("Tunnel session restored after system resume.");
+        appendLog(
+          pid === 0
+            ? "[SYSTEM] macOS TUN route restored after resume; supervisor PID is being refreshed."
+            : `[SYSTEM] Active sing-box session restored after resume (PID ${pid}).`,
+        );
+      } catch (error) {
+        if (!cancelled) {
+          appendLog(`[WARN] Failed to restore tunnel after resume: ${error}`);
+        }
+      } finally {
+        restoreInFlight = false;
+      }
+    }
+
+    const handleVisibility = () => {
+      if (!document.hidden) {
+        void restoreAfterResume();
+      }
+    };
+    const handleFocus = () => {
+      void restoreAfterResume();
+    };
+
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibility);
+    const intervalId = window.setInterval(() => {
+      if (!document.hidden) {
+        void restoreAfterResume();
+      }
+    }, 10000);
+
+    void restoreAfterResume();
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.clearInterval(intervalId);
+    };
+  }, [isRunning]);
+
+  useEffect(() => {
     const unlisten = listen<string>("subordinate-config-outdated", () => {
       if (appRole !== "subordinate") {
         return;

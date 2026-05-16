@@ -4,6 +4,8 @@ use jni::objects::{JObject, JValue};
 use jni::JavaVM;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::io::Write;
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+use std::os::unix::fs::MetadataExt;
 #[cfg(any(target_os = "windows", target_os = "android"))]
 use std::process::Stdio;
 use std::sync::Mutex;
@@ -30,6 +32,9 @@ mod generator;
 mod geodata;
 #[path = "ssh/mod.rs"]
 mod ssh;
+
+#[cfg(target_os = "macos")]
+const MACOS_TUN_ROUTE_SENTINEL_PID: u32 = u32::MAX - 17;
 
 #[cfg(desktop)]
 const TRAY_ICON: Image<'_> = tauri::include_image!("./icons/tray-icon.png");
@@ -412,6 +417,226 @@ fn run_admin_command(script: &str) -> Result<std::process::Output, String> {
         .map_err(|e| format!("Failed to execute osascript: {}", e))
 }
 
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+fn desktop_tunnel_stop_signal_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("desktop_singbox.stop"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+fn desktop_tunnel_restart_signal_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("desktop_singbox.restart"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+fn desktop_tunnel_supervisor_script_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("desktop_singbox_supervisor.sh"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+fn write_desktop_tunnel_supervisor_script(
+    app: &AppHandle,
+    singbox_path: &str,
+    config_path: &str,
+    log_path: &str,
+) -> Result<PathBuf, String> {
+    let script_path = desktop_tunnel_supervisor_script_path(app)?;
+    let stop_signal_path = desktop_tunnel_stop_signal_path(app)?;
+    let restart_signal_path = desktop_tunnel_restart_signal_path(app)?;
+    let pid_path = tunnel_pid_path(app)?;
+    let local_data_dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let owner = std::fs::metadata(&local_data_dir).map_err(|e| {
+        format!(
+            "Failed to inspect app data owner {}: {}",
+            local_data_dir.display(),
+            e
+        )
+    })?;
+    let script = format!(
+        r#"#!/bin/sh
+SINGBOX={}
+CONFIG={}
+LOG={}
+STOP={}
+RESTART={}
+PID_FILE={}
+PID_OWNER_UID={}
+PID_OWNER_GID={}
+PARENT={}
+CHILD=""
+
+write_pid_file() {{
+  echo $$ > "$PID_FILE" 2>/dev/null || true
+  chown "$PID_OWNER_UID:$PID_OWNER_GID" "$PID_FILE" >/dev/null 2>&1 || true
+  chmod 600 "$PID_FILE" >/dev/null 2>&1 || true
+}}
+
+cleanup() {{
+  if [ -n "$CHILD" ]; then
+    kill "$CHILD" >/dev/null 2>&1 || true
+    wait "$CHILD" >/dev/null 2>&1 || true
+  fi
+  rm -f "$STOP" >/dev/null 2>&1 || true
+  rm -f "$RESTART" >/dev/null 2>&1 || true
+  rm -f "$PID_FILE" >/dev/null 2>&1 || true
+}}
+
+trap cleanup TERM INT EXIT
+rm -f "$STOP" >/dev/null 2>&1 || true
+rm -f "$RESTART" >/dev/null 2>&1 || true
+write_pid_file
+echo "[SUPERVISOR] Desktop tunnel supervisor started." >> "$LOG"
+
+while true; do
+  write_pid_file
+
+  if ! kill -0 "$PARENT" >/dev/null 2>&1; then
+    echo "[SUPERVISOR] Parent app exited; stopping tunnel." >> "$LOG"
+    exit 0
+  fi
+
+  if [ -f "$STOP" ]; then
+    echo "[SUPERVISOR] Stop signal received; stopping tunnel." >> "$LOG"
+    exit 0
+  fi
+
+  "$SINGBOX" run -c "$CONFIG" >> "$LOG" 2>&1 &
+  CHILD=$!
+  echo "[SUPERVISOR] sing-box started with PID $CHILD." >> "$LOG"
+
+  while kill -0 "$CHILD" >/dev/null 2>&1; do
+    if ! kill -0 "$PARENT" >/dev/null 2>&1; then
+      exit 0
+    fi
+
+    if [ -f "$STOP" ]; then
+      exit 0
+    fi
+
+    if [ -f "$RESTART" ]; then
+      echo "[SUPERVISOR] Restart signal received; refreshing sing-box." >> "$LOG"
+      rm -f "$RESTART" >/dev/null 2>&1 || true
+      kill "$CHILD" >/dev/null 2>&1 || true
+      break
+    fi
+
+    sleep 0.5
+  done
+
+  wait "$CHILD" >/dev/null 2>&1
+  CHILD=""
+
+  if [ -f "$STOP" ]; then
+    exit 0
+  fi
+
+  if ! kill -0 "$PARENT" >/dev/null 2>&1; then
+    exit 0
+  fi
+
+  echo "[SUPERVISOR] sing-box exited unexpectedly; restarting in 1 second." >> "$LOG"
+  sleep 1
+done
+"#,
+        shell_single_quote(singbox_path),
+        shell_single_quote(config_path),
+        shell_single_quote(log_path),
+        shell_single_quote(&stop_signal_path.to_string_lossy()),
+        shell_single_quote(&restart_signal_path.to_string_lossy()),
+        shell_single_quote(&pid_path.to_string_lossy()),
+        owner.uid(),
+        owner.gid(),
+        std::process::id(),
+    );
+
+    std::fs::write(&script_path, script).map_err(|e| {
+        format!(
+            "Failed to write desktop tunnel supervisor {}: {}",
+            script_path.display(),
+            e
+        )
+    })?;
+
+    Ok(script_path)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_netstat_inet_snapshot() -> Result<String, String> {
+    let output = std::process::Command::new("netstat")
+        .args(["-rn", "-f", "inet"])
+        .output()
+        .map_err(|e| format!("Failed to inspect macOS route table: {}", e))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_tun_route_ready() -> bool {
+    let Ok(snapshot) = macos_netstat_inet_snapshot() else {
+        return false;
+    };
+
+    snapshot.lines().any(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("utun")
+            && (lower.starts_with("default")
+                || lower.starts_with("0/1")
+                || lower.starts_with("128.0/1")
+                || lower.starts_with("198.18")
+                || lower.starts_with("172.19.0"))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_route_table_diagnostic(max_lines: usize) -> String {
+    macos_netstat_inet_snapshot()
+        .map(|snapshot| {
+            snapshot
+                .lines()
+                .take(max_lines)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|error| format!("route table unavailable: {}", error))
+}
+
+#[cfg(target_os = "macos")]
+fn request_desktop_supervisor_core_restart(app: &AppHandle, reason: &str) -> Result<(), String> {
+    let path = desktop_tunnel_restart_signal_path(app)?;
+    std::fs::write(&path, "restart").map_err(|e| {
+        format!(
+            "Failed to request desktop supervisor restart {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+
+    let _ = app.emit(
+        "tunnel-log",
+        format!(
+            "[SYSTEM] {} Refreshing the desktop core through the privileged supervisor without another administrator prompt.",
+            reason
+        ),
+    );
+
+    Ok(())
+}
+
 #[allow(unused_variables)]
 fn terminate_root_process(app: Option<&AppHandle>, pid: u32) -> Result<(), String> {
     if !process_exists(pid) {
@@ -483,6 +708,12 @@ fn terminate_root_process(app: Option<&AppHandle>, pid: u32) -> Result<(), Strin
 
         #[cfg(not(target_os = "android"))]
         {
+            if let Some(app) = app {
+                if let Ok(signal_path) = desktop_tunnel_stop_signal_path(app) {
+                    let _ = std::fs::write(signal_path, "stop");
+                }
+            }
+
             let _ = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .output();
@@ -1538,6 +1769,55 @@ fn macos_server_route_prelude(_server_ip: Option<&str>) -> String {
 }
 
 #[cfg(not(target_os = "android"))]
+fn is_udp_443_reject_rule(rule: &serde_json::Value) -> bool {
+    let Some(object) = rule.as_object() else {
+        return false;
+    };
+
+    let is_reject = object
+        .get("action")
+        .and_then(|value| value.as_str())
+        .map(|value| value == "reject")
+        .unwrap_or(false);
+    let is_udp = object
+        .get("network")
+        .and_then(|value| value.as_str())
+        .map(|value| value == "udp")
+        .unwrap_or(false);
+    let is_443 = object
+        .get("port")
+        .and_then(|value| value.as_u64())
+        .map(|value| value == 443)
+        .unwrap_or(false);
+
+    is_reject && is_udp && is_443
+}
+
+#[cfg(not(target_os = "android"))]
+fn move_udp_443_reject_rule_to_route_tail(cfg: &mut serde_json::Value) {
+    let Some(route_rules) = cfg
+        .get_mut("route")
+        .and_then(|value| value.get_mut("rules"))
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+
+    let mut reject_rules = Vec::new();
+    let mut ordered_rules = Vec::with_capacity(route_rules.len());
+    for rule in route_rules.drain(..) {
+        if is_udp_443_reject_rule(&rule) {
+            reject_rules.push(rule);
+        } else {
+            ordered_rules.push(rule);
+        }
+    }
+
+    ordered_rules.extend(reject_rules);
+    *route_rules = ordered_rules;
+}
+
+#[cfg(not(target_os = "android"))]
 fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, String> {
     let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
         format!(
@@ -1592,6 +1872,8 @@ fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, Strin
             }
         }
     }
+
+    move_udp_443_reject_rule_to_route_tail(&mut cfg);
 
     serde_json::to_string_pretty(&cfg)
         .map_err(|e| format!("Failed to serialize desktop runtime client config: {}", e))
@@ -2387,11 +2669,15 @@ fn register_proxy_failure(app: &AppHandle, state: &AppState) {
 
     #[cfg(target_os = "macos")]
     {
-        let _ = app.emit(
-            "tunnel-log",
-            "[SYSTEM] Proxy transport is failing repeatedly. Automatic privileged restart is suppressed on macOS to avoid repeated administrator prompts; toggle the tunnel manually if traffic does not recover."
-                .to_string(),
-        );
+        if request_desktop_supervisor_core_restart(app, "Proxy transport is failing repeatedly.")
+            .is_err()
+        {
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Proxy transport is failing repeatedly, but the desktop supervisor restart signal could not be created. Toggle the tunnel manually if traffic does not recover."
+                    .to_string(),
+            );
+        }
     }
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
@@ -2426,11 +2712,15 @@ fn classify_proxy_failure(line: &str) -> bool {
     lower.contains("outbound/shadowsocks[proxy]")
         && (lower.contains("context deadline exceeded")
             || lower.contains("connection refused")
+            || lower.contains("connection upload closed")
             || lower.contains("i/o timeout")
+            || lower.contains("network is down")
             || lower.contains("network is unreachable")
             || lower.contains("no route to host")
             || lower.contains("connection reset")
             || lower.contains("failed to verify certificate")
+            || lower.contains("software caused connection abort")
+            || lower.contains("tls: internal error")
             || lower.contains("x509:"))
 }
 
@@ -4779,12 +5069,15 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
         let route_prelude = macos_server_route_prelude(server_ip.as_deref());
 
         #[cfg(not(target_os = "android"))]
+        let supervisor_script =
+            write_desktop_tunnel_supervisor_script(app, &singbox_path, &config_str, log_path)?;
+
+        #[cfg(not(target_os = "android"))]
         let shell_cmd = format!(
-            "{}{} run -c {} > {} 2>&1 & echo $!",
+            "rm -f {log_path} >/dev/null 2>&1 || true\n{}/bin/sh {} </dev/null >/dev/null 2>&1 & echo $!",
             route_prelude,
-            shell_single_quote(&singbox_path),
-            shell_single_quote(&config_str),
-            shell_single_quote(log_path),
+            shell_single_quote(&supervisor_script.to_string_lossy()),
+            log_path = shell_single_quote(log_path),
         );
 
         #[cfg(not(target_os = "android"))]
@@ -5045,12 +5338,19 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
         let route_prelude = macos_server_route_prelude(server_ip.as_deref());
 
         #[cfg(not(target_os = "android"))]
+        let supervisor_script =
+            write_desktop_tunnel_supervisor_script(app, &singbox_path, &config_str, log_path)?;
+
+        #[cfg(not(target_os = "android"))]
+        let stop_signal_path = desktop_tunnel_stop_signal_path(app)?;
+
+        #[cfg(not(target_os = "android"))]
         let shell_cmd = format!(
-            "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n{}{} run -c {} > {} 2>&1 & echo $!",
+            "touch {stop_signal} >/dev/null 2>&1 || true\nkill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\nrm -f {log_path} >/dev/null 2>&1 || true\n{}/bin/sh {} </dev/null >/dev/null 2>&1 & echo $!",
             route_prelude,
-            shell_single_quote(&singbox_path),
-            shell_single_quote(&config_str),
-            shell_single_quote(log_path),
+            shell_single_quote(&supervisor_script.to_string_lossy()),
+            stop_signal = shell_single_quote(&stop_signal_path.to_string_lossy()),
+            log_path = shell_single_quote(log_path),
         );
 
         #[cfg(not(target_os = "android"))]
@@ -5236,6 +5536,88 @@ async fn verify_tunnel_start(
         return Err(format!("Core process exited during startup. {}", details));
     }
 
+    #[cfg(not(target_os = "android"))]
+    {
+        let log_tail = recent_log_tail(log_path, 20);
+        let lower_tail = log_tail.to_lowercase();
+        let supervisor_restart_seen =
+            lower_tail.contains("[supervisor] sing-box exited unexpectedly");
+        let fatal_startup_seen = lower_tail.contains("fatal");
+
+        if supervisor_restart_seen || fatal_startup_seen {
+            let _ = terminate_root_process(Some(app), pid);
+
+            {
+                let mut guard = state.singbox_pid.lock().unwrap();
+                if guard.as_ref() == Some(&pid) {
+                    *guard = None;
+                }
+            }
+
+            set_network_fingerprint(state, None);
+            clear_saved_tunnel_pid(app);
+            emit_tunnel_state(app, false);
+            emit_guard_state(app, "inactive");
+
+            let details = if log_tail.is_empty() {
+                "No startup logs captured.".to_string()
+            } else {
+                format!("Recent logs:\n{}", log_tail)
+            };
+
+            return Err(format!("Core process failed during startup. {}", details));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut route_ready = false;
+        for attempt in 0..16 {
+            if macos_tun_route_ready() {
+                route_ready = true;
+                break;
+            }
+
+            if attempt == 5 {
+                let _ = request_desktop_supervisor_core_restart(
+                    app,
+                    "macOS TUN route did not appear during startup.",
+                );
+            }
+
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        if !route_ready {
+            let _ = terminate_root_process(Some(app), pid);
+
+            {
+                let mut guard = state.singbox_pid.lock().unwrap();
+                if guard.as_ref() == Some(&pid) {
+                    *guard = None;
+                }
+            }
+
+            set_network_fingerprint(state, None);
+            clear_saved_tunnel_pid(app);
+            emit_tunnel_state(app, false);
+            emit_guard_state(app, "inactive");
+
+            let log_tail = recent_log_tail(log_path, 30);
+            let route_table = macos_route_table_diagnostic(40);
+            let details = if log_tail.is_empty() {
+                format!("Route table:\n{}", route_table)
+            } else {
+                format!("Recent logs:\n{}\nRoute table:\n{}", log_tail, route_table)
+            };
+
+            return Err(format!(
+                "macOS TUN route did not become active after startup. {}",
+                details
+            ));
+        }
+    }
+
     set_network_fingerprint(state, current_network_fingerprint());
     reset_guard_state(state);
     save_tunnel_pid(app, pid)?;
@@ -5398,6 +5780,64 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
                     }
                 }
 
+                #[cfg(not(target_os = "android"))]
+                {
+                    let intentional_stop = {
+                        #[cfg(target_os = "windows")]
+                        {
+                            app.path()
+                                .app_local_data_dir()
+                                .ok()
+                                .map(|dir| dir.join("elevated_singbox.stop").exists())
+                                .unwrap_or(false)
+                        }
+
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            desktop_tunnel_stop_signal_path(&app)
+                                .map(|path| path.exists())
+                                .unwrap_or(false)
+                        }
+                    };
+
+                    if !intentional_stop {
+                        let should_recover = {
+                            let state = app.state::<AppState>();
+                            begin_recovery(&state)
+                        };
+
+                        if should_recover {
+                            let log_tail = recent_log_tail(tunnel_log_path(), 12);
+                            let reason = if log_tail.is_empty() {
+                                "[SYSTEM] Core process exited unexpectedly. Restarting the tunnel immediately to keep desktop protection active.".to_string()
+                            } else {
+                                format!(
+                                    "[SYSTEM] Core process exited unexpectedly. Restarting the tunnel immediately to keep desktop protection active. Recent logs:\n{}",
+                                    log_tail
+                                )
+                            };
+
+                            match restart_tunnel_if_running(&app, &reason).await {
+                                Ok(true) => break,
+                                Ok(false) => {
+                                    let state = app.state::<AppState>();
+                                    finish_recovery(&state);
+                                }
+                                Err(error) => {
+                                    let _ = app.emit(
+                                        "tunnel-log",
+                                        format!(
+                                            "[ERROR] Automatic tunnel restart after core exit failed: {}",
+                                            error
+                                        ),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 {
                     let state = app.state::<AppState>();
                     let mut guard = state.singbox_pid.lock().unwrap();
@@ -5483,6 +5923,44 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
             let elapsed = last_tick.elapsed();
             last_tick = std::time::Instant::now();
             let current_fingerprint = current_network_fingerprint();
+
+            #[cfg(target_os = "macos")]
+            if !macos_tun_route_ready() {
+                let should_recover = {
+                    let state = app.state::<AppState>();
+                    begin_recovery(&state)
+                };
+
+                if should_recover {
+                    if let Err(error) = request_desktop_supervisor_core_restart(
+                        &app,
+                        "macOS TUN route disappeared while the tunnel process was still alive.",
+                    ) {
+                        let _ = app.emit(
+                            "tunnel-log",
+                            format!("[ERROR] macOS TUN route recovery signal failed: {}", error),
+                        );
+                    }
+
+                    sleep(Duration::from_secs(4)).await;
+
+                    if !macos_tun_route_ready() {
+                        let route_table = macos_route_table_diagnostic(30);
+                        let _ = app.emit(
+                            "tunnel-log",
+                            format!(
+                                "[WARN] macOS TUN route is still missing after supervisor refresh. Route table:\n{}",
+                                route_table
+                            ),
+                        );
+                    }
+
+                    let state = app.state::<AppState>();
+                    finish_recovery(&state);
+                }
+
+                continue;
+            }
 
             #[cfg(target_os = "windows")]
             {
@@ -6213,12 +6691,26 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
                 "tunnel-log",
                 if cfg!(target_os = "android") && is_android_native_backend_pid(pid) {
                     "[SYSTEM] Stopping Android native backend...".to_string()
+                } else if cfg!(target_os = "macos") && pid == MACOS_TUN_ROUTE_SENTINEL_PID {
+                    "[SYSTEM] Stopping macOS tunnel route recovered after resume...".to_string()
                 } else {
                     format!("[SYSTEM] Stopping core process (PID {})...", pid)
                 },
             );
 
-            if cfg!(target_os = "android") && is_android_native_backend_pid(pid) {
+            if cfg!(target_os = "macos") && pid == MACOS_TUN_ROUTE_SENTINEL_PID {
+                #[cfg(target_os = "macos")]
+                {
+                    if let Ok(signal_path) = desktop_tunnel_stop_signal_path(&app) {
+                        let _ = std::fs::write(signal_path, "stop");
+                    }
+                }
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] macOS supervisor stop signal sent for the recovered tunnel route."
+                        .to_string(),
+                );
+            } else if cfg!(target_os = "android") && is_android_native_backend_pid(pid) {
                 #[cfg(target_os = "android")]
                 {
                     let _ = stop_android_tunnel_service();
@@ -6262,6 +6754,18 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             Ok(())
         }
         None => {
+            #[cfg(target_os = "macos")]
+            if macos_tun_route_ready() {
+                if let Ok(signal_path) = desktop_tunnel_stop_signal_path(&app) {
+                    let _ = std::fs::write(signal_path, "stop");
+                    let _ = app.emit(
+                        "tunnel-log",
+                        "[SYSTEM] No tracked supervisor PID was present, but macOS TUN route is active. Sent supervisor stop signal."
+                            .to_string(),
+                    );
+                }
+            }
+
             let _ = app.emit(
                 "tunnel-log",
                 "[SYSTEM] No active tunnel to stop.".to_string(),
@@ -6742,6 +7246,25 @@ async fn restore_tunnel_session(
     }
 
     let Some(saved_pid) = load_saved_tunnel_pid(&app)? else {
+        #[cfg(target_os = "macos")]
+        if macos_tun_route_ready() {
+            {
+                let mut guard = state.singbox_pid.lock().unwrap();
+                *guard = Some(MACOS_TUN_ROUTE_SENTINEL_PID);
+            }
+            set_network_fingerprint(&state, current_network_fingerprint());
+            reset_guard_state(&state);
+            emit_tunnel_state(&app, true);
+            emit_guard_state(&app, "active");
+            refresh_tray_toggle_item(&app);
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] macOS TUN route is still active after resume, but the supervisor PID file is missing. Keeping UI active and waiting for the supervisor to refresh its PID file."
+                    .to_string(),
+            );
+            return Ok(Some(0));
+        }
+
         emit_tunnel_state(&app, false);
         emit_guard_state(&app, "inactive");
         return Ok(None);
@@ -6777,6 +7300,27 @@ async fn restore_tunnel_session(
     }
 
     if !process_exists(saved_pid) {
+        #[cfg(target_os = "macos")]
+        if macos_tun_route_ready() {
+            {
+                let mut guard = state.singbox_pid.lock().unwrap();
+                *guard = Some(MACOS_TUN_ROUTE_SENTINEL_PID);
+            }
+            set_network_fingerprint(&state, current_network_fingerprint());
+            reset_guard_state(&state);
+            emit_tunnel_state(&app, true);
+            emit_guard_state(&app, "active");
+            refresh_tray_toggle_item(&app);
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SYSTEM] macOS TUN route is still active after resume, but saved supervisor PID {} is not visible yet. Keeping UI active until the supervisor rewrites its PID file.",
+                    saved_pid
+                ),
+            );
+            return Ok(Some(0));
+        }
+
         clear_saved_tunnel_pid(&app);
         emit_tunnel_state(&app, false);
         emit_guard_state(&app, "inactive");

@@ -539,12 +539,6 @@ pub fn build_client_config(
             "action": "hijack-dns"
           },
           {
-            "network": "udp",
-            "port": 443,
-            "action": "reject",
-            "method": "default"
-          },
-          {
             "domain_suffix": PROXY_PRIORITY_DOMAIN_SUFFIXES,
             "action": "route",
             "outbound": "proxy"
@@ -612,6 +606,16 @@ pub fn build_client_config(
               "outbound": "direct"
             }));
     }
+
+    config["route"]["rules"]
+        .as_array_mut()
+        .expect("route rules must be an array")
+        .push(json!({
+          "network": "udp",
+          "port": 443,
+          "action": "reject",
+          "method": "default"
+        }));
 
     serde_json::to_string_pretty(&config).unwrap()
 }
