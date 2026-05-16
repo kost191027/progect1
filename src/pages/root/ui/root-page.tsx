@@ -159,6 +159,7 @@ export function RootPage() {
 
       {controlCenter.isInviteModalOpen ? (
         <InviteLinkModal
+          label={controlCenter.isAndroidRuntime ? "Phone link" : "Invite link"}
           title={controlCenter.isAndroidRuntime ? "Import phone link" : "Import invite link"}
           description={
             controlCenter.isAndroidRuntime
@@ -169,15 +170,25 @@ export function RootPage() {
           errorMessage={controlCenter.inviteLinkError}
           statusMessage={
             controlCenter.isImportingInvite
-              ? "Valid invite link detected. Importing automatically..."
+              ? controlCenter.isAndroidRuntime
+                ? "Valid phone link detected. Importing automatically..."
+                : "Valid invite link detected. Importing automatically..."
               : controlCenter.isAndroidRuntime
-                ? "The clipboard is checked when this window opens. A valid phone link imports automatically as soon as it appears here."
+                ? "The clipboard is checked when this window opens. You can also tap Paste from Clipboard if Android asks for explicit clipboard access."
                 : "The clipboard is checked when this window opens. A valid invite link imports automatically as soon as it appears here."
           }
+          placeholder={
+            controlCenter.isAndroidRuntime
+              ? "Paste the phone link from the master app"
+              : "Paste the invite link from the master app"
+          }
           isBusy={controlCenter.isImportingInvite}
+          isPastingFromClipboard={controlCenter.isPastingInviteLink}
+          pasteButtonLabel={controlCenter.isAndroidRuntime ? "Paste Phone Link" : "Paste Invite Link"}
           onChange={controlCenter.setInviteLinkInput}
           onClose={controlCenter.closeInviteLinkModal}
           onSubmit={controlCenter.importInviteLink}
+          onPasteFromClipboard={controlCenter.pasteInviteLinkFromClipboard}
         />
       ) : null}
     </main>

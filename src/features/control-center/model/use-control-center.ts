@@ -254,6 +254,7 @@ export function useControlCenter() {
   const [inviteLinkInput, setInviteLinkInput] = useState("");
   const [inviteLinkError, setInviteLinkError] = useState<string | null>(null);
   const [inviteImportSuccessMessage, setInviteImportSuccessMessage] = useState<string | null>(null);
+  const [isPastingInviteLink, setIsPastingInviteLink] = useState(false);
   const [issuedInviteLinks, setIssuedInviteLinks] = useState<IssuedInviteLink[]>([]);
   const [primaryInviteCopied, setPrimaryInviteCopied] = useState(false);
   const [copiedInviteId, setCopiedInviteId] = useState<string | null>(null);
@@ -950,7 +951,9 @@ export function useControlCenter() {
       { host, user, password },
       {
         logHeader: "--- INITIATING REMOTE SERVER DEPLOYMENT ---",
-        userMessage: "Connecting to the server and applying the current transport configuration.",
+        userMessage: isAndroidRuntime
+          ? "Syncing this phone with the server and applying the current transport configuration."
+          : "Connecting to the server and applying the current transport configuration.",
       },
     );
   }
@@ -1027,8 +1030,9 @@ export function useControlCenter() {
 
     await deployWithProfile(profile, {
       logHeader: "--- REFRESHING LOCAL CONFIGURATION FROM SAVED SERVER PROFILE ---",
-      userMessage:
-        "Refreshing this app from the saved server profile so the local tunnel config matches the active remote transport.",
+      userMessage: isAndroidRuntime
+        ? "Refreshing this phone from the saved server profile so its local config matches the active remote transport."
+        : "Refreshing this app from the saved server profile so the local tunnel config matches the active remote transport.",
     });
   }
 
@@ -1049,14 +1053,18 @@ export function useControlCenter() {
         await copyTextToClipboard(inviteLink);
         flashPrimaryInviteCopied();
         setLastUserMessage(
-          "Invite link created and copied. You can now send it to another device.",
+          isAndroidRuntime
+            ? "Phone link created and copied. You can now send it to another Android device."
+            : "Invite link created and copied. You can now send it to another device.",
         );
       } catch (clipboardError) {
         appendLog(
           `[WARN] Invite link was generated, but clipboard copy failed: ${clipboardError}`,
         );
         setLastUserMessage(
-          "Invite link created successfully. Clipboard access was blocked, so copy it from the invite list below.",
+          isAndroidRuntime
+            ? "Phone link created successfully. Clipboard access was blocked, so copy it from the phone link list below."
+            : "Invite link created successfully. Clipboard access was blocked, so copy it from the invite list below.",
         );
       }
     } catch (error) {
@@ -1071,7 +1079,9 @@ export function useControlCenter() {
       await copyTextToClipboard(inviteLink);
       flashIssuedInviteCopied(inviteId);
       setLastUserMessage(
-        "Invite link copied from the master list. You can now send it to another device.",
+        isAndroidRuntime
+          ? "Phone link copied from the master list. You can now send it to another Android device."
+          : "Invite link copied from the master list. You can now send it to another device.",
       );
     } catch (error) {
       appendLog(`[WARN] Failed to copy invite link from the master list: ${error}`);
@@ -1116,6 +1126,50 @@ export function useControlCenter() {
     setInviteLinkError(null);
     setInviteImportSuccessMessage(null);
     setLastAutoImportedInvite(null);
+  }
+
+  async function pasteInviteLinkFromClipboard() {
+    setIsPastingInviteLink(true);
+    setInviteLinkError(null);
+    setInviteImportSuccessMessage(null);
+    setLastAutoImportedInvite(null);
+
+    try {
+      const clipboardText = await readTextFromClipboard();
+      const normalizedClipboard = normalizeInviteLink(clipboardText);
+
+      if (!normalizedClipboard) {
+        setInviteLinkError(
+          isAndroidRuntime
+            ? "The Android clipboard is empty. Copy the phone link from the master app, then tap Paste from Clipboard again."
+            : "The clipboard is empty. Copy the invite link from the master app, then paste it again.",
+        );
+        return;
+      }
+
+      setInviteLinkInput(normalizedClipboard);
+      if (looksLikeInviteLink(normalizedClipboard)) {
+        setLastUserMessage(
+          isAndroidRuntime
+            ? "Phone link pasted from the Android clipboard. Import will begin automatically."
+            : "Invite link pasted from the clipboard. Import will begin automatically.",
+        );
+      } else {
+        setInviteLinkError(
+          isAndroidRuntime
+            ? "Clipboard text does not look like a phone link. It should start with rkn://invite/."
+            : "Clipboard text does not look like an invite link. It should start with rkn://invite/.",
+        );
+      }
+    } catch (error) {
+      setInviteLinkError(
+        isAndroidRuntime
+          ? `Android clipboard access failed: ${error}. You can still paste the phone link manually.`
+          : `Clipboard access failed: ${error}. You can still paste the invite link manually.`,
+      );
+    } finally {
+      setIsPastingInviteLink(false);
+    }
   }
 
   function updateHost(value: string) {
@@ -1876,6 +1930,7 @@ export function useControlCenter() {
     inviteLinkInput,
     inviteLinkError,
     inviteImportSuccessMessage,
+    isPastingInviteLink,
     issuedInviteLinks,
     primaryInviteCopied,
     copiedInviteId,
@@ -1931,6 +1986,7 @@ export function useControlCenter() {
     openInviteLinkModal,
     closeInviteLinkModal,
     setInviteLinkInput: updateInviteLinkInput,
+    pasteInviteLinkFromClipboard,
     importInviteLink,
     refreshConfiguration,
     resetLocalData,

@@ -104,6 +104,7 @@ export function HomePage({ controlCenter }: HomePageProps) {
             : controlCenter.localWarpProfileStatus.endpoint
         }
         localWarpAddressV4={controlCenter.localWarpProfileStatus.address_v4}
+        isAndroidRuntime={controlCenter.isAndroidRuntime}
         isWindowsRuntime={controlCenter.isWindowsRuntime}
         windowsRuntimeMode={controlCenter.windowsRuntimeMode}
         isSavingWindowsRuntimeMode={controlCenter.isSavingWindowsRuntimeMode}
