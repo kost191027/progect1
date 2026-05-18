@@ -36,6 +36,16 @@ mod ssh;
 #[cfg(target_os = "macos")]
 const MACOS_TUN_ROUTE_SENTINEL_PID: u32 = u32::MAX - 17;
 
+#[cfg(target_os = "macos")]
+fn is_macos_tun_route_sentinel_pid(pid: u32) -> bool {
+    pid == MACOS_TUN_ROUTE_SENTINEL_PID
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_macos_tun_route_sentinel_pid(_pid: u32) -> bool {
+    false
+}
+
 #[cfg(desktop)]
 const TRAY_ICON: Image<'_> = tauri::include_image!("./icons/tray-icon.png");
 struct AppState {
@@ -210,6 +220,39 @@ fn clear_saved_tunnel_pid(app: &AppHandle) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn desktop_manual_stop_marker_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("desktop_tunnel.manual_stop"))
+}
+
+#[cfg(target_os = "macos")]
+fn mark_desktop_manual_stop(app: &AppHandle) {
+    if let Ok(path) = desktop_manual_stop_marker_path(app) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(path, "stopped");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clear_desktop_manual_stop_marker(app: &AppHandle) {
+    if let Ok(path) = desktop_manual_stop_marker_path(app) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn desktop_manual_stop_marker_exists(app: &AppHandle) -> bool {
+    desktop_manual_stop_marker_path(app)
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
+
 fn emit_tunnel_state(app: &AppHandle, is_running: bool) {
     let _ = app.emit("tunnel-state", is_running);
 }
@@ -271,6 +314,136 @@ fn local_client_config_requires_refresh(app: &AppHandle) -> Result<bool, String>
     }
 
     Ok(false)
+}
+
+fn normalize_local_client_config_for_runtime(app: &AppHandle) -> Result<(), String> {
+    let config_path = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("client_config.json");
+
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let contents = fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+    let mut config: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("Invalid client config JSON: {}", e))?;
+    let mut changed = false;
+
+    if let Some(outbounds) = config
+        .get_mut("outbounds")
+        .and_then(|value| value.as_array_mut())
+    {
+        for outbound in outbounds {
+            let is_proxy_shadowsocks = outbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "shadowsocks")
+                && outbound
+                    .get("tag")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == "proxy");
+
+            if is_proxy_shadowsocks
+                && outbound
+                    .as_object_mut()
+                    .and_then(|object| object.remove("multiplex"))
+                    .is_some()
+            {
+                changed = true;
+            }
+
+            let is_direct = outbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "direct")
+                && outbound
+                    .get("tag")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == "direct");
+
+            if is_direct {
+                if let Some(object) = outbound.as_object_mut() {
+                    if object.remove("domain_strategy").is_some() {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if route_ipv6_to_proxy_before_direct_rules(&mut config) {
+        changed = true;
+    }
+    if force_route_default_domain_resolver_ipv4(&mut config) {
+        changed = true;
+    }
+
+    if changed {
+        let rendered = serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize normalized client config: {}", e))?;
+        fs::write(&config_path, rendered)
+            .map_err(|e| format!("Failed to write normalized client config: {}", e))?;
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Local client config optimized for runtime stability: disabled Shadowsocks multiplex, forced DNS to IPv4, and routed IPv6 through proxy."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn route_ipv6_to_proxy_before_direct_rules(cfg: &mut serde_json::Value) -> bool {
+    let Some(route_rules) = cfg
+        .get_mut("route")
+        .and_then(|value| value.get_mut("rules"))
+        .and_then(|value| value.as_array_mut())
+    else {
+        return false;
+    };
+
+    let ipv6_proxy_rule = serde_json::json!({
+        "ip_version": 6,
+        "action": "route",
+        "outbound": "proxy"
+    });
+
+    if route_rules.iter().any(|rule| rule == &ipv6_proxy_rule) {
+        return false;
+    }
+
+    let insert_at = route_rules
+        .iter()
+        .position(|rule| {
+            rule.get("outbound")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "direct")
+        })
+        .unwrap_or(route_rules.len());
+
+    route_rules.insert(insert_at, ipv6_proxy_rule);
+    true
+}
+
+fn force_route_default_domain_resolver_ipv4(cfg: &mut serde_json::Value) -> bool {
+    let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) else {
+        return false;
+    };
+
+    let desired = serde_json::json!({
+        "server": "remote-dns",
+        "strategy": "ipv4_only"
+    });
+
+    if route.get("default_domain_resolver") == Some(&desired) {
+        return false;
+    }
+
+    route.insert("default_domain_resolver".to_string(), desired);
+    true
 }
 
 #[cfg(desktop)]
@@ -613,6 +786,54 @@ fn macos_route_table_diagnostic(max_lines: usize) -> String {
                 .join("\n")
         })
         .unwrap_or_else(|error| format!("route table unavailable: {}", error))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_force_stop_orphaned_desktop_tunnel(app: &AppHandle) {
+    let stop_signal = desktop_tunnel_stop_signal_path(app)
+        .map(|path| path.to_string_lossy().to_string())
+        .ok();
+    let supervisor = desktop_tunnel_supervisor_script_path(app)
+        .map(|path| path.to_string_lossy().to_string())
+        .ok();
+    let runtime_config = app.path().app_local_data_dir().ok().map(|path| {
+        path.join("client_config_desktop.json")
+            .to_string_lossy()
+            .to_string()
+    });
+
+    let mut script = String::new();
+    if let Some(stop_signal) = stop_signal {
+        script.push_str(&format!(
+            "touch {} >/dev/null 2>&1 || true\n",
+            shell_single_quote(&stop_signal)
+        ));
+    }
+
+    for pattern in [supervisor.clone(), runtime_config.clone()]
+        .into_iter()
+        .flatten()
+    {
+        let quoted_pattern = shell_single_quote(&pattern);
+        script.push_str(&format!(
+            "for p in $(/usr/bin/pgrep -f {} 2>/dev/null || true); do [ \"$p\" != \"$$\" ] && [ \"$p\" != \"$PPID\" ] && /bin/kill \"$p\" >/dev/null 2>&1 || true; done\n",
+            quoted_pattern
+        ));
+    }
+
+    script.push_str("sleep 0.4\n");
+
+    for pattern in [supervisor, runtime_config].into_iter().flatten() {
+        let quoted_pattern = shell_single_quote(&pattern);
+        script.push_str(&format!(
+            "for p in $(/usr/bin/pgrep -f {} 2>/dev/null || true); do [ \"$p\" != \"$$\" ] && [ \"$p\" != \"$PPID\" ] && /bin/kill -9 \"$p\" >/dev/null 2>&1 || true; done\n",
+            quoted_pattern
+        ));
+    }
+
+    let _ = std::process::Command::new("/bin/sh")
+        .args(["-c", &script])
+        .output();
 }
 
 #[cfg(target_os = "macos")]
@@ -1845,6 +2066,10 @@ fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, Strin
             }
 
             if let Some(object) = inbound.as_object_mut() {
+                object.insert(
+                    "address".to_string(),
+                    serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]),
+                );
                 object.remove("sniff");
                 object.remove("sniff_override_destination");
             }
@@ -1856,24 +2081,70 @@ fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, Strin
         .and_then(|value| value.as_array_mut())
     {
         for outbound in outbounds {
-            let outbound_type = outbound
+            let is_proxy_shadowsocks = outbound
                 .get("type")
                 .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let outbound_tag = outbound
-                .get("tag")
+                .is_some_and(|value| value == "shadowsocks")
+                && outbound
+                    .get("tag")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == "proxy");
+            let is_direct = outbound
+                .get("type")
                 .and_then(|value| value.as_str())
-                .unwrap_or_default();
+                .is_some_and(|value| value == "direct")
+                && outbound
+                    .get("tag")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == "direct");
 
-            if outbound_type == "shadowsocks" && outbound_tag == "proxy" {
+            if is_proxy_shadowsocks {
                 if let Some(object) = outbound.as_object_mut() {
                     object.remove("multiplex");
+                }
+            }
+
+            if is_direct {
+                if let Some(object) = outbound.as_object_mut() {
+                    object.remove("domain_strategy");
                 }
             }
         }
     }
 
+    route_ipv6_to_proxy_before_direct_rules(&mut cfg);
+    force_route_default_domain_resolver_ipv4(&mut cfg);
     move_udp_443_reject_rule_to_route_tail(&mut cfg);
+
+    if let Some(dns_servers) = cfg
+        .get_mut("dns")
+        .and_then(|value| value.get_mut("servers"))
+        .and_then(|value| value.as_array_mut())
+    {
+        for server in dns_servers {
+            let is_remote_dns = server
+                .get("tag")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "remote-dns");
+
+            if !is_remote_dns {
+                continue;
+            }
+
+            *server = serde_json::json!({
+                "type": "https",
+                "tag": "remote-dns",
+                "server": "8.8.8.8",
+                "server_port": 443,
+                "path": "/dns-query",
+                "detour": "proxy",
+                "tls": {
+                    "enabled": true,
+                    "server_name": "dns.google"
+                }
+            });
+        }
+    }
 
     serde_json::to_string_pretty(&cfg)
         .map_err(|e| format!("Failed to serialize desktop runtime client config: {}", e))
@@ -6155,6 +6426,14 @@ async fn wait_for_android_backend_shutdown(app: &AppHandle) {
 }
 
 #[cfg(target_os = "android")]
+fn spawn_android_backend_shutdown_cleanup(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        wait_for_android_backend_shutdown(&app).await;
+    });
+}
+
+#[cfg(target_os = "android")]
 fn clear_android_native_backend_runtime_artifacts(app: &AppHandle) {
     let Ok(local_data) = app.path().app_local_data_dir() else {
         return;
@@ -6558,6 +6837,11 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    clear_desktop_manual_stop_marker(&app);
+
+    normalize_local_client_config_for_runtime(&app)?;
+
     if local_client_config_requires_refresh(&app)? {
         let _ = app.emit(
             "tunnel-log",
@@ -6680,6 +6964,8 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
 
 async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+    #[cfg(target_os = "macos")]
+    mark_desktop_manual_stop(&app);
     let pid = {
         let mut guard = state.singbox_pid.lock().unwrap();
         guard.take()
@@ -6691,19 +6977,20 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
                 "tunnel-log",
                 if cfg!(target_os = "android") && is_android_native_backend_pid(pid) {
                     "[SYSTEM] Stopping Android native backend...".to_string()
-                } else if cfg!(target_os = "macos") && pid == MACOS_TUN_ROUTE_SENTINEL_PID {
+                } else if is_macos_tun_route_sentinel_pid(pid) {
                     "[SYSTEM] Stopping macOS tunnel route recovered after resume...".to_string()
                 } else {
                     format!("[SYSTEM] Stopping core process (PID {})...", pid)
                 },
             );
 
-            if cfg!(target_os = "macos") && pid == MACOS_TUN_ROUTE_SENTINEL_PID {
+            if is_macos_tun_route_sentinel_pid(pid) {
                 #[cfg(target_os = "macos")]
                 {
                     if let Ok(signal_path) = desktop_tunnel_stop_signal_path(&app) {
                         let _ = std::fs::write(signal_path, "stop");
                     }
+                    macos_force_stop_orphaned_desktop_tunnel(&app);
                 }
                 let _ = app.emit(
                     "tunnel-log",
@@ -6714,12 +7001,13 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
                 #[cfg(target_os = "android")]
                 {
                     let _ = stop_android_tunnel_service();
-                    wait_for_android_backend_shutdown(&app).await;
                     clear_android_native_backend_runtime_artifacts(&app);
+                    spawn_android_backend_shutdown_cleanup(&app);
                 }
                 let _ = app.emit(
                     "tunnel-log",
-                    "[SYSTEM] Android native backend terminated. Routing disabled.".to_string(),
+                    "[SYSTEM] Android native backend stop signal sent. Routing disabled."
+                        .to_string(),
                 );
             } else if terminate_root_process(Some(&app), pid).is_ok() {
                 let _ = app.emit(
@@ -6744,8 +7032,8 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             #[cfg(target_os = "android")]
             if !is_android_native_backend_pid(pid) {
                 let _ = stop_android_tunnel_service();
-                wait_for_android_backend_shutdown(&app).await;
                 clear_android_native_backend_runtime_artifacts(&app);
+                spawn_android_backend_shutdown_cleanup(&app);
             }
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
@@ -6758,6 +7046,7 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             if macos_tun_route_ready() {
                 if let Ok(signal_path) = desktop_tunnel_stop_signal_path(&app) {
                     let _ = std::fs::write(signal_path, "stop");
+                    macos_force_stop_orphaned_desktop_tunnel(&app);
                     let _ = app.emit(
                         "tunnel-log",
                         "[SYSTEM] No tracked supervisor PID was present, but macOS TUN route is active. Sent supervisor stop signal."
@@ -6779,8 +7068,8 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             #[cfg(target_os = "android")]
             {
                 let _ = stop_android_tunnel_service();
-                wait_for_android_backend_shutdown(&app).await;
                 clear_android_native_backend_runtime_artifacts(&app);
+                spawn_android_backend_shutdown_cleanup(&app);
             }
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
@@ -7247,7 +7536,7 @@ async fn restore_tunnel_session(
 
     let Some(saved_pid) = load_saved_tunnel_pid(&app)? else {
         #[cfg(target_os = "macos")]
-        if macos_tun_route_ready() {
+        if macos_tun_route_ready() && !desktop_manual_stop_marker_exists(&app) {
             {
                 let mut guard = state.singbox_pid.lock().unwrap();
                 *guard = Some(MACOS_TUN_ROUTE_SENTINEL_PID);
@@ -7301,7 +7590,7 @@ async fn restore_tunnel_session(
 
     if !process_exists(saved_pid) {
         #[cfg(target_os = "macos")]
-        if macos_tun_route_ready() {
+        if macos_tun_route_ready() && !desktop_manual_stop_marker_exists(&app) {
             {
                 let mut guard = state.singbox_pid.lock().unwrap();
                 *guard = Some(MACOS_TUN_ROUTE_SENTINEL_PID);

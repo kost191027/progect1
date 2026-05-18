@@ -499,9 +499,6 @@ pub fn build_client_config(
           "method": "2022-blake3-aes-128-gcm",
           "password": ss_password,
           "udp_over_tcp": true,
-          "multiplex": {
-            "enabled": true
-          },
           "detour": "shadowtls-out"
         },
         {
@@ -544,6 +541,11 @@ pub fn build_client_config(
             "outbound": "proxy"
           },
           {
+            "ip_version": 6,
+            "action": "route",
+            "outbound": "proxy"
+          },
+          {
             "ip_cidr": [format!("{}/32", server_ip)],
             "action": "route",
             "outbound": "direct"
@@ -555,7 +557,10 @@ pub fn build_client_config(
           }
         ],
         "final": "proxy",
-        "default_domain_resolver": "remote-dns",
+        "default_domain_resolver": {
+          "server": "remote-dns",
+          "strategy": "ipv4_only"
+        },
         "auto_detect_interface": true,
         "rule_set": local_rule_set_entries
       }
