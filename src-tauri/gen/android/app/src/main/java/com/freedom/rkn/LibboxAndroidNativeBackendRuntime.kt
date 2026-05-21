@@ -597,7 +597,9 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
 
         override fun writeDebugMessage(message: String) {
             writeRuntimeLog(bundle.runtimeLogPath, "[libbox-debug] $message")
-            Log.d(TAG, message)
+            if (BuildConfig.DEBUG) {
+                Log.d(TAG, message)
+            }
         }
     }
 

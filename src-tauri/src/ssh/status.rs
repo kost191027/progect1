@@ -503,6 +503,10 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
             "ROTATE",
             "Deploying new cover domain to server...",
         );
+        let _maintenance_guard = crate::begin_remote_transport_maintenance(
+            &rotate_app,
+            "cover-domain rotation is updating the active RKN container.",
+        );
         execute_remote_deploy(
             &sess,
             &rotate_app,

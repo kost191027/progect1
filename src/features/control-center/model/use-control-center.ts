@@ -353,6 +353,25 @@ export function useControlCenter() {
     }, LOG_FLUSH_INTERVAL_MS);
   }
 
+  function applyTransportSnapshot(snapshot: TransportStateSnapshot) {
+    setCurrentCoverDomain(snapshot.current_cover_domain ?? snapshot.local_cover_domain);
+    setAvailableCoverDomains(snapshot.available_cover_domains);
+    setRequiresRedeploy(snapshot.requires_redeploy);
+  }
+
+  async function refreshTransportSnapshot(options?: { silent?: boolean }) {
+    try {
+      const snapshot = await invoke<TransportStateSnapshot>("get_transport_state_snapshot");
+      applyTransportSnapshot(snapshot);
+      return snapshot;
+    } catch (error) {
+      if (!options?.silent) {
+        appendLog(`[WARN] Failed to load active cover domain snapshot: ${error}`);
+      }
+      return null;
+    }
+  }
+
   async function refreshAndroidRuntimeContext() {
     if (!isAndroidRuntime) {
       setAndroidRuntimeContext(null);
@@ -464,12 +483,12 @@ export function useControlCenter() {
           setPassword(profile.password);
           setSavedProfile(profile);
           setAppRole("master");
-          setCurrentCoverDomain(null);
           setRequiresInviteRefresh(false);
           window.localStorage.setItem(APP_ROLE_KEY, "master");
           window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
           window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
           appendLog("[SYSTEM] Saved server profile loaded.");
+          void refreshTransportSnapshot({ silent: true });
           return;
         }
 
@@ -521,7 +540,7 @@ export function useControlCenter() {
 
     const latestLine = logs[logs.length - 1] ?? "";
     if (
-      latestLine.includes("Android TUN handoff checkpoint reached") ||
+      latestLine.includes("Android TUN handoff prepared") ||
       latestLine.includes("Android VpnService established a real TUN interface") ||
       latestLine.includes("Android launch paths:")
     ) {
@@ -1005,9 +1024,7 @@ export function useControlCenter() {
       window.localStorage.setItem(APP_ROLE_KEY, "master");
       window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
       window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
-      setCurrentCoverDomain(snapshot.current_cover_domain);
-      setAvailableCoverDomains(snapshot.available_cover_domains);
-      setRequiresRedeploy(snapshot.requires_redeploy);
+      applyTransportSnapshot(snapshot);
       const deployedAt = new Date().toISOString();
       setLastDeployedAt(deployedAt);
       window.localStorage.setItem(LAST_DEPLOYED_AT_KEY, deployedAt);
@@ -1423,6 +1440,7 @@ export function useControlCenter() {
 
     try {
       await invoke("check_server_status");
+      await refreshTransportSnapshot({ silent: true });
     } catch (error) {
       appendLog(`[MAIN ERROR] Server status check failed: ${error}`);
     } finally {
@@ -1790,33 +1808,15 @@ export function useControlCenter() {
       return {
         title: backendReady ? "Android native backend ready" : "Android handoff checkpoint",
         description: backendReady
-          ? "VpnService owns the mobile TUN interface and the libbox backend has consumed the handoff session. Use Android route diagnostics for DNS/geodata checks."
-          : "VpnService already owns the mobile TUN interface. Waiting for the Android-native backend to consume this handoff session.",
+          ? "VpnService and the libbox backend are active. Use Android route diagnostics only when DNS/geodata needs a deeper audit."
+          : "VpnService is preparing the mobile tunnel. If this stays here, run Android route diagnostics.",
         tone: backendReady ? "ready" : "attention",
         details: [
-          `Handoff session: ${androidRuntimeContext.session_id}`,
           `TUN state: ${androidRuntimeContext.tun_state}`,
-          `TUN fd: ${androidRuntimeContext.tun_fd}`,
           `TUN address: ${androidRuntimeContext.tun_address}/${androidRuntimeContext.tun_prefix_length}`,
           `TUN route: ${androidRuntimeContext.tun_route}`,
-          `TUN mtu: ${androidRuntimeContext.tun_mtu}`,
-          `Config: ${androidRuntimeContext.config_path}`,
-          `Backend config: ${androidRuntimeContext.backend_config_path}`,
-          `Log: ${androidRuntimeContext.log_path}`,
-          `Protect API: ${androidRuntimeContext.protect_api_available ? "available" : "unavailable"}`,
           `Backend session: ${androidRuntimeContext.backend_session_state}`,
-          `Backend session id: ${androidRuntimeContext.backend_session_id}`,
-          `Backend session context: ${androidRuntimeContext.backend_session_context_path}`,
-          `Consumer tag: ${androidRuntimeContext.consumer_tag || "not prepared"}`,
-          `Consumer claim: ${androidRuntimeContext.consumer_claim_state}`,
-          `Consumer claim path: ${androidRuntimeContext.consumer_claim_path || "not created"}`,
-          `Consumer seam: ${androidRuntimeContext.consumer_launch_state || "idle"}`,
           `Consumer runtime: ${androidRuntimeContext.consumer_launch_runtime || "unknown"}`,
-          `Consumer selection: ${androidRuntimeContext.consumer_launch_selection || "not resolved"}`,
-          `Consumer summary: ${androidRuntimeContext.consumer_launch_summary || "not available"}`,
-          `Consumer session dir: ${androidRuntimeContext.consumer_session_dir || "not created"}`,
-          `TUN fd ownership: ${androidRuntimeContext.tun_fd_ownership || "not specified"}`,
-          `Consumer seam status: ${androidRuntimeContext.consumer_launch_path || "not created"}`,
         ],
       };
     }

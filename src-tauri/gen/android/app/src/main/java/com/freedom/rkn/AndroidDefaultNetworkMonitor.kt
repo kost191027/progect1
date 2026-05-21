@@ -11,6 +11,10 @@ import io.nekohasekai.libbox.InterfaceUpdateListener
 import java.net.NetworkInterface
 
 object AndroidDefaultNetworkMonitor {
+    private const val NETWORK_RESTORE_WAIT_ATTEMPTS = 16
+    private const val NETWORK_RESTORE_WAIT_MS = 125L
+    private const val EMPTY_INTERFACE_DEBOUNCE_MS = 2_500L
+
     @Volatile
     private var defaultNetwork: Network? = null
 
@@ -19,6 +23,10 @@ object AndroidDefaultNetworkMonitor {
 
     @Volatile
     private var callbackRegistered = false
+
+    @Volatile
+    private var emptyInterfaceGeneration = 0L
+
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val monitorLock = Any()
 
@@ -45,6 +53,14 @@ object AndroidDefaultNetworkMonitor {
                     if (defaultNetwork == network || defaultNetwork == null) {
                         defaultNetwork = resolveUnderlyingNetwork(connectivity)
                     }
+                    notifyListener(context.applicationContext, defaultNetwork)
+                }
+
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities
+                ) {
+                    defaultNetwork = resolveUnderlyingNetwork(connectivity)
                     notifyListener(context.applicationContext, defaultNetwork)
                 }
 
@@ -79,9 +95,20 @@ object AndroidDefaultNetworkMonitor {
             context.applicationContext.getSystemService(
                 Context.CONNECTIVITY_SERVICE
             ) as ConnectivityManager
-        val current = defaultNetwork ?: resolveUnderlyingNetwork(connectivity)
-        defaultNetwork = current
-        return current
+        repeat(NETWORK_RESTORE_WAIT_ATTEMPTS) { attempt ->
+            val current = resolveUnderlyingNetwork(connectivity)
+            if (current != null) {
+                defaultNetwork = current
+                return current
+            }
+
+            if (attempt < NETWORK_RESTORE_WAIT_ATTEMPTS - 1) {
+                Thread.sleep(NETWORK_RESTORE_WAIT_MS)
+            }
+        }
+
+        defaultNetwork = null
+        return null
     }
 
     fun setListener(context: Context, newListener: InterfaceUpdateListener?) {
@@ -99,7 +126,7 @@ object AndroidDefaultNetworkMonitor {
     private fun notifyListener(context: Context, network: Network?) {
         val currentListener = listener ?: return
         if (network == null) {
-            currentListener.updateDefaultInterface("", -1, false, false)
+            scheduleEmptyInterfaceUpdate(context.applicationContext)
             return
         }
 
@@ -110,13 +137,35 @@ object AndroidDefaultNetworkMonitor {
         val linkProperties = connectivity.getLinkProperties(network) ?: return
         val interfaceName = linkProperties.interfaceName ?: return
         if (!isUsableInterface(interfaceName)) {
-            currentListener.updateDefaultInterface("", -1, false, false)
+            scheduleEmptyInterfaceUpdate(context.applicationContext)
             return
         }
         val interfaceIndex = runCatching {
             NetworkInterface.getByName(interfaceName)?.index ?: -1
         }.getOrDefault(-1)
+        emptyInterfaceGeneration += 1
         currentListener.updateDefaultInterface(interfaceName, interfaceIndex, false, false)
+    }
+
+    private fun scheduleEmptyInterfaceUpdate(context: Context) {
+        val generation = emptyInterfaceGeneration + 1
+        emptyInterfaceGeneration = generation
+        Thread({
+            Thread.sleep(EMPTY_INTERFACE_DEBOUNCE_MS)
+            val connectivity =
+                context.applicationContext.getSystemService(
+                    Context.CONNECTIVITY_SERVICE
+                ) as ConnectivityManager
+            val recoveredNetwork = resolveUnderlyingNetwork(connectivity)
+            if (recoveredNetwork != null) {
+                defaultNetwork = recoveredNetwork
+                notifyListener(context.applicationContext, recoveredNetwork)
+                return@Thread
+            }
+            if (emptyInterfaceGeneration == generation) {
+                listener?.updateDefaultInterface("", -1, false, false)
+            }
+        }, "rkn-default-network-empty-debounce").start()
     }
 
     fun interfaceFlags(context: Context, interfaceName: String): Int {

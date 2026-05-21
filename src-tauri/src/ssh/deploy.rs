@@ -923,6 +923,10 @@ pub async fn deploy_server(
 
     let deploy_app = app.clone();
     let deploy_snapshot = tauri::async_runtime::spawn_blocking(move || -> Result<TransportStateSnapshot, String> {
+        let _maintenance_guard = crate::begin_remote_transport_maintenance(
+            &deploy_app,
+            "server deploy/update is changing the active RKN container.",
+        );
         let _mutation_guard = acquire_remote_mutation_lock()?;
         let _ = deploy_app.emit(
             "tunnel-log",

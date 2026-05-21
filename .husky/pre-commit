@@ -1,7 +1,11 @@
 #!/usr/bin/env sh
 
 echo "⚙️ Running Frontend Lint & TS Check..."
-npx lint-staged
+if [ ! -x node_modules/.bin/lint-staged ] || [ ! -x node_modules/.bin/eslint ]; then
+  echo "Frontend dependencies are missing or offloaded. Run npm install, then retry commit."
+  exit 1
+fi
+./node_modules/.bin/lint-staged
 npm run build-check
 
 echo "⚙️ Running Rust Formatting & Clippy (Backend)..."
