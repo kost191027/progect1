@@ -4,12 +4,12 @@ object AndroidNativeBackendRuntimeRegistry {
     private val candidates =
         listOf(
             LibboxAndroidNativeBackendRuntime,
-            StubAndroidNativeBackendRuntime,
+            StubAndroidNativeBackendRuntime
         )
 
     fun current(
         context: android.content.Context,
-        bundle: AndroidNativeBackendLaunchBundlePayload,
+        bundle: AndroidNativeBackendLaunchBundlePayload
     ): AndroidNativeBackendRuntimeSelection {
         val preferredRuntime = BuildConfig.ANDROID_NATIVE_BACKEND_RUNTIME
         val preferredCandidate = candidates.firstOrNull { it.runtimeId == preferredRuntime }
@@ -20,7 +20,7 @@ object AndroidNativeBackendRuntimeRegistry {
                 return AndroidNativeBackendRuntimeSelection(
                     runtime = preferredCandidate,
                     preferredRuntime = preferredRuntime,
-                    selectionSummary = "preferred=$preferredRuntime, selected=${preferredCandidate.runtimeId}, detail=${availability.detail}",
+                    selectionSummary = "preferred=$preferredRuntime, selected=${preferredCandidate.runtimeId}, detail=${availability.detail}"
                 )
             }
         }
@@ -35,7 +35,9 @@ object AndroidNativeBackendRuntimeRegistry {
             ?.takeIf { preferredCandidate.runtimeId != fallbackCandidate.runtimeId }
 
         val selectionSummary = buildString {
-            append("preferred=$preferredRuntime, selected=${fallbackCandidate.runtimeId}, detail=${fallbackAvailability.detail}")
+            append(
+                "preferred=$preferredRuntime, selected=${fallbackCandidate.runtimeId}, detail=${fallbackAvailability.detail}"
+            )
             if (unavailablePreferred != null) {
                 append(", preferred_unavailable=$unavailablePreferred")
             }
@@ -44,11 +46,11 @@ object AndroidNativeBackendRuntimeRegistry {
         return AndroidNativeBackendRuntimeSelection(
             runtime = fallbackCandidate,
             preferredRuntime = preferredRuntime,
-            selectionSummary = selectionSummary,
+            selectionSummary = selectionSummary
         )
     }
 
-    fun byId(runtimeId: String): AndroidNativeBackendRuntime? {
-        return candidates.firstOrNull { it.runtimeId == runtimeId }
+    fun byId(runtimeId: String): AndroidNativeBackendRuntime? = candidates.firstOrNull {
+        it.runtimeId == runtimeId
     }
 }

@@ -4,6 +4,8 @@ use jni::objects::{JObject, JValue};
 use jni::JavaVM;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::io::Write;
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+use std::os::unix::fs::MetadataExt;
 #[cfg(any(target_os = "windows", target_os = "android"))]
 use std::process::Stdio;
 use std::sync::Mutex;
@@ -31,6 +33,19 @@ mod geodata;
 #[path = "ssh/mod.rs"]
 mod ssh;
 
+#[cfg(target_os = "macos")]
+const MACOS_TUN_ROUTE_SENTINEL_PID: u32 = u32::MAX - 17;
+
+#[cfg(target_os = "macos")]
+fn is_macos_tun_route_sentinel_pid(pid: u32) -> bool {
+    pid == MACOS_TUN_ROUTE_SENTINEL_PID
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_macos_tun_route_sentinel_pid(_pid: u32) -> bool {
+    false
+}
+
 #[cfg(desktop)]
 const TRAY_ICON: Image<'_> = tauri::include_image!("./icons/tray-icon.png");
 struct AppState {
@@ -41,10 +56,21 @@ struct AppState {
     proxy_failure_count: Mutex<u8>,
     proxy_failure_window_started: Mutex<Option<std::time::Instant>>,
     kill_switch_engaged: Mutex<bool>,
+    remote_transport_maintenance_depth: Mutex<u32>,
     #[cfg(desktop)]
     tray_toggle_item: Mutex<Option<MenuItem<Wry>>>,
     #[cfg(target_os = "windows")]
     windows_tray_notice_shown: Mutex<bool>,
+}
+
+pub(crate) struct RemoteTransportMaintenanceGuard {
+    app: AppHandle,
+}
+
+impl Drop for RemoteTransportMaintenanceGuard {
+    fn drop(&mut self) {
+        finish_remote_transport_maintenance(&self.app);
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -205,6 +231,39 @@ fn clear_saved_tunnel_pid(app: &AppHandle) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn desktop_manual_stop_marker_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("desktop_tunnel.manual_stop"))
+}
+
+#[cfg(target_os = "macos")]
+fn mark_desktop_manual_stop(app: &AppHandle) {
+    if let Ok(path) = desktop_manual_stop_marker_path(app) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(path, "stopped");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clear_desktop_manual_stop_marker(app: &AppHandle) {
+    if let Ok(path) = desktop_manual_stop_marker_path(app) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn desktop_manual_stop_marker_exists(app: &AppHandle) -> bool {
+    desktop_manual_stop_marker_path(app)
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
+
 fn emit_tunnel_state(app: &AppHandle, is_running: bool) {
     let _ = app.emit("tunnel-state", is_running);
 }
@@ -266,6 +325,136 @@ fn local_client_config_requires_refresh(app: &AppHandle) -> Result<bool, String>
     }
 
     Ok(false)
+}
+
+fn normalize_local_client_config_for_runtime(app: &AppHandle) -> Result<(), String> {
+    let config_path = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("client_config.json");
+
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let contents = fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+    let mut config: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("Invalid client config JSON: {}", e))?;
+    let mut changed = false;
+
+    if let Some(outbounds) = config
+        .get_mut("outbounds")
+        .and_then(|value| value.as_array_mut())
+    {
+        for outbound in outbounds {
+            let is_proxy_shadowsocks = outbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "shadowsocks")
+                && outbound
+                    .get("tag")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == "proxy");
+
+            if is_proxy_shadowsocks
+                && outbound
+                    .as_object_mut()
+                    .and_then(|object| object.remove("multiplex"))
+                    .is_some()
+            {
+                changed = true;
+            }
+
+            let is_direct = outbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "direct")
+                && outbound
+                    .get("tag")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == "direct");
+
+            if is_direct {
+                if let Some(object) = outbound.as_object_mut() {
+                    if object.remove("domain_strategy").is_some() {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if route_ipv6_to_proxy_before_direct_rules(&mut config) {
+        changed = true;
+    }
+    if force_route_default_domain_resolver_ipv4(&mut config) {
+        changed = true;
+    }
+
+    if changed {
+        let rendered = serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize normalized client config: {}", e))?;
+        fs::write(&config_path, rendered)
+            .map_err(|e| format!("Failed to write normalized client config: {}", e))?;
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Local client config optimized for runtime stability: disabled Shadowsocks multiplex, forced DNS to IPv4, and routed IPv6 through proxy."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn route_ipv6_to_proxy_before_direct_rules(cfg: &mut serde_json::Value) -> bool {
+    let Some(route_rules) = cfg
+        .get_mut("route")
+        .and_then(|value| value.get_mut("rules"))
+        .and_then(|value| value.as_array_mut())
+    else {
+        return false;
+    };
+
+    let ipv6_proxy_rule = serde_json::json!({
+        "ip_version": 6,
+        "action": "route",
+        "outbound": "proxy"
+    });
+
+    if route_rules.iter().any(|rule| rule == &ipv6_proxy_rule) {
+        return false;
+    }
+
+    let insert_at = route_rules
+        .iter()
+        .position(|rule| {
+            rule.get("outbound")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "direct")
+        })
+        .unwrap_or(route_rules.len());
+
+    route_rules.insert(insert_at, ipv6_proxy_rule);
+    true
+}
+
+fn force_route_default_domain_resolver_ipv4(cfg: &mut serde_json::Value) -> bool {
+    let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) else {
+        return false;
+    };
+
+    let desired = serde_json::json!({
+        "server": "remote-dns",
+        "strategy": "ipv4_only"
+    });
+
+    if route.get("default_domain_resolver") == Some(&desired) {
+        return false;
+    }
+
+    route.insert("default_domain_resolver".to_string(), desired);
+    true
 }
 
 #[cfg(desktop)]
@@ -412,6 +601,274 @@ fn run_admin_command(script: &str) -> Result<std::process::Output, String> {
         .map_err(|e| format!("Failed to execute osascript: {}", e))
 }
 
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+fn desktop_tunnel_stop_signal_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("desktop_singbox.stop"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+fn desktop_tunnel_restart_signal_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("desktop_singbox.restart"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+fn desktop_tunnel_supervisor_script_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("desktop_singbox_supervisor.sh"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+fn write_desktop_tunnel_supervisor_script(
+    app: &AppHandle,
+    singbox_path: &str,
+    config_path: &str,
+    log_path: &str,
+) -> Result<PathBuf, String> {
+    let script_path = desktop_tunnel_supervisor_script_path(app)?;
+    let stop_signal_path = desktop_tunnel_stop_signal_path(app)?;
+    let restart_signal_path = desktop_tunnel_restart_signal_path(app)?;
+    let pid_path = tunnel_pid_path(app)?;
+    let local_data_dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let owner = std::fs::metadata(&local_data_dir).map_err(|e| {
+        format!(
+            "Failed to inspect app data owner {}: {}",
+            local_data_dir.display(),
+            e
+        )
+    })?;
+    let script = format!(
+        r#"#!/bin/sh
+SINGBOX={}
+CONFIG={}
+LOG={}
+STOP={}
+RESTART={}
+PID_FILE={}
+PID_OWNER_UID={}
+PID_OWNER_GID={}
+PARENT={}
+CHILD=""
+
+write_pid_file() {{
+  echo $$ > "$PID_FILE" 2>/dev/null || true
+  chown "$PID_OWNER_UID:$PID_OWNER_GID" "$PID_FILE" >/dev/null 2>&1 || true
+  chmod 600 "$PID_FILE" >/dev/null 2>&1 || true
+}}
+
+cleanup() {{
+  if [ -n "$CHILD" ]; then
+    kill "$CHILD" >/dev/null 2>&1 || true
+    wait "$CHILD" >/dev/null 2>&1 || true
+  fi
+  rm -f "$STOP" >/dev/null 2>&1 || true
+  rm -f "$RESTART" >/dev/null 2>&1 || true
+  rm -f "$PID_FILE" >/dev/null 2>&1 || true
+}}
+
+trap cleanup TERM INT EXIT
+rm -f "$STOP" >/dev/null 2>&1 || true
+rm -f "$RESTART" >/dev/null 2>&1 || true
+write_pid_file
+echo "[SUPERVISOR] Desktop tunnel supervisor started." >> "$LOG"
+
+while true; do
+  write_pid_file
+
+  if ! kill -0 "$PARENT" >/dev/null 2>&1; then
+    echo "[SUPERVISOR] Parent app exited; stopping tunnel." >> "$LOG"
+    exit 0
+  fi
+
+  if [ -f "$STOP" ]; then
+    echo "[SUPERVISOR] Stop signal received; stopping tunnel." >> "$LOG"
+    exit 0
+  fi
+
+  "$SINGBOX" run -c "$CONFIG" >> "$LOG" 2>&1 &
+  CHILD=$!
+  echo "[SUPERVISOR] sing-box started with PID $CHILD." >> "$LOG"
+
+  while kill -0 "$CHILD" >/dev/null 2>&1; do
+    if ! kill -0 "$PARENT" >/dev/null 2>&1; then
+      exit 0
+    fi
+
+    if [ -f "$STOP" ]; then
+      exit 0
+    fi
+
+    if [ -f "$RESTART" ]; then
+      echo "[SUPERVISOR] Restart signal received; refreshing sing-box." >> "$LOG"
+      rm -f "$RESTART" >/dev/null 2>&1 || true
+      kill "$CHILD" >/dev/null 2>&1 || true
+      break
+    fi
+
+    sleep 0.5
+  done
+
+  wait "$CHILD" >/dev/null 2>&1
+  CHILD=""
+
+  if [ -f "$STOP" ]; then
+    exit 0
+  fi
+
+  if ! kill -0 "$PARENT" >/dev/null 2>&1; then
+    exit 0
+  fi
+
+  echo "[SUPERVISOR] sing-box exited unexpectedly; restarting in 1 second." >> "$LOG"
+  sleep 1
+done
+"#,
+        shell_single_quote(singbox_path),
+        shell_single_quote(config_path),
+        shell_single_quote(log_path),
+        shell_single_quote(&stop_signal_path.to_string_lossy()),
+        shell_single_quote(&restart_signal_path.to_string_lossy()),
+        shell_single_quote(&pid_path.to_string_lossy()),
+        owner.uid(),
+        owner.gid(),
+        std::process::id(),
+    );
+
+    std::fs::write(&script_path, script).map_err(|e| {
+        format!(
+            "Failed to write desktop tunnel supervisor {}: {}",
+            script_path.display(),
+            e
+        )
+    })?;
+
+    Ok(script_path)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_netstat_inet_snapshot() -> Result<String, String> {
+    let output = std::process::Command::new("netstat")
+        .args(["-rn", "-f", "inet"])
+        .output()
+        .map_err(|e| format!("Failed to inspect macOS route table: {}", e))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_tun_route_ready() -> bool {
+    let Ok(snapshot) = macos_netstat_inet_snapshot() else {
+        return false;
+    };
+
+    snapshot.lines().any(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("utun")
+            && (lower.starts_with("default")
+                || lower.starts_with("0/1")
+                || lower.starts_with("128.0/1")
+                || lower.starts_with("198.18")
+                || lower.starts_with("172.19.0"))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_route_table_diagnostic(max_lines: usize) -> String {
+    macos_netstat_inet_snapshot()
+        .map(|snapshot| {
+            snapshot
+                .lines()
+                .take(max_lines)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|error| format!("route table unavailable: {}", error))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_force_stop_orphaned_desktop_tunnel(app: &AppHandle) {
+    let stop_signal = desktop_tunnel_stop_signal_path(app)
+        .map(|path| path.to_string_lossy().to_string())
+        .ok();
+    let supervisor = desktop_tunnel_supervisor_script_path(app)
+        .map(|path| path.to_string_lossy().to_string())
+        .ok();
+    let runtime_config = app.path().app_local_data_dir().ok().map(|path| {
+        path.join("client_config_desktop.json")
+            .to_string_lossy()
+            .to_string()
+    });
+
+    let mut script = String::new();
+    if let Some(stop_signal) = stop_signal {
+        script.push_str(&format!(
+            "touch {} >/dev/null 2>&1 || true\n",
+            shell_single_quote(&stop_signal)
+        ));
+    }
+
+    for pattern in [supervisor.clone(), runtime_config.clone()]
+        .into_iter()
+        .flatten()
+    {
+        let quoted_pattern = shell_single_quote(&pattern);
+        script.push_str(&format!(
+            "for p in $(/usr/bin/pgrep -f {} 2>/dev/null || true); do [ \"$p\" != \"$$\" ] && [ \"$p\" != \"$PPID\" ] && /bin/kill \"$p\" >/dev/null 2>&1 || true; done\n",
+            quoted_pattern
+        ));
+    }
+
+    script.push_str("sleep 0.4\n");
+
+    for pattern in [supervisor, runtime_config].into_iter().flatten() {
+        let quoted_pattern = shell_single_quote(&pattern);
+        script.push_str(&format!(
+            "for p in $(/usr/bin/pgrep -f {} 2>/dev/null || true); do [ \"$p\" != \"$$\" ] && [ \"$p\" != \"$PPID\" ] && /bin/kill -9 \"$p\" >/dev/null 2>&1 || true; done\n",
+            quoted_pattern
+        ));
+    }
+
+    let _ = std::process::Command::new("/bin/sh")
+        .args(["-c", &script])
+        .output();
+}
+
+#[cfg(target_os = "macos")]
+fn request_desktop_supervisor_core_restart(app: &AppHandle, reason: &str) -> Result<(), String> {
+    let path = desktop_tunnel_restart_signal_path(app)?;
+    std::fs::write(&path, "restart").map_err(|e| {
+        format!(
+            "Failed to request desktop supervisor restart {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+
+    let _ = app.emit(
+        "tunnel-log",
+        format!(
+            "[SYSTEM] {} Refreshing the desktop core through the privileged supervisor without another administrator prompt.",
+            reason
+        ),
+    );
+
+    Ok(())
+}
+
 #[allow(unused_variables)]
 fn terminate_root_process(app: Option<&AppHandle>, pid: u32) -> Result<(), String> {
     if !process_exists(pid) {
@@ -483,6 +940,12 @@ fn terminate_root_process(app: Option<&AppHandle>, pid: u32) -> Result<(), Strin
 
         #[cfg(not(target_os = "android"))]
         {
+            if let Some(app) = app {
+                if let Ok(signal_path) = desktop_tunnel_stop_signal_path(app) {
+                    let _ = std::fs::write(signal_path, "stop");
+                }
+            }
+
             let _ = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .output();
@@ -630,10 +1093,260 @@ fn trim_utf8_bom(value: &str) -> &str {
     value.strip_prefix('\u{feff}').unwrap_or(value)
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 const ANDROID_PROXY_FALLBACK_MODE: bool = false;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AndroidLocalProxyInboundViolation {
+    inbound_type: String,
+    listen: String,
+    listen_port: String,
+}
+
+#[cfg(any(target_os = "android", test))]
+fn find_android_local_proxy_inbound_violation(
+    parsed: &serde_json::Value,
+) -> Option<AndroidLocalProxyInboundViolation> {
+    let inbounds = parsed.get("inbounds").and_then(|value| value.as_array())?;
+
+    for inbound in inbounds {
+        let inbound_type = inbound
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let listen = inbound
+            .get("listen")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        let is_proxy_inbound = matches!(inbound_type, "socks" | "mixed" | "http");
+        let is_localhost_listener = matches!(listen, "127.0.0.1" | "::1" | "localhost");
+
+        if is_proxy_inbound || is_localhost_listener {
+            let listen_port = inbound
+                .get("listen_port")
+                .and_then(|value| value.as_u64())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            return Some(AndroidLocalProxyInboundViolation {
+                inbound_type: inbound_type.to_string(),
+                listen: if listen.is_empty() {
+                    "default".to_string()
+                } else {
+                    listen.to_string()
+                },
+                listen_port,
+            });
+        }
+    }
+
+    None
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_local_proxy_inbound_error(violation: &AndroidLocalProxyInboundViolation) -> String {
+    format!(
+        "[SECURITY] Android security policy blocked a local proxy inbound (type='{}', listen='{}', port={}). RKN mobile currently permits only VPN/TUN-style inbounds; localhost proxy fallback must go through an explicit security review before it can be enabled.",
+        violation.inbound_type, violation.listen, violation.listen_port
+    )
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_rule_has_action(rule: &serde_json::Value, action: &str) -> bool {
+    rule.get("action").and_then(|value| value.as_str()) == Some(action)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_rule_routes_rule_set_to(rule: &serde_json::Value, tag: &str, outbound: &str) -> bool {
+    if !android_rule_has_action(rule, "route") {
+        return false;
+    }
+
+    if rule.get("outbound").and_then(|value| value.as_str()) != Some(outbound) {
+        return false;
+    }
+
+    rule.get("rule_set")
+        .and_then(|value| value.as_array())
+        .map(|rule_sets| rule_sets.iter().any(|value| value.as_str() == Some(tag)))
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_dns_rule_uses_server(rule: &serde_json::Value, tag: &str, server: &str) -> bool {
+    if rule.get("server").and_then(|value| value.as_str()) != Some(server) {
+        return false;
+    }
+
+    rule.get("rule_set")
+        .and_then(|value| value.as_array())
+        .map(|rule_sets| rule_sets.iter().any(|value| value.as_str() == Some(tag)))
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_route_policy_error(message: &str) -> String {
+    format!("[ANDROID ROUTE] Android runtime route policy is incomplete: {message}")
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_direct_rule_set_dns_server() -> &'static str {
+    "local-dns"
+}
+
+#[cfg(any(target_os = "android", test))]
+fn inject_android_local_rule_sets(
+    raw_config: &str,
+    local_rule_sets: &[crate::geodata::LocalRuleSetAsset],
+) -> Result<String, String> {
+    let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
+        format!(
+            "Failed to parse generated client config while injecting Android rule-sets: {}",
+            e
+        )
+    })?;
+
+    let route = cfg
+        .get_mut("route")
+        .and_then(|value| value.as_object_mut())
+        .ok_or_else(|| {
+            android_route_policy_error("missing route section while injecting Android rule-sets")
+        })?;
+    let rule_set_entries = local_rule_sets
+        .iter()
+        .map(|rule_set| {
+            serde_json::json!({
+                "tag": rule_set.tag,
+                "type": "local",
+                "format": "binary",
+                "path": rule_set.path.to_string_lossy().to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    route.insert("rule_set".to_string(), serde_json::json!(rule_set_entries));
+
+    serde_json::to_string_pretty(&cfg).map_err(|e| {
+        format!(
+            "Failed to serialize generated client config after injecting Android rule-sets: {}",
+            e
+        )
+    })
+}
+
+#[cfg(any(target_os = "android", test))]
+fn validate_android_runtime_route_policy(cfg: &serde_json::Value) -> Result<(), String> {
+    let route = cfg
+        .get("route")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| android_route_policy_error("missing route section"))?;
+    let dns = cfg
+        .get("dns")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| android_route_policy_error("missing dns section"))?;
+    let route_rules = route
+        .get("rules")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| android_route_policy_error("missing route.rules"))?;
+    let dns_rules = dns
+        .get("rules")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| android_route_policy_error("missing dns.rules"))?;
+    let route_rule_sets = route
+        .get("rule_set")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let route_rule_set_tags = route_rule_sets
+        .iter()
+        .filter_map(|rule_set| rule_set.get("tag").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+
+    if route.get("final").and_then(|value| value.as_str()) != Some("proxy") {
+        return Err(android_route_policy_error("route.final must stay proxy"));
+    }
+
+    if route
+        .get("default_domain_resolver")
+        .and_then(|value| value.as_str())
+        != Some("local-dns")
+    {
+        return Err(android_route_policy_error(
+            "route.default_domain_resolver must stay local-dns on Android",
+        ));
+    }
+
+    if dns.get("final").and_then(|value| value.as_str()) != Some("local-dns") {
+        return Err(android_route_policy_error("dns.final must stay local-dns"));
+    }
+
+    let generic_udp_direct = route_rules.iter().any(|rule| {
+        rule.get("network").and_then(|value| value.as_str()) == Some("udp")
+            && rule.get("action").and_then(|value| value.as_str()) == Some("route")
+            && rule.get("outbound").and_then(|value| value.as_str()) == Some("direct")
+    });
+    if generic_udp_direct {
+        return Err(android_route_policy_error(
+            "generic Android UDP must not route direct because games must stay inside the tunnel",
+        ));
+    }
+
+    let has_dns_hijack = route_rules
+        .iter()
+        .any(|rule| android_rule_has_action(rule, "hijack-dns"));
+    if !has_dns_hijack {
+        return Err(android_route_policy_error("missing hijack-dns route rule"));
+    }
+
+    if route_rule_set_tags.contains(&crate::geodata::GOOGLE_RULE_SET_TAG) {
+        let google_routes_proxy = route_rules.iter().any(|rule| {
+            android_rule_routes_rule_set_to(rule, crate::geodata::GOOGLE_RULE_SET_TAG, "proxy")
+        });
+        let google_dns_fakeip = dns_rules.iter().any(|rule| {
+            android_dns_rule_uses_server(rule, crate::geodata::GOOGLE_RULE_SET_TAG, "fakeip-dns")
+        });
+
+        if !google_routes_proxy || !google_dns_fakeip {
+            return Err(android_route_policy_error(
+                "Google rule-set must route through proxy and resolve through fakeip",
+            ));
+        }
+    }
+
+    let direct_rule_tags = route_rule_set_tags
+        .iter()
+        .copied()
+        .filter(|tag| crate::geodata::DIRECT_ROUTE_RULE_SET_TAGS.contains(tag))
+        .collect::<Vec<_>>();
+    if !direct_rule_tags.is_empty() {
+        let routes_direct = direct_rule_tags.iter().all(|tag| {
+            route_rules
+                .iter()
+                .any(|rule| android_rule_routes_rule_set_to(rule, tag, "direct"))
+        });
+        let dns_server = android_direct_rule_set_dns_server();
+        let dns_local = direct_rule_tags
+            .iter()
+            .filter(|tag| !tag.starts_with("geoip-"))
+            .all(|tag| {
+                dns_rules
+                    .iter()
+                    .any(|rule| android_dns_rule_uses_server(rule, tag, dns_server))
+            });
+
+        if !routes_direct || !dns_local {
+            return Err(android_route_policy_error(
+                "RU rule-sets must route direct and use the Android direct rule-set DNS server for domain rule-sets",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", test))]
 fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Result<String, String> {
     if ANDROID_PROXY_FALLBACK_MODE {
         return build_android_proxy_runtime_client_config(raw_config, log_path);
@@ -682,9 +1395,13 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 // interface-bound forwarders while we stabilize the mobile tunnel.
                 object.insert("strict_route".to_string(), serde_json::json!(false));
                 object.insert("stack".to_string(), serde_json::json!("gvisor"));
-                object.insert("mtu".to_string(), serde_json::json!(1400));
+                object.insert("mtu".to_string(), serde_json::json!(1280));
             }
         }
+    }
+
+    if let Some(violation) = find_android_local_proxy_inbound_violation(&cfg) {
+        return Err(android_local_proxy_inbound_error(&violation));
     }
 
     if let Some(outbounds) = cfg
@@ -720,7 +1437,7 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         route.remove("network_strategy");
         route.insert(
             "default_domain_resolver".to_string(),
-            serde_json::json!("remote-dns"),
+            serde_json::json!("local-dns"),
         );
 
         let mut direct_rule_set_tags = Vec::<String>::new();
@@ -783,12 +1500,6 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 "port": 53,
                 "action": "hijack-dns"
             }),
-            serde_json::json!({
-                "network": "udp",
-                "port": 443,
-                "action": "reject",
-                "method": "default"
-            }),
         ];
 
         if google_rule_set_available {
@@ -825,6 +1536,13 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             }));
         }
 
+        route_rules.push(serde_json::json!({
+            "network": "udp",
+            "port": 443,
+            "action": "reject",
+            "method": "default"
+        }));
+
         route.insert("rules".to_string(), serde_json::json!(route_rules));
         route.insert("final".to_string(), serde_json::json!("proxy"));
     }
@@ -836,14 +1554,14 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         .cloned()
         .unwrap_or_default();
     let mut direct_dns_rule_set_tags = Vec::<String>::new();
-    let mut google_rule_set_available = false;
+    let mut google_dns_rule_set_available = false;
     for rule_set in route_rule_sets {
         let tag = rule_set
             .get("tag")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         if tag == crate::geodata::GOOGLE_RULE_SET_TAG {
-            google_rule_set_available = true;
+            google_dns_rule_set_available = true;
         }
         if crate::geodata::DIRECT_ROUTE_RULE_SET_TAGS.contains(&tag) && !tag.starts_with("geoip-") {
             direct_dns_rule_set_tags.push(tag.to_string());
@@ -854,6 +1572,12 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         dns.insert(
             "servers".to_string(),
             serde_json::json!([
+                {
+                    "type": "fakeip",
+                    "tag": "fakeip-dns",
+                    "inet4_range": "198.18.0.0/15",
+                    "inet6_range": "fc00::/18"
+                },
                 {
                     "type": "tcp",
                     "tag": "remote-dns",
@@ -868,23 +1592,24 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 }
             ]),
         );
+        let android_direct_dns_server = android_direct_rule_set_dns_server();
         let mut dns_rules = vec![
             serde_json::json!({
                 "domain_suffix": crate::geodata::PROXY_PRIORITY_DOMAIN_SUFFIXES,
-                "server": "remote-dns"
+                "server": "fakeip-dns"
             }),
             serde_json::json!({
                 "domain_suffix": crate::geodata::CURATED_RU_DOMAIN_SUFFIXES,
-                "server": "local-dns"
+                "server": android_direct_dns_server
             }),
         ];
 
-        if google_rule_set_available {
+        if google_dns_rule_set_available {
             dns_rules.insert(
                 0,
                 serde_json::json!({
                     "rule_set": [crate::geodata::GOOGLE_RULE_SET_TAG],
-                    "server": "remote-dns"
+                    "server": "fakeip-dns"
                 }),
             );
         }
@@ -892,20 +1617,22 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         if !direct_dns_rule_set_tags.is_empty() {
             dns_rules.push(serde_json::json!({
                 "rule_set": direct_dns_rule_set_tags,
-                "server": "local-dns"
+                "server": android_direct_dns_server
             }));
         }
 
         dns.insert("rules".to_string(), serde_json::json!(dns_rules));
-        dns.insert("final".to_string(), serde_json::json!("remote-dns"));
+        dns.insert("final".to_string(), serde_json::json!("local-dns"));
         dns.insert("strategy".to_string(), serde_json::json!("ipv4_only"));
     }
+
+    validate_android_runtime_route_policy(&cfg)?;
 
     serde_json::to_string_pretty(&cfg)
         .map_err(|e| format!("Failed to serialize Android runtime client config: {}", e))
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 fn build_android_proxy_runtime_client_config(
     raw_config: &str,
     log_path: &str,
@@ -1019,7 +1746,7 @@ fn build_android_proxy_runtime_client_config(
     })
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 fn validate_android_rule_set_file(path: &str) -> Result<(), String> {
     let mut magic = [0_u8; 4];
     let mut file = std::fs::File::open(path).map_err(|e| {
@@ -1298,6 +2025,55 @@ fn macos_server_route_prelude(_server_ip: Option<&str>) -> String {
 }
 
 #[cfg(not(target_os = "android"))]
+fn is_udp_443_reject_rule(rule: &serde_json::Value) -> bool {
+    let Some(object) = rule.as_object() else {
+        return false;
+    };
+
+    let is_reject = object
+        .get("action")
+        .and_then(|value| value.as_str())
+        .map(|value| value == "reject")
+        .unwrap_or(false);
+    let is_udp = object
+        .get("network")
+        .and_then(|value| value.as_str())
+        .map(|value| value == "udp")
+        .unwrap_or(false);
+    let is_443 = object
+        .get("port")
+        .and_then(|value| value.as_u64())
+        .map(|value| value == 443)
+        .unwrap_or(false);
+
+    is_reject && is_udp && is_443
+}
+
+#[cfg(not(target_os = "android"))]
+fn move_udp_443_reject_rule_to_route_tail(cfg: &mut serde_json::Value) {
+    let Some(route_rules) = cfg
+        .get_mut("route")
+        .and_then(|value| value.get_mut("rules"))
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+
+    let mut reject_rules = Vec::new();
+    let mut ordered_rules = Vec::with_capacity(route_rules.len());
+    for rule in route_rules.drain(..) {
+        if is_udp_443_reject_rule(&rule) {
+            reject_rules.push(rule);
+        } else {
+            ordered_rules.push(rule);
+        }
+    }
+
+    ordered_rules.extend(reject_rules);
+    *route_rules = ordered_rules;
+}
+
+#[cfg(not(target_os = "android"))]
 fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, String> {
     let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
         format!(
@@ -1325,6 +2101,10 @@ fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, Strin
             }
 
             if let Some(object) = inbound.as_object_mut() {
+                object.insert(
+                    "address".to_string(),
+                    serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]),
+                );
                 object.remove("sniff");
                 object.remove("sniff_override_destination");
             }
@@ -1336,20 +2116,68 @@ fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, Strin
         .and_then(|value| value.as_array_mut())
     {
         for outbound in outbounds {
-            let outbound_type = outbound
+            let is_proxy_shadowsocks = outbound
                 .get("type")
                 .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let outbound_tag = outbound
-                .get("tag")
+                .is_some_and(|value| value == "shadowsocks")
+                && outbound
+                    .get("tag")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == "proxy");
+            let is_direct = outbound
+                .get("type")
                 .and_then(|value| value.as_str())
-                .unwrap_or_default();
+                .is_some_and(|value| value == "direct")
+                && outbound
+                    .get("tag")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == "direct");
 
-            if outbound_type == "shadowsocks" && outbound_tag == "proxy" {
+            if is_proxy_shadowsocks {
                 if let Some(object) = outbound.as_object_mut() {
                     object.remove("multiplex");
                 }
             }
+
+            if is_direct {
+                if let Some(object) = outbound.as_object_mut() {
+                    object.remove("domain_strategy");
+                }
+            }
+        }
+    }
+
+    route_ipv6_to_proxy_before_direct_rules(&mut cfg);
+    force_route_default_domain_resolver_ipv4(&mut cfg);
+    move_udp_443_reject_rule_to_route_tail(&mut cfg);
+
+    if let Some(dns_servers) = cfg
+        .get_mut("dns")
+        .and_then(|value| value.get_mut("servers"))
+        .and_then(|value| value.as_array_mut())
+    {
+        for server in dns_servers {
+            let is_remote_dns = server
+                .get("tag")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "remote-dns");
+
+            if !is_remote_dns {
+                continue;
+            }
+
+            *server = serde_json::json!({
+                "type": "https",
+                "tag": "remote-dns",
+                "server": "8.8.8.8",
+                "server_port": 443,
+                "path": "/dns-query",
+                "detour": "proxy",
+                "tls": {
+                    "enabled": true,
+                    "server_name": "dns.google"
+                }
+            });
         }
     }
 
@@ -2050,6 +2878,54 @@ fn finish_recovery(state: &AppState) {
     *guard = false;
 }
 
+pub(crate) fn begin_remote_transport_maintenance(
+    app: &AppHandle,
+    reason: &str,
+) -> RemoteTransportMaintenanceGuard {
+    let state = app.state::<AppState>();
+    let mut depth = state.remote_transport_maintenance_depth.lock().unwrap();
+    let was_idle = *depth == 0;
+    *depth = depth.saturating_add(1);
+    drop(depth);
+
+    if was_idle {
+        reset_guard_state(&state);
+        let _ = app.emit(
+            "tunnel-log",
+            format!(
+                "[SYSTEM] Remote transport maintenance started: {} Live proxy recovery is paused until the server runtime is healthy again.",
+                reason
+            ),
+        );
+    }
+
+    RemoteTransportMaintenanceGuard { app: app.clone() }
+}
+
+fn finish_remote_transport_maintenance(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mut depth = state.remote_transport_maintenance_depth.lock().unwrap();
+    if *depth == 0 {
+        return;
+    }
+
+    *depth -= 1;
+    let is_finished = *depth == 0;
+    drop(depth);
+
+    if is_finished {
+        reset_guard_state(&state);
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Remote transport maintenance finished. Live proxy recovery is active again.",
+        );
+    }
+}
+
+fn remote_transport_maintenance_is_active(state: &AppState) -> bool {
+    *state.remote_transport_maintenance_depth.lock().unwrap() > 0
+}
+
 fn begin_recovery(state: &AppState) -> bool {
     let mut guard = state.recovery_in_progress.lock().unwrap();
     if *guard {
@@ -2066,9 +2942,43 @@ fn reset_guard_state(state: &AppState) {
     *state.kill_switch_engaged.lock().unwrap() = false;
 }
 
+fn release_guard_after_quiet_period(app: &AppHandle, state: &AppState) {
+    const PROXY_GUARD_QUIET_RELEASE: Duration = Duration::from_secs(90);
+
+    let should_release = {
+        let engaged = *state.kill_switch_engaged.lock().unwrap();
+        if !engaged {
+            false
+        } else {
+            state
+                .proxy_failure_window_started
+                .lock()
+                .unwrap()
+                .map(|started| started.elapsed() >= PROXY_GUARD_QUIET_RELEASE)
+                .unwrap_or(false)
+        }
+    };
+
+    if !should_release {
+        return;
+    }
+
+    reset_guard_state(state);
+    emit_guard_state(app, "active");
+    let _ = app.emit(
+        "tunnel-log",
+        "[GUARD] Proxy path has been quiet since the degraded burst. Clearing the runtime guard state; the tunnel remains active.",
+    );
+}
+
 fn register_proxy_failure(app: &AppHandle, state: &AppState) {
     const PROXY_FAILURE_RECOVERY_THRESHOLD: u8 = 8;
     const PROXY_FAILURE_WINDOW: Duration = Duration::from_secs(45);
+
+    if remote_transport_maintenance_is_active(state) {
+        reset_guard_state(state);
+        return;
+    }
 
     {
         let mut window = state.proxy_failure_window_started.lock().unwrap();
@@ -2118,11 +3028,15 @@ fn register_proxy_failure(app: &AppHandle, state: &AppState) {
 
     #[cfg(target_os = "macos")]
     {
-        let _ = app.emit(
-            "tunnel-log",
-            "[SYSTEM] Proxy transport is failing repeatedly. Automatic privileged restart is suppressed on macOS to avoid repeated administrator prompts; toggle the tunnel manually if traffic does not recover."
-                .to_string(),
-        );
+        if request_desktop_supervisor_core_restart(app, "Proxy transport is failing repeatedly.")
+            .is_err()
+        {
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] Proxy transport is failing repeatedly, but the desktop supervisor restart signal could not be created. Toggle the tunnel manually if traffic does not recover."
+                    .to_string(),
+            );
+        }
     }
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
@@ -2154,15 +3068,28 @@ fn register_proxy_failure(app: &AppHandle, state: &AppState) {
 fn classify_proxy_failure(line: &str) -> bool {
     let lower = line.to_lowercase();
 
-    lower.contains("outbound/shadowsocks[proxy]")
+    let proxy_outbound_failure = lower.contains("outbound/shadowsocks[proxy]")
         && (lower.contains("context deadline exceeded")
             || lower.contains("connection refused")
+            || lower.contains("connection upload closed")
             || lower.contains("i/o timeout")
+            || lower.contains("network is down")
             || lower.contains("network is unreachable")
+            || lower.contains(": eof")
             || lower.contains("no route to host")
             || lower.contains("connection reset")
             || lower.contains("failed to verify certificate")
-            || lower.contains("x509:"))
+            || lower.contains("software caused connection abort")
+            || lower.contains("tls: internal error")
+            || lower.contains("x509:"));
+
+    let proxy_dns_failure = lower.contains("dns: exchange failed")
+        && (lower.contains("dial tcp connection: eof")
+            || lower.contains("read response: eof")
+            || lower.contains("network is unreachable")
+            || lower.contains("context deadline exceeded"));
+
+    proxy_outbound_failure || proxy_dns_failure
 }
 
 fn classify_outdated_subordinate_config(line: &str) -> bool {
@@ -3093,6 +4020,16 @@ fn android_tun_mtu() -> Result<i32, String> {
 }
 
 #[cfg(target_os = "android")]
+fn android_private_dns_summary() -> Result<String, String> {
+    android_bridge_string("getPrivateDnsSummary")
+}
+
+#[cfg(target_os = "android")]
+fn android_active_network_summary() -> Result<String, String> {
+    android_bridge_string("getActiveNetworkSummary")
+}
+
+#[cfg(target_os = "android")]
 fn android_register_backend_handoff_session(
     session_id: &str,
     context_path: &str,
@@ -3411,8 +4348,7 @@ fn android_start_native_backend_seam(claim_path: &str) -> Result<String, String>
 }
 
 #[cfg(target_os = "android")]
-#[allow(dead_code)]
-fn android_protect_socket_fd(fd: i32) -> Result<bool, String> {
+fn android_abort_native_backend_session(session_id: &str, reason: &str) -> Result<String, String> {
     with_android_activity(|env, activity| {
         let class_loader = env
             .call_method(
@@ -3438,46 +4374,40 @@ fn android_protect_socket_fd(fd: i32) -> Result<bool, String> {
             .l()
             .map_err(|e| format!("Failed to decode Android VPN bridge class: {}", e))?;
         let bridge = jni::objects::JClass::from(bridge);
-        let protected = env
+        let java_session_id = env
+            .new_string(session_id)
+            .map_err(|e| format!("Failed to allocate Android abort session id: {}", e))?;
+        let java_reason = env
+            .new_string(reason)
+            .map_err(|e| format!("Failed to allocate Android abort reason: {}", e))?;
+        let value = env
             .call_static_method(
                 bridge,
-                "protectSocketFd",
-                "(Landroid/content/Context;I)Z",
-                &[JValue::Object(&activity), JValue::Int(fd)],
+                "abortNativeBackendSession",
+                "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &[
+                    JValue::Object(&activity),
+                    JValue::Object(&JObject::from(java_session_id)),
+                    JValue::Object(&JObject::from(java_reason)),
+                ],
             )
-            .map_err(|e| format!("Failed to protect Android socket fd: {}", e))?
-            .z()
-            .map_err(|e| format!("Failed to decode Android socket protect result: {}", e))?;
+            .map_err(|e| format!("Failed to abort Android native backend session: {}", e))?
+            .l()
+            .map_err(|e| {
+                format!(
+                    "Failed to decode Android native backend abort result: {}",
+                    e
+                )
+            })?;
+        let java_string = jni::objects::JString::from(value);
+        let resolved = env
+            .get_string(&java_string)
+            .map_err(|e| format!("Failed to read Android native backend abort result: {}", e))?
+            .to_string_lossy()
+            .into_owned();
 
-        Ok(protected)
+        Ok(resolved)
     })
-}
-
-#[cfg(target_os = "android")]
-#[allow(dead_code)]
-async fn wait_for_android_tun_interface(app: &AppHandle) -> Result<String, String> {
-    for _ in 0..20 {
-        match android_tun_interface_ready() {
-            Ok(true) => {
-                return android_tunnel_debug_state();
-            }
-            Ok(false) => {}
-            Err(error) => {
-                let _ = app.emit(
-                    "tunnel-log",
-                    format!("[WARN] Android TUN interface check failed: {}", error),
-                );
-            }
-        }
-
-        sleep(Duration::from_millis(150)).await;
-    }
-
-    let state = android_tunnel_debug_state().unwrap_or_else(|_| "unknown".to_string());
-    Err(format!(
-        "Android VPN service started, but it did not expose a ready TUN interface in time. Last state: {}",
-        state
-    ))
 }
 
 #[cfg(target_os = "android")]
@@ -3855,10 +4785,12 @@ async fn start_android_native_backend_consumer_seam_inner(
             }
         }
 
-        return Err(format!(
+        let reason = format!(
             "Android native backend stayed in a pending launch state for too long. status_path={}, runtime={}, detail={}",
             status_path, runtime_name, detail
-        ));
+        );
+        let _ = android_abort_native_backend_session(&runtime_context.session_id, &reason);
+        return Err(reason);
     }
 
     Ok(AndroidNativeBackendLaunchSnapshot {
@@ -3881,119 +4813,7 @@ fn android_native_backend_launch_state_is_pending(state: &str) -> bool {
 }
 
 #[cfg(target_os = "android")]
-#[allow(dead_code)]
-fn summarize_android_command_failure(prefix: &str, output: &std::process::Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-
-    if !stderr.is_empty() && !stdout.is_empty() {
-        format!("{prefix}: {stderr} | {stdout}")
-    } else if !stderr.is_empty() {
-        format!("{prefix}: {stderr}")
-    } else if !stdout.is_empty() {
-        format!("{prefix}: {stdout}")
-    } else {
-        format!(
-            "{prefix}: process exited with code {:?}",
-            output.status.code()
-        )
-    }
-}
-
-#[cfg(target_os = "android")]
-fn ensure_android_config_has_no_local_proxy_inbounds(config_path: &str) -> Result<(), String> {
-    if ANDROID_PROXY_FALLBACK_MODE {
-        return Ok(());
-    }
-
-    let raw = std::fs::read_to_string(config_path).map_err(|e| {
-        format!(
-            "Failed to read Android client config for localhost proxy audit: {}",
-            e
-        )
-    })?;
-    let parsed = serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
-        format!(
-            "Failed to parse Android client config for localhost proxy audit: {}",
-            e
-        )
-    })?;
-
-    let Some(inbounds) = parsed.get("inbounds").and_then(|value| value.as_array()) else {
-        return Ok(());
-    };
-
-    for inbound in inbounds {
-        let inbound_type = inbound
-            .get("type")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let listen = inbound
-            .get("listen")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-
-        let is_local_proxy_inbound = matches!(inbound_type, "socks" | "mixed" | "http");
-        let is_localhost_listener = matches!(listen, "127.0.0.1" | "::1" | "localhost");
-
-        if is_local_proxy_inbound || is_localhost_listener {
-            let listen_port = inbound
-                .get("listen_port")
-                .and_then(|value| value.as_u64())
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            return Err(format!(
-                "Android security policy blocked a localhost proxy inbound (type='{}', listen='{}', port={}). RKN mobile currently permits only VPN/TUN-style inbounds to avoid localhost proxy leaks across apps.",
-                inbound_type,
-                if listen.is_empty() { "default" } else { listen },
-                listen_port
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "android")]
-#[allow(dead_code)]
-fn run_android_singbox_preflight(singbox_path: &str, config_path: &str) -> Result<(), String> {
-    ensure_android_config_has_no_local_proxy_inbounds(config_path)?;
-
-    let singbox_dir = std::path::Path::new(singbox_path)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-
-    let version_output = std::process::Command::new(singbox_path)
-        .current_dir(singbox_dir)
-        .arg("version")
-        .output()
-        .map_err(|e| format!("Failed to launch Android sing-box preflight: {}", e))?;
-
-    if !version_output.status.success() {
-        return Err(summarize_android_command_failure(
-            "Android sing-box preflight failed",
-            &version_output,
-        ));
-    }
-
-    let check_output = std::process::Command::new(singbox_path)
-        .current_dir(singbox_dir)
-        .args(["check", "-c", config_path])
-        .output()
-        .map_err(|e| format!("Failed to run Android sing-box config preflight: {}", e))?;
-
-    if !check_output.status.success() {
-        return Err(summarize_android_command_failure(
-            "Android sing-box config preflight failed",
-            &check_output,
-        ));
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "android")]
-fn prepare_android_runtime_launch(
+async fn prepare_android_runtime_launch(
     app: &AppHandle,
     local_data: &std::path::Path,
     config_path: &std::path::Path,
@@ -4007,8 +4827,30 @@ fn prepare_android_runtime_launch(
             e
         )
     })?;
+    let local_rule_sets = crate::geodata::ensure_local_client_rule_sets(app).await?;
+    if local_rule_sets.is_empty() {
+        return Err(android_route_policy_error(
+            "no local Android rule-set assets were prepared; refusing to start without geodata-backed route policy",
+        ));
+    }
+    let raw = inject_android_local_rule_sets(&raw, &local_rule_sets)?;
+    let _ = app.emit(
+        "tunnel-log",
+        format!(
+            "[SYSTEM] Android route rule-sets prepared locally ({} assets).",
+            local_rule_sets.len()
+        ),
+    );
     let android_config_path = local_data.join("client_config_android.json");
-    let runtime_cfg = build_android_runtime_client_config(&raw, log_path)?;
+    let runtime_cfg = match build_android_runtime_client_config(&raw, log_path) {
+        Ok(config) => config,
+        Err(error) => {
+            if error.starts_with("[SECURITY]") {
+                let _ = app.emit("tunnel-log", error.clone());
+            }
+            return Err(error);
+        }
+    };
     std::fs::write(&android_config_path, &runtime_cfg).map_err(|e| {
         format!(
             "Failed to write Android runtime client config {}: {}",
@@ -4093,18 +4935,9 @@ fn prepare_android_runtime_launch(
         let _ = app.emit(
             "tunnel-log",
             format!(
-                "[SYSTEM] Android TUN handoff checkpoint reached: session={}, VpnService owns fd={}, state={}, addr={}/{}, route={}, mtu={}, config={}, backend_config={}, log={}, context={}, backend_session={}. The next backend for 6A.4.1 must consume this Android-owned interface instead of launching the standalone CLI path.",
-                session_id,
-                tun_fd,
+                "[SYSTEM] Android TUN handoff prepared: state={}, route={}, backend_session={}. Detailed handoff paths are available in Android diagnostics.",
                 tun_state,
-                tun_address,
-                tun_prefix_length,
                 tun_route,
-                tun_mtu,
-                runtime_config_path,
-                backend_config_path,
-                log_path,
-                context_path.display(),
                 backend_session_state,
             ),
         );
@@ -4155,11 +4988,8 @@ fn prepare_android_runtime_launch(
     let _ = app.emit(
         "tunnel-log",
         format!(
-            "[SYSTEM] Android proxy fallback prepared: session={}, config={}, backend_config={}, context={}. Starting the native backend without VpnService/TUN handoff.",
-            session_id,
-            runtime_config_path,
-            backend_config_path,
-            context_path.display(),
+            "[SYSTEM] Android proxy fallback prepared: session={}. Detailed fallback paths are available in Android diagnostics.",
+            session_id
         ),
     );
 
@@ -4167,39 +4997,6 @@ fn prepare_android_runtime_launch(
         config_path: runtime_config_path,
         log_path: log_path.to_string(),
     })
-}
-
-#[cfg(target_os = "android")]
-#[allow(dead_code)]
-async fn launch_tunnel_process_android(
-    _app: &AppHandle,
-    singbox_path: &str,
-    config_str: &str,
-    log_path: &str,
-) -> Result<u32, String> {
-    let singbox_dir = std::path::Path::new(singbox_path)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(log_path)
-        .map_err(|e| format!("Failed to open Android sidecar log file: {}", e))?;
-    let stderr_file = log_file
-        .try_clone()
-        .map_err(|e| format!("Failed to duplicate Android sidecar log handle: {}", e))?;
-
-    let child = std::process::Command::new(singbox_path)
-        .current_dir(singbox_dir)
-        .args(["run", "-c", config_str])
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .map_err(|e| format!("Failed to launch Android sing-box sidecar: {}", e))?;
-
-    Ok(child.id())
 }
 
 async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result<u32, String> {
@@ -4291,7 +5088,9 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                 &config_path,
                 log_path,
                 announce_prompt,
-            )? {
+            )
+            .await?
+            {
                 AndroidRuntimeLaunchPlan::TunHandoffRequired {
                     tun_fd,
                     config_path,
@@ -4435,12 +5234,15 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
         let route_prelude = macos_server_route_prelude(server_ip.as_deref());
 
         #[cfg(not(target_os = "android"))]
+        let supervisor_script =
+            write_desktop_tunnel_supervisor_script(app, &singbox_path, &config_str, log_path)?;
+
+        #[cfg(not(target_os = "android"))]
         let shell_cmd = format!(
-            "{}{} run -c {} > {} 2>&1 & echo $!",
+            "rm -f {log_path} >/dev/null 2>&1 || true\n{}/bin/sh {} </dev/null >/dev/null 2>&1 & echo $!",
             route_prelude,
-            shell_single_quote(&singbox_path),
-            shell_single_quote(&config_str),
-            shell_single_quote(log_path),
+            shell_single_quote(&supervisor_script.to_string_lossy()),
+            log_path = shell_single_quote(log_path),
         );
 
         #[cfg(not(target_os = "android"))]
@@ -4493,10 +5295,11 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
     let log_path = tunnel_log_path();
     let _ = std::fs::remove_file(log_path);
 
-    let _ = app.emit(
-        "tunnel-log",
-        "[SYSTEM] Requesting administrator privileges to restart the tunnel...".to_string(),
-    );
+    #[cfg(target_os = "android")]
+    let restart_message = "[SYSTEM] Restarting Android VPN runtime after transport recovery...";
+    #[cfg(not(target_os = "android"))]
+    let restart_message = "[SYSTEM] Requesting administrator privileges to restart the tunnel...";
+    let _ = app.emit("tunnel-log", restart_message.to_string());
 
     #[cfg(target_os = "windows")]
     {
@@ -4563,7 +5366,9 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
                 );
             }
 
-            match prepare_android_runtime_launch(app, &local_data, &config_path, log_path, false)? {
+            match prepare_android_runtime_launch(app, &local_data, &config_path, log_path, false)
+                .await?
+            {
                 AndroidRuntimeLaunchPlan::TunHandoffRequired {
                     tun_fd,
                     config_path,
@@ -4699,12 +5504,19 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
         let route_prelude = macos_server_route_prelude(server_ip.as_deref());
 
         #[cfg(not(target_os = "android"))]
+        let supervisor_script =
+            write_desktop_tunnel_supervisor_script(app, &singbox_path, &config_str, log_path)?;
+
+        #[cfg(not(target_os = "android"))]
+        let stop_signal_path = desktop_tunnel_stop_signal_path(app)?;
+
+        #[cfg(not(target_os = "android"))]
         let shell_cmd = format!(
-            "kill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\n{}{} run -c {} > {} 2>&1 & echo $!",
+            "touch {stop_signal} >/dev/null 2>&1 || true\nkill {old_pid} >/dev/null 2>&1 || true\nsleep 1\nkill -9 {old_pid} >/dev/null 2>&1 || true\nrm -f {log_path} >/dev/null 2>&1 || true\n{}/bin/sh {} </dev/null >/dev/null 2>&1 & echo $!",
             route_prelude,
-            shell_single_quote(&singbox_path),
-            shell_single_quote(&config_str),
-            shell_single_quote(log_path),
+            shell_single_quote(&supervisor_script.to_string_lossy()),
+            stop_signal = shell_single_quote(&stop_signal_path.to_string_lossy()),
+            log_path = shell_single_quote(log_path),
         );
 
         #[cfg(not(target_os = "android"))]
@@ -4890,6 +5702,88 @@ async fn verify_tunnel_start(
         return Err(format!("Core process exited during startup. {}", details));
     }
 
+    #[cfg(not(target_os = "android"))]
+    {
+        let log_tail = recent_log_tail(log_path, 20);
+        let lower_tail = log_tail.to_lowercase();
+        let supervisor_restart_seen =
+            lower_tail.contains("[supervisor] sing-box exited unexpectedly");
+        let fatal_startup_seen = lower_tail.contains("fatal");
+
+        if supervisor_restart_seen || fatal_startup_seen {
+            let _ = terminate_root_process(Some(app), pid);
+
+            {
+                let mut guard = state.singbox_pid.lock().unwrap();
+                if guard.as_ref() == Some(&pid) {
+                    *guard = None;
+                }
+            }
+
+            set_network_fingerprint(state, None);
+            clear_saved_tunnel_pid(app);
+            emit_tunnel_state(app, false);
+            emit_guard_state(app, "inactive");
+
+            let details = if log_tail.is_empty() {
+                "No startup logs captured.".to_string()
+            } else {
+                format!("Recent logs:\n{}", log_tail)
+            };
+
+            return Err(format!("Core process failed during startup. {}", details));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut route_ready = false;
+        for attempt in 0..16 {
+            if macos_tun_route_ready() {
+                route_ready = true;
+                break;
+            }
+
+            if attempt == 5 {
+                let _ = request_desktop_supervisor_core_restart(
+                    app,
+                    "macOS TUN route did not appear during startup.",
+                );
+            }
+
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        if !route_ready {
+            let _ = terminate_root_process(Some(app), pid);
+
+            {
+                let mut guard = state.singbox_pid.lock().unwrap();
+                if guard.as_ref() == Some(&pid) {
+                    *guard = None;
+                }
+            }
+
+            set_network_fingerprint(state, None);
+            clear_saved_tunnel_pid(app);
+            emit_tunnel_state(app, false);
+            emit_guard_state(app, "inactive");
+
+            let log_tail = recent_log_tail(log_path, 30);
+            let route_table = macos_route_table_diagnostic(40);
+            let details = if log_tail.is_empty() {
+                format!("Route table:\n{}", route_table)
+            } else {
+                format!("Recent logs:\n{}\nRoute table:\n{}", log_tail, route_table)
+            };
+
+            return Err(format!(
+                "macOS TUN route did not become active after startup. {}",
+                details
+            ));
+        }
+    }
+
     set_network_fingerprint(state, current_network_fingerprint());
     reset_guard_state(state);
     save_tunnel_pid(app, pid)?;
@@ -5004,6 +5898,43 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
                     continue;
                 }
 
+                let should_recover = {
+                    let state = app.state::<AppState>();
+                    begin_recovery(&state)
+                };
+
+                if should_recover {
+                    let _ = app.emit(
+                        "tunnel-log",
+                        format!(
+                            "[SYSTEM] Android runtime became stale after sleep or backgrounding. Restarting protection automatically. Backend state: {}, tun_ready={}",
+                            backend_state, tun_ready
+                        ),
+                    );
+
+                    match restart_tunnel_if_running(
+                        &app,
+                        "Android runtime health check failed. Restarting protection before marking the tunnel inactive.",
+                    )
+                    .await
+                    {
+                        Ok(true) => break,
+                        Ok(false) => {
+                            let state = app.state::<AppState>();
+                            finish_recovery(&state);
+                        }
+                        Err(error) => {
+                            let _ = app.emit(
+                                "tunnel-log",
+                                format!(
+                                    "[ERROR] Android automatic recovery after sleep/background failed: {}",
+                                    error
+                                ),
+                            );
+                        }
+                    }
+                }
+
                 {
                     let state = app.state::<AppState>();
                     let mut guard = state.singbox_pid.lock().unwrap();
@@ -5049,6 +5980,64 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
                     sleep(Duration::from_millis(700)).await;
                     if process_exists(pid) {
                         continue;
+                    }
+                }
+
+                #[cfg(not(target_os = "android"))]
+                {
+                    let intentional_stop = {
+                        #[cfg(target_os = "windows")]
+                        {
+                            app.path()
+                                .app_local_data_dir()
+                                .ok()
+                                .map(|dir| dir.join("elevated_singbox.stop").exists())
+                                .unwrap_or(false)
+                        }
+
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            desktop_tunnel_stop_signal_path(&app)
+                                .map(|path| path.exists())
+                                .unwrap_or(false)
+                        }
+                    };
+
+                    if !intentional_stop {
+                        let should_recover = {
+                            let state = app.state::<AppState>();
+                            begin_recovery(&state)
+                        };
+
+                        if should_recover {
+                            let log_tail = recent_log_tail(tunnel_log_path(), 12);
+                            let reason = if log_tail.is_empty() {
+                                "[SYSTEM] Core process exited unexpectedly. Restarting the tunnel immediately to keep desktop protection active.".to_string()
+                            } else {
+                                format!(
+                                    "[SYSTEM] Core process exited unexpectedly. Restarting the tunnel immediately to keep desktop protection active. Recent logs:\n{}",
+                                    log_tail
+                                )
+                            };
+
+                            match restart_tunnel_if_running(&app, &reason).await {
+                                Ok(true) => break,
+                                Ok(false) => {
+                                    let state = app.state::<AppState>();
+                                    finish_recovery(&state);
+                                }
+                                Err(error) => {
+                                    let _ = app.emit(
+                                        "tunnel-log",
+                                        format!(
+                                            "[ERROR] Automatic tunnel restart after core exit failed: {}",
+                                            error
+                                        ),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -5129,9 +6118,52 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                 break;
             }
 
+            {
+                let state = app.state::<AppState>();
+                release_guard_after_quiet_period(&app, &state);
+            }
+
             let elapsed = last_tick.elapsed();
             last_tick = std::time::Instant::now();
             let current_fingerprint = current_network_fingerprint();
+
+            #[cfg(target_os = "macos")]
+            if !macos_tun_route_ready() {
+                let should_recover = {
+                    let state = app.state::<AppState>();
+                    begin_recovery(&state)
+                };
+
+                if should_recover {
+                    if let Err(error) = request_desktop_supervisor_core_restart(
+                        &app,
+                        "macOS TUN route disappeared while the tunnel process was still alive.",
+                    ) {
+                        let _ = app.emit(
+                            "tunnel-log",
+                            format!("[ERROR] macOS TUN route recovery signal failed: {}", error),
+                        );
+                    }
+
+                    sleep(Duration::from_secs(4)).await;
+
+                    if !macos_tun_route_ready() {
+                        let route_table = macos_route_table_diagnostic(30);
+                        let _ = app.emit(
+                            "tunnel-log",
+                            format!(
+                                "[WARN] macOS TUN route is still missing after supervisor refresh. Route table:\n{}",
+                                route_table
+                            ),
+                        );
+                    }
+
+                    let state = app.state::<AppState>();
+                    finish_recovery(&state);
+                }
+
+                continue;
+            }
 
             #[cfg(target_os = "windows")]
             {
@@ -5306,7 +6338,7 @@ fn spawn_post_start_transport_sync_check(app: AppHandle, pid: u32) {
 
 #[cfg(target_os = "android")]
 async fn wait_for_android_backend_shutdown(app: &AppHandle) {
-    for _ in 0..15 {
+    for _ in 0..60 {
         let backend_state =
             android_native_backend_status_state().unwrap_or_else(|_| "unknown".to_string());
         let tun_ready = android_tun_interface_ready().unwrap_or(false);
@@ -5323,6 +6355,14 @@ async fn wait_for_android_backend_shutdown(app: &AppHandle) {
         "[WARN] Android backend stop did not fully settle before the timeout window expired."
             .to_string(),
     );
+}
+
+#[cfg(target_os = "android")]
+fn spawn_android_backend_shutdown_cleanup(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        wait_for_android_backend_shutdown(&app).await;
+    });
 }
 
 #[cfg(target_os = "android")]
@@ -5363,11 +6403,45 @@ fn clear_android_native_backend_runtime_artifacts(app: &AppHandle) {
     let _ = persist_android_runtime_context(&local_data, &snapshot);
 }
 
+#[cfg(target_os = "android")]
+async fn rollback_android_tunnel_start_failure(app: &AppHandle, reason: &str) {
+    if let Ok(local_data) = app.path().app_local_data_dir() {
+        if let Ok(Some(snapshot)) = load_android_runtime_context(&local_data) {
+            if !snapshot.session_id.is_empty() {
+                let _ = android_abort_native_backend_session(&snapshot.session_id, reason);
+            }
+        }
+    }
+
+    let _ = stop_android_tunnel_service();
+    wait_for_android_backend_shutdown(app).await;
+    clear_android_native_backend_runtime_artifacts(app);
+}
+
+async fn verify_tunnel_start_or_cleanup(
+    app: &AppHandle,
+    state: &AppState,
+    pid: u32,
+    log_path: &str,
+) -> Result<(), String> {
+    let result = verify_tunnel_start(app, state, pid, log_path).await;
+    #[cfg(target_os = "android")]
+    if let Err(error) = result.as_ref() {
+        rollback_android_tunnel_start_failure(app, error).await;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "windows")]
     use super::parse_windows_network_fingerprint_json;
-    use super::{escape_applescript, shell_single_quote};
+    use super::{
+        android_local_proxy_inbound_error, build_android_runtime_client_config, escape_applescript,
+        find_android_local_proxy_inbound_violation, inject_android_local_rule_sets,
+        shell_single_quote, validate_android_runtime_route_policy,
+    };
+    use crate::android_direct_rule_set_dns_server;
 
     #[test]
     fn escape_applescript_preserves_shell_special_chars_inside_string_literal() {
@@ -5387,6 +6461,319 @@ mod tests {
         let quoted = shell_single_quote(input);
 
         assert_eq!(quoted, r#"'/tmp/test'"'"'s "path" $(whoami) `id`'"#);
+    }
+
+    #[test]
+    fn classify_proxy_failure_catches_android_dns_and_transport_eof() {
+        assert!(super::classify_proxy_failure(
+            "[CORE] dns: exchange failed for www.gstatic.com. IN A: dial TCP connection: EOF"
+        ));
+        assert!(super::classify_proxy_failure(
+            "[CORE] connection: open connection to 142.250.74.10:443 using outbound/shadowsocks[proxy]: EOF"
+        ));
+        assert!(super::classify_proxy_failure(
+            "[CORE] connection: listen packet connection using outbound/shadowsocks[proxy]: dial tcp 195.133.26.225:443: connect: network is unreachable"
+        ));
+    }
+
+    #[test]
+    fn android_local_proxy_guard_allows_tun_only_config() {
+        let config = serde_json::json!({
+            "inbounds": [
+                {
+                    "type": "tun",
+                    "tag": "tun-in"
+                }
+            ]
+        });
+
+        assert!(find_android_local_proxy_inbound_violation(&config).is_none());
+    }
+
+    #[test]
+    fn android_local_proxy_guard_blocks_mixed_localhost_inbound() {
+        let config = serde_json::json!({
+            "inbounds": [
+                {
+                    "type": "mixed",
+                    "listen": "127.0.0.1",
+                    "listen_port": 2080
+                }
+            ]
+        });
+
+        let violation = find_android_local_proxy_inbound_violation(&config)
+            .expect("mixed localhost inbound must be blocked on Android");
+
+        assert_eq!(violation.inbound_type, "mixed");
+        assert_eq!(violation.listen, "127.0.0.1");
+        assert_eq!(violation.listen_port, "2080");
+        assert!(android_local_proxy_inbound_error(&violation).starts_with("[SECURITY]"));
+    }
+
+    #[test]
+    fn android_local_proxy_guard_blocks_http_and_socks_proxy_inbounds() {
+        for inbound_type in ["http", "socks"] {
+            let config = serde_json::json!({
+                "inbounds": [
+                    {
+                        "type": inbound_type,
+                        "listen": "0.0.0.0",
+                        "listen_port": 18080
+                    }
+                ]
+            });
+
+            let violation = find_android_local_proxy_inbound_violation(&config)
+                .expect("proxy inbound must be blocked on Android even when it is not explicitly bound to 127.0.0.1");
+
+            assert_eq!(violation.inbound_type, inbound_type);
+        }
+    }
+
+    #[test]
+    fn android_local_proxy_guard_blocks_any_localhost_listener() {
+        for listen in ["127.0.0.1", "::1", "localhost"] {
+            let config = serde_json::json!({
+                "inbounds": [
+                    {
+                        "type": "custom-fallback",
+                        "listen": listen,
+                        "listen_port": 19090
+                    }
+                ]
+            });
+
+            let violation = find_android_local_proxy_inbound_violation(&config)
+                .expect("localhost listeners must stay blocked until a reviewed Android fallback mode exists");
+
+            assert_eq!(violation.listen, listen);
+        }
+    }
+
+    fn write_test_srs(tag: &str) -> String {
+        let dir =
+            std::env::temp_dir().join(format!("rkn-android-route-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test rule-set dir must be created");
+        let path = dir.join(format!("{tag}.srs"));
+        std::fs::write(&path, b"SRS\x00test").expect("test SRS file must be written");
+        path.to_string_lossy().to_string()
+    }
+
+    fn android_policy_base_config() -> String {
+        serde_json::json!({
+            "log": {
+                "level": "info"
+            },
+            "dns": {
+                "servers": [
+                    {
+                        "type": "fakeip",
+                        "tag": "fakeip-dns",
+                        "inet4_range": "198.18.0.0/15"
+                    }
+                ],
+                "rules": [],
+                "final": "remote-dns"
+            },
+            "inbounds": [
+                {
+                    "type": "tun",
+                    "tag": "tun-in",
+                    "address": ["172.19.0.1/30"],
+                    "auto_route": true,
+                    "strict_route": true,
+                    "stack": "system",
+                    "sniff": true,
+                    "sniff_override_destination": true,
+                    "interface_name": "tun0"
+                }
+            ],
+            "outbounds": [
+                {
+                    "type": "shadowsocks",
+                    "tag": "proxy",
+                    "server": "203.0.113.10",
+                    "server_port": 4433,
+                    "multiplex": {
+                        "enabled": true
+                    }
+                },
+                {
+                    "type": "direct",
+                    "tag": "direct"
+                }
+            ],
+            "route": {
+                "rules": [],
+                "final": "proxy",
+                "rule_set": [
+                    {
+                        "tag": "geosite-google",
+                        "type": "local",
+                        "format": "binary",
+                        "path": write_test_srs("geosite-google")
+                    },
+                    {
+                        "tag": "geosite-category-ru",
+                        "type": "local",
+                        "format": "binary",
+                        "path": write_test_srs("geosite-category-ru")
+                    },
+                    {
+                        "tag": "geoip-ru",
+                        "type": "local",
+                        "format": "binary",
+                        "path": write_test_srs("geoip-ru")
+                    }
+                ]
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn android_runtime_config_preserves_split_tunnel_route_policy() {
+        let rendered = build_android_runtime_client_config(
+            &android_policy_base_config(),
+            "/data/user/0/com.freedom.rkn/files/rkn-tun.log",
+        )
+        .expect("Android runtime config should be generated");
+        let config = serde_json::from_str::<serde_json::Value>(&rendered)
+            .expect("Android runtime config should stay valid JSON");
+
+        validate_android_runtime_route_policy(&config)
+            .expect("Android route/DNS policy should pass audit");
+
+        let tun = config["inbounds"]
+            .as_array()
+            .and_then(|items| items.first())
+            .expect("tun inbound should exist");
+        assert_eq!(tun["type"], "tun");
+        assert_eq!(tun["auto_route"], true);
+        assert_eq!(tun["strict_route"], false);
+        assert_eq!(tun["stack"], "gvisor");
+        assert_eq!(tun["mtu"], 1280);
+        assert!(tun.get("interface_name").is_none());
+        assert!(tun.get("sniff").is_none());
+
+        let route_rules = config["route"]["rules"]
+            .as_array()
+            .expect("route rules should be an array");
+        assert!(route_rules.iter().any(|rule| {
+            rule["rule_set"]
+                .as_array()
+                .is_some_and(|rule_sets| rule_sets.iter().any(|value| value == "geosite-google"))
+                && rule["outbound"] == "proxy"
+        }));
+        assert!(route_rules.iter().any(|rule| {
+            rule["rule_set"].as_array().is_some_and(|rule_sets| {
+                rule_sets.iter().any(|value| value == "geosite-category-ru")
+            }) && rule["outbound"] == "direct"
+        }));
+
+        let ru_route_index = route_rules
+            .iter()
+            .position(|rule| {
+                rule["rule_set"].as_array().is_some_and(|rule_sets| {
+                    rule_sets.iter().any(|value| value == "geosite-category-ru")
+                }) && rule["outbound"] == "direct"
+            })
+            .expect("RU geodata route rule should exist");
+        let udp_443_reject_index = route_rules
+            .iter()
+            .position(|rule| {
+                rule["action"] == "reject" && rule["network"] == "udp" && rule["port"] == 443
+            })
+            .expect("UDP/443 fallback reject should exist");
+        assert!(
+            ru_route_index < udp_443_reject_index,
+            "RU direct geodata must be evaluated before generic UDP/443 reject"
+        );
+        assert!(
+            route_rules.iter().all(|rule| {
+                !(rule["network"] == "udp"
+                    && rule["action"] == "route"
+                    && rule["outbound"] == "direct")
+            }),
+            "Android gameplay UDP must not bypass the tunnel; route.final=proxy owns generic UDP"
+        );
+
+        let dns_rules = config["dns"]["rules"]
+            .as_array()
+            .expect("dns rules should be an array");
+        assert_eq!(config["route"]["default_domain_resolver"], "local-dns");
+        assert_eq!(config["dns"]["final"], "local-dns");
+        assert!(dns_rules.iter().any(|rule| {
+            rule["rule_set"]
+                .as_array()
+                .is_some_and(|rule_sets| rule_sets.iter().any(|value| value == "geosite-google"))
+                && rule["server"] == "fakeip-dns"
+        }));
+        assert!(dns_rules.iter().any(|rule| {
+            rule["rule_set"].as_array().is_some_and(|rule_sets| {
+                rule_sets.iter().any(|value| value == "geosite-category-ru")
+            }) && rule["server"] == android_direct_rule_set_dns_server()
+        }));
+    }
+
+    #[test]
+    fn android_runtime_config_fails_when_ru_rule_set_is_not_local_srs() {
+        let mut config = serde_json::from_str::<serde_json::Value>(&android_policy_base_config())
+            .expect("base config must parse");
+        config["route"]["rule_set"][1]["type"] = serde_json::json!("remote");
+
+        let error = build_android_runtime_client_config(
+            &config.to_string(),
+            "/data/user/0/com.freedom.rkn/files/rkn-tun.log",
+        )
+        .expect_err("Android runtime must reject remote rule-set entries");
+
+        assert!(error.contains("requires local rule-set entries"));
+    }
+
+    #[test]
+    fn android_rule_set_injection_replaces_stale_paths_before_runtime_audit() {
+        let mut config = serde_json::from_str::<serde_json::Value>(&android_policy_base_config())
+            .expect("base config must parse");
+        config["route"]["rule_set"] = serde_json::json!([
+            {
+                "tag": "geosite-category-ru",
+                "type": "local",
+                "format": "binary",
+                "path": "/stale/missing/geosite-category-ru.srs"
+            }
+        ]);
+        let ru_path = write_test_srs("geosite-category-ru-injected");
+        let google_path = write_test_srs("geosite-google-injected");
+        let assets = vec![
+            crate::geodata::LocalRuleSetAsset {
+                tag: "geosite-category-ru",
+                path: std::path::PathBuf::from(&ru_path),
+            },
+            crate::geodata::LocalRuleSetAsset {
+                tag: crate::geodata::GOOGLE_RULE_SET_TAG,
+                path: std::path::PathBuf::from(&google_path),
+            },
+        ];
+
+        let injected = inject_android_local_rule_sets(&config.to_string(), &assets)
+            .expect("Android rule-set injection should succeed");
+        let rendered = build_android_runtime_client_config(
+            &injected,
+            "/data/user/0/com.freedom.rkn/files/rkn-tun.log",
+        )
+        .expect("Android runtime config should use injected local rule-sets");
+        let runtime_config = serde_json::from_str::<serde_json::Value>(&rendered)
+            .expect("runtime config should parse");
+
+        assert!(runtime_config["route"]["rule_set"]
+            .as_array()
+            .expect("rule_set should stay an array")
+            .iter()
+            .any(|rule_set| rule_set["path"] == ru_path));
+        validate_android_runtime_route_policy(&runtime_config)
+            .expect("injected Android route policy should pass audit");
     }
 
     #[cfg(target_os = "windows")]
@@ -5411,6 +6798,11 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    clear_desktop_manual_stop_marker(&app);
+
+    normalize_local_client_config_for_runtime(&app)?;
+
     if local_client_config_requires_refresh(&app)? {
         let _ = app.emit(
             "tunnel-log",
@@ -5424,6 +6816,8 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
 
     #[cfg(target_os = "android")]
     ssh::ensure_local_transport_is_current(&app).await?;
+
+    #[cfg(not(target_os = "android"))]
     crate::geodata::ensure_local_client_rule_sets(&app).await?;
 
     #[cfg(target_os = "android")]
@@ -5470,7 +6864,7 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         Ok(pid) => pid,
         Err(error) => {
             #[cfg(target_os = "android")]
-            let _ = stop_android_tunnel_service();
+            rollback_android_tunnel_start_failure(&app, &error).await;
             return Err(error);
         }
     };
@@ -5487,12 +6881,8 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
         },
     );
 
-    verify_tunnel_start(&app, &state, pid, tunnel_log_path())
-        .await
-        .inspect_err(|_| {
-            #[cfg(target_os = "android")]
-            let _ = stop_android_tunnel_service();
-        })?;
+    verify_tunnel_start_or_cleanup(&app, &state, pid, tunnel_log_path()).await?;
+
     spawn_log_reader(app.clone(), pid, tunnel_log_path());
     spawn_process_exit_monitor(app.clone(), pid);
     spawn_network_recovery_monitor(app.clone(), pid);
@@ -5535,6 +6925,8 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
 
 async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+    #[cfg(target_os = "macos")]
+    mark_desktop_manual_stop(&app);
     let pid = {
         let mut guard = state.singbox_pid.lock().unwrap();
         guard.take()
@@ -5546,21 +6938,37 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
                 "tunnel-log",
                 if cfg!(target_os = "android") && is_android_native_backend_pid(pid) {
                     "[SYSTEM] Stopping Android native backend...".to_string()
+                } else if is_macos_tun_route_sentinel_pid(pid) {
+                    "[SYSTEM] Stopping macOS tunnel route recovered after resume...".to_string()
                 } else {
                     format!("[SYSTEM] Stopping core process (PID {})...", pid)
                 },
             );
 
-            if cfg!(target_os = "android") && is_android_native_backend_pid(pid) {
-                #[cfg(target_os = "android")]
+            if is_macos_tun_route_sentinel_pid(pid) {
+                #[cfg(target_os = "macos")]
                 {
-                    let _ = stop_android_tunnel_service();
-                    wait_for_android_backend_shutdown(&app).await;
-                    clear_android_native_backend_runtime_artifacts(&app);
+                    if let Ok(signal_path) = desktop_tunnel_stop_signal_path(&app) {
+                        let _ = std::fs::write(signal_path, "stop");
+                    }
+                    macos_force_stop_orphaned_desktop_tunnel(&app);
                 }
                 let _ = app.emit(
                     "tunnel-log",
-                    "[SYSTEM] Android native backend terminated. Routing disabled.".to_string(),
+                    "[SYSTEM] macOS supervisor stop signal sent for the recovered tunnel route."
+                        .to_string(),
+                );
+            } else if cfg!(target_os = "android") && is_android_native_backend_pid(pid) {
+                #[cfg(target_os = "android")]
+                {
+                    let _ = stop_android_tunnel_service();
+                    clear_android_native_backend_runtime_artifacts(&app);
+                    spawn_android_backend_shutdown_cleanup(&app);
+                }
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Android native backend stop signal sent. Routing disabled."
+                        .to_string(),
                 );
             } else if terminate_root_process(Some(&app), pid).is_ok() {
                 let _ = app.emit(
@@ -5585,8 +6993,8 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             #[cfg(target_os = "android")]
             if !is_android_native_backend_pid(pid) {
                 let _ = stop_android_tunnel_service();
-                wait_for_android_backend_shutdown(&app).await;
                 clear_android_native_backend_runtime_artifacts(&app);
+                spawn_android_backend_shutdown_cleanup(&app);
             }
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
@@ -5595,6 +7003,19 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             Ok(())
         }
         None => {
+            #[cfg(target_os = "macos")]
+            if macos_tun_route_ready() {
+                if let Ok(signal_path) = desktop_tunnel_stop_signal_path(&app) {
+                    let _ = std::fs::write(signal_path, "stop");
+                    macos_force_stop_orphaned_desktop_tunnel(&app);
+                    let _ = app.emit(
+                        "tunnel-log",
+                        "[SYSTEM] No tracked supervisor PID was present, but macOS TUN route is active. Sent supervisor stop signal."
+                            .to_string(),
+                    );
+                }
+            }
+
             let _ = app.emit(
                 "tunnel-log",
                 "[SYSTEM] No active tunnel to stop.".to_string(),
@@ -5608,8 +7029,8 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             #[cfg(target_os = "android")]
             {
                 let _ = stop_android_tunnel_service();
-                wait_for_android_backend_shutdown(&app).await;
                 clear_android_native_backend_runtime_artifacts(&app);
+                spawn_android_backend_shutdown_cleanup(&app);
             }
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
@@ -5714,6 +7135,111 @@ async fn get_android_runtime_context(app: AppHandle) -> Result<Option<serde_json
     {
         let _ = app;
         Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn check_android_route_policy(app: AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        let config_path = local_data.join("client_config_android.json");
+        if !config_path.exists() {
+            return Err(
+                "Android runtime config is not available yet. Start Protection once or run Deploy/Update before checking route policy."
+                    .to_string(),
+            );
+        }
+
+        let raw = std::fs::read_to_string(&config_path).map_err(|error| {
+            format!(
+                "Failed to read Android runtime config {}: {}",
+                config_path.display(),
+                error
+            )
+        })?;
+        let config = serde_json::from_str::<serde_json::Value>(&raw).map_err(|error| {
+            format!(
+                "Failed to parse Android runtime config {}: {}",
+                config_path.display(),
+                error
+            )
+        })?;
+
+        if let Some(violation) = find_android_local_proxy_inbound_violation(&config) {
+            return Err(android_local_proxy_inbound_error(&violation));
+        }
+        validate_android_runtime_route_policy(&config)?;
+
+        let inbounds = config
+            .get("inbounds")
+            .and_then(|value| value.as_array())
+            .map(|value| value.len())
+            .unwrap_or(0);
+        let route_rules = config
+            .get("route")
+            .and_then(|value| value.get("rules"))
+            .and_then(|value| value.as_array())
+            .map(|value| value.len())
+            .unwrap_or(0);
+        let dns_rules = config
+            .get("dns")
+            .and_then(|value| value.get("rules"))
+            .and_then(|value| value.as_array())
+            .map(|value| value.len())
+            .unwrap_or(0);
+        let rule_sets = config
+            .get("route")
+            .and_then(|value| value.get("rule_set"))
+            .and_then(|value| value.as_array())
+            .map(|value| {
+                value
+                    .iter()
+                    .filter_map(|rule_set| {
+                        let tag = rule_set.get("tag").and_then(|tag| tag.as_str())?;
+                        let path = rule_set.get("path").and_then(|path| path.as_str())?;
+                        let size = std::fs::metadata(path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        Some(format!("{tag}:{size}b"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "none".to_string());
+        let private_dns =
+            android_private_dns_summary().unwrap_or_else(|error| format!("unavailable({})", error));
+        let network = android_active_network_summary()
+            .unwrap_or_else(|error| format!("unavailable({})", error));
+        let tun_state =
+            android_tunnel_debug_state().unwrap_or_else(|error| format!("unavailable({})", error));
+        let private_dns_note = if private_dns.starts_with("hostname:")
+            || private_dns.starts_with("strict:")
+        {
+            " Private DNS is strict; if DNS leaks or RU geodata look wrong, disable Android Private DNS for the test."
+        } else {
+            ""
+        };
+        let summary = format!(
+            "Android route policy OK. Config: {}. inbounds={}, route_rules={}, dns_rules={}, rule_sets=[{}], private_dns={}, network={}, tun_state={}.{}",
+            config_path.display(),
+            inbounds,
+            route_rules,
+            dns_rules,
+            rule_sets,
+            private_dns,
+            network,
+            tun_state,
+            private_dns_note
+        );
+
+        Ok(summary)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok("Android route policy diagnostics are only available on Android builds.".to_string())
     }
 }
 
@@ -5883,15 +7409,50 @@ pub(crate) async fn restart_tunnel_if_running(
         return Ok(false);
     };
 
-    let _ = app.emit("tunnel-log", format!("[SYSTEM] {}", reason));
-    {
-        let mut guard = state.singbox_pid.lock().unwrap();
-        *guard = None;
-    }
+    let reason_line = if reason.starts_with('[') {
+        reason.to_string()
+    } else {
+        format!("[SYSTEM] {}", reason)
+    };
+    let _ = app.emit("tunnel-log", reason_line);
 
     let new_pid = match restart_tunnel_process(app, old_pid).await {
         Ok(pid) => pid,
         Err(error) => {
+            let old_runtime_still_alive = {
+                #[cfg(target_os = "android")]
+                {
+                    if is_android_native_backend_pid(old_pid) {
+                        android_native_backend_status_state()
+                            .map(|state| android_backend_state_is_ready(&state))
+                            .unwrap_or(false)
+                    } else {
+                        process_exists(old_pid)
+                    }
+                }
+
+                #[cfg(not(target_os = "android"))]
+                {
+                    process_exists(old_pid)
+                }
+            };
+
+            if old_runtime_still_alive {
+                {
+                    let mut guard = state.singbox_pid.lock().unwrap();
+                    *guard = Some(old_pid);
+                }
+                let _ = save_tunnel_pid(app, old_pid);
+                finish_recovery(&state);
+                emit_tunnel_state(app, true);
+                refresh_tray_toggle_item(app);
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SYSTEM] Tunnel restart did not complete, but the previous runtime is still alive. Keeping it tracked instead of leaving an orphaned tunnel state.",
+                );
+                return Err(error);
+            }
+
             set_network_fingerprint(&state, None);
             clear_saved_tunnel_pid(app);
             finish_recovery(&state);
@@ -5940,6 +7501,25 @@ async fn restore_tunnel_session(
     }
 
     let Some(saved_pid) = load_saved_tunnel_pid(&app)? else {
+        #[cfg(target_os = "macos")]
+        if macos_tun_route_ready() && !desktop_manual_stop_marker_exists(&app) {
+            {
+                let mut guard = state.singbox_pid.lock().unwrap();
+                *guard = Some(MACOS_TUN_ROUTE_SENTINEL_PID);
+            }
+            set_network_fingerprint(&state, current_network_fingerprint());
+            reset_guard_state(&state);
+            emit_tunnel_state(&app, true);
+            emit_guard_state(&app, "active");
+            refresh_tray_toggle_item(&app);
+            let _ = app.emit(
+                "tunnel-log",
+                "[SYSTEM] macOS TUN route is still active after resume, but the supervisor PID file is missing. Keeping UI active and waiting for the supervisor to refresh its PID file."
+                    .to_string(),
+            );
+            return Ok(Some(0));
+        }
+
         emit_tunnel_state(&app, false);
         emit_guard_state(&app, "inactive");
         return Ok(None);
@@ -5975,6 +7555,27 @@ async fn restore_tunnel_session(
     }
 
     if !process_exists(saved_pid) {
+        #[cfg(target_os = "macos")]
+        if macos_tun_route_ready() && !desktop_manual_stop_marker_exists(&app) {
+            {
+                let mut guard = state.singbox_pid.lock().unwrap();
+                *guard = Some(MACOS_TUN_ROUTE_SENTINEL_PID);
+            }
+            set_network_fingerprint(&state, current_network_fingerprint());
+            reset_guard_state(&state);
+            emit_tunnel_state(&app, true);
+            emit_guard_state(&app, "active");
+            refresh_tray_toggle_item(&app);
+            let _ = app.emit(
+                "tunnel-log",
+                format!(
+                    "[SYSTEM] macOS TUN route is still active after resume, but saved supervisor PID {} is not visible yet. Keeping UI active until the supervisor rewrites its PID file.",
+                    saved_pid
+                ),
+            );
+            return Ok(Some(0));
+        }
+
         clear_saved_tunnel_pid(&app);
         emit_tunnel_state(&app, false);
         emit_guard_state(&app, "inactive");
@@ -6010,6 +7611,7 @@ pub fn run() {
             proxy_failure_count: Mutex::new(0),
             proxy_failure_window_started: Mutex::new(None),
             kill_switch_engaged: Mutex::new(false),
+            remote_transport_maintenance_depth: Mutex::new(0),
             #[cfg(desktop)]
             tray_toggle_item: Mutex::new(None),
             #[cfg(target_os = "windows")]
@@ -6134,6 +7736,7 @@ pub fn run() {
             stop_tunnel,
             get_windows_runtime_mode,
             get_android_runtime_context,
+            check_android_route_policy,
             claim_android_backend_session,
             prepare_android_backend_consumer_handoff,
             start_android_native_backend_consumer_seam,

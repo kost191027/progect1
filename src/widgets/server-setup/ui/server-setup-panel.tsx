@@ -19,6 +19,7 @@ type ServerSetupPanelProps = {
   hasLocalWarpProfile: boolean;
   localWarpEndpoint: string | null;
   localWarpAddressV4: string | null;
+  isAndroidRuntime: boolean;
   isWindowsRuntime: boolean;
   windowsRuntimeMode: WindowsRuntimeMode;
   isSavingWindowsRuntimeMode: boolean;
@@ -54,6 +55,7 @@ export function ServerSetupPanel({
   hasLocalWarpProfile,
   localWarpEndpoint,
   localWarpAddressV4,
+  isAndroidRuntime,
   isWindowsRuntime,
   windowsRuntimeMode,
   isSavingWindowsRuntimeMode,
@@ -75,11 +77,28 @@ export function ServerSetupPanel({
   onClearWarpProfile,
 }: ServerSetupPanelProps) {
   const localDeviceReference = getLocalDeviceReference();
+  const resetLabel = isAndroidRuntime ? "Reset This Phone" : "Reset Local Data";
+  const resettingLabel = isAndroidRuntime ? "Resetting phone..." : "Resetting...";
+  const panelSubtitle = isAndroidRuntime
+    ? "Deploy, attach, or refresh a self-hosted server from this phone. Credentials stay local on this device."
+    : "Save the server address and credentials locally, then deploy or update the node from here.";
+  const deployBusyLabel = isAndroidRuntime ? "Syncing phone..." : "Deploying...";
+  const warpDescription = hasLocalWarpProfile
+    ? `Deploy will prefer the imported profile (${localWarpEndpoint ?? "endpoint unavailable"}, ${localWarpAddressV4 ?? "IPv4 unavailable"}) before trying automatic remote bootstrap.`
+    : isAndroidRuntime
+      ? "This is still server-side WARP egress. Create WARP Profile can prepare one from the saved server credentials, or you can paste a personal profile if automatic registration is blocked."
+      : "Use Create WARP Profile to let the app prepare one automatically from the server details currently entered above. If you are a power user, you can still paste your own profile here. Accepted formats: wgcf-profile.conf, compact warp.json, or a sing-box wireguard outbound.";
+  const mobileFlowSteps = [
+    "Deploy installs or repairs the server from this phone when SSH credentials are available.",
+    "Attach reuses an existing transport and refreshes this phone's client config without rotating credentials.",
+    "Phone links let a secondary Android device import config without SSH access.",
+    "Reset This Phone removes only local app data; it does not delete the remote server.",
+  ];
 
   return (
     <Panel
       title="Server Access"
-      subtitle="Save the server address and credentials locally, then deploy or update the node from here."
+      subtitle={panelSubtitle}
       className="bg-[#1a1a1a]"
       collapsible={collapsible}
       defaultOpen={defaultOpen}
@@ -131,7 +150,7 @@ export function ServerSetupPanel({
             {isDeploying ? (
               <>
                 <span className="animate-spin text-lg">⚙</span>
-                Deploying...
+                {deployBusyLabel}
               </>
             ) : (
               deployActionLabel
@@ -151,9 +170,30 @@ export function ServerSetupPanel({
             }
             onClick={onResetLocalData}
           >
-            {isResettingLocalData ? "Resetting..." : "Reset Local Data"}
+            {isResettingLocalData ? resettingLabel : resetLabel}
           </Button>
         </div>
+
+        {isAndroidRuntime ? (
+          <div className="rounded-2xl border border-emerald-900/40 bg-emerald-950/10 px-4 py-4">
+            <div className="text-[11px] font-bold uppercase tracking-[0.22em] text-emerald-300/80">
+              Android self-hosted flow
+            </div>
+            <div className="mt-2 text-sm font-semibold text-zinc-100">
+              Same server model as desktop, safer phone-first wording
+            </div>
+            <div className="mt-3 grid gap-2">
+              {mobileFlowSteps.map((step) => (
+                <div
+                  key={step}
+                  className="rounded-xl border border-zinc-800/80 bg-black/20 px-3 py-2 text-sm leading-6 text-zinc-300"
+                >
+                  {step}
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
         {isWindowsRuntime ? (
           <div className="rounded-2xl border border-zinc-800 bg-[#111212] px-4 py-4">
@@ -215,9 +255,7 @@ export function ServerSetupPanel({
               : "Automatic bootstrap by default"}
           </div>
           <p className="mt-2 text-sm leading-6 text-zinc-400">
-            {hasLocalWarpProfile
-              ? `Deploy will prefer the imported profile (${localWarpEndpoint ?? "endpoint unavailable"}, ${localWarpAddressV4 ?? "IPv4 unavailable"}) before trying automatic remote bootstrap.`
-              : "Use Create WARP Profile to let the app prepare one automatically from the server details currently entered above. If you are a power user, you can still paste your own profile here. Accepted formats: wgcf-profile.conf, compact warp.json, or a sing-box wireguard outbound."}
+            {warpDescription}
           </p>
 
           <div className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_220px]">

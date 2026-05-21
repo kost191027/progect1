@@ -1,16 +1,14 @@
 package com.freedom.rkn
 
 import android.content.Context
-import org.json.JSONObject
 import java.io.File
+import org.json.JSONObject
 
 object AndroidNativeBackendSeam {
     private const val DEFAULT_CONSUMER_TAG = "rkn_android_native_backend_seam"
     private const val STATUS_FILE_NAME = "android_native_backend_status.json"
 
-    private fun globalStatusFile(context: Context): File {
-        return File(context.filesDir, STATUS_FILE_NAME)
-    }
+    private fun globalStatusFile(context: Context): File = File(context.filesDir, STATUS_FILE_NAME)
 
     @JvmStatic
     fun startClaimedSession(context: Context, launchBundlePath: String): String {
@@ -24,7 +22,7 @@ object AndroidNativeBackendSeam {
             tunFd: Int = -1,
             contextPath: String = "",
             backendConfigPath: String = "",
-            logPath: String = "",
+            logPath: String = ""
         ): String {
             val payload = JSONObject().apply {
                 put("phase", phase)
@@ -55,7 +53,7 @@ object AndroidNativeBackendSeam {
             if (!launchBundleFile.exists()) {
                 return persistStatus(
                     phase = "failed",
-                    detail = "Android native backend seam could not find the launch bundle artifact.",
+                    detail = "Android native backend seam could not find the launch bundle artifact."
                 )
             }
 
@@ -72,7 +70,7 @@ object AndroidNativeBackendSeam {
                     tunFd = launchBundle.tunFd,
                     contextPath = launchBundle.contextPath,
                     backendConfigPath = launchBundle.backendConfigPath,
-                    logPath = launchBundle.logPath,
+                    logPath = launchBundle.logPath
                 )
             }
 
@@ -81,7 +79,7 @@ object AndroidNativeBackendSeam {
                     sessionId = sessionId,
                     consumerTag = consumerTag,
                     phase = "launching",
-                    detail = "Android native backend seam is validating the claimed handoff session.",
+                    detail = "Android native backend seam is validating the claimed handoff session."
                 )
             }
 
@@ -94,7 +92,7 @@ object AndroidNativeBackendSeam {
 
             if (
                 launchBundle.backendHint != "android_native_handoff_required" &&
-                    launchBundle.backendHint != "android_native_proxy_fallback"
+                launchBundle.backendHint != "android_native_proxy_fallback"
             ) {
                 val detail =
                     "Android native backend seam received a launch bundle with an unexpected backend hint."
@@ -102,7 +100,7 @@ object AndroidNativeBackendSeam {
                     sessionId = sessionId,
                     consumerTag = consumerTag,
                     phase = "failed",
-                    detail = detail,
+                    detail = detail
                 )
                 return persistStatus(
                     phase = "failed",
@@ -110,7 +108,7 @@ object AndroidNativeBackendSeam {
                     tunFd = launchBundle.tunFd,
                     contextPath = launchBundle.contextPath,
                     backendConfigPath = launchBundle.backendConfigPath,
-                    logPath = launchBundle.logPath,
+                    logPath = launchBundle.logPath
                 )
             }
 
@@ -121,7 +119,7 @@ object AndroidNativeBackendSeam {
                     sessionId = sessionId,
                     consumerTag = consumerTag,
                     phase = "failed",
-                    detail = detail,
+                    detail = detail
                 )
                 return persistStatus(
                     phase = "failed",
@@ -129,7 +127,7 @@ object AndroidNativeBackendSeam {
                     tunFd = launchBundle.tunFd,
                     contextPath = launchBundle.contextPath,
                     backendConfigPath = launchBundle.backendConfigPath,
-                    logPath = launchBundle.logPath,
+                    logPath = launchBundle.logPath
                 )
             }
 
@@ -138,7 +136,7 @@ object AndroidNativeBackendSeam {
                 phase = "launching",
                 detail = "Android native backend launch was dispatched to the background runtime worker.",
                 runtimeName = selection.runtime.runtimeName,
-                runtimeSelection = selection.selectionSummary,
+                runtimeSelection = selection.selectionSummary
             )
             val launchState =
                 if (launchBundle.backendHint == "android_native_proxy_fallback") {
@@ -148,13 +146,13 @@ object AndroidNativeBackendSeam {
                         sessionId = sessionId,
                         consumerTag = consumerTag,
                         phase = initialLaunchResult.phase,
-                        detail = initialLaunchResult.detail,
+                        detail = initialLaunchResult.detail
                     )
                 }
             val payload = initialLaunchResult.toJson(
                 launchBundlePath = launchBundlePath,
                 statusPath = statusFile.absolutePath,
-                bundle = launchBundle,
+                bundle = launchBundle
             ).apply {
                 put("launch_state", launchState)
             }
@@ -168,7 +166,7 @@ object AndroidNativeBackendSeam {
 
             Thread({
                 val launchResult = selection.runtime.launch(context, launchBundle).copy(
-                    runtimeSelection = selection.selectionSummary,
+                    runtimeSelection = selection.selectionSummary
                 )
 
                 val activeSession = AndroidTunnelService.getBackendHandoffSessionId()
@@ -181,7 +179,7 @@ object AndroidNativeBackendSeam {
                     }
                     val cancelledPayload = launchResult.copy(
                         phase = "cancelled",
-                        detail = "Android native backend launch finished after the handoff session had already been cleared.",
+                        detail = "Android native backend launch finished after the handoff session had already been cleared."
                     )
                     persistBackgroundStatus(
                         context = context,
@@ -190,7 +188,7 @@ object AndroidNativeBackendSeam {
                         launchBundle = launchBundle,
                         sessionId = sessionId,
                         consumerTag = consumerTag,
-                        launchResult = cancelledPayload,
+                        launchResult = cancelledPayload
                     )
                     return@Thread
                 }
@@ -205,7 +203,7 @@ object AndroidNativeBackendSeam {
                     launchBundle = launchBundle,
                     sessionId = sessionId,
                     consumerTag = consumerTag,
-                    launchResult = launchResult,
+                    launchResult = launchResult
                 )
             }, "rkn-libbox-launch-$sessionId").start()
 
@@ -217,19 +215,44 @@ object AndroidNativeBackendSeam {
                     sessionId = sessionId,
                     consumerTag = consumerTag,
                     phase = "failed",
-                    detail = detail,
+                    detail = detail
                 )
             }
             persistStatus(
                 phase = "failed",
-                detail = "Android native backend seam crashed while preparing the launch bundle: $detail",
+                detail = "Android native backend seam crashed while preparing the launch bundle: $detail"
             )
         }
     }
 
     @JvmStatic
-    fun getStatusPath(context: Context): String {
-        return globalStatusFile(context).absolutePath
+    fun getStatusPath(context: Context): String = globalStatusFile(context).absolutePath
+
+    @JvmStatic
+    fun abortClaimedSession(context: Context, sessionId: String, reason: String): String {
+        val statusFile = resolveStatusFileForSession(context, sessionId)
+        val stopState = AndroidTunnelService.abortBackendLaunch(sessionId, reason)
+        val payload = JSONObject().apply {
+            put("phase", "failed")
+            put("detail", "Android native backend launch aborted: $reason")
+            put("session_id", sessionId)
+            put("consumer_tag", DEFAULT_CONSUMER_TAG)
+            put("status_path", statusFile.absolutePath)
+            put("launch_state", "failed")
+            put("abort_state", stopState)
+        }
+
+        runCatching {
+            statusFile.parentFile?.mkdirs()
+            statusFile.writeText(payload.toString(2))
+            val global = globalStatusFile(context)
+            global.parentFile?.mkdirs()
+            if (global.absolutePath != statusFile.absolutePath) {
+                global.writeText(payload.toString(2))
+            }
+        }
+
+        return stopState
     }
 
     @JvmStatic
@@ -253,6 +276,22 @@ object AndroidNativeBackendSeam {
         }
     }
 
+    private fun resolveStatusFileForSession(context: Context, sessionId: String): File {
+        val global = globalStatusFile(context)
+        val statusPath = runCatching {
+            val payload = JSONObject(global.readText())
+            val payloadSession = payload.optString("session_id")
+            payload
+                .optString("status_path")
+                .takeIf {
+                    it.isNotBlank() &&
+                        (payloadSession.isBlank() || payloadSession == sessionId)
+                }
+        }.getOrNull()
+
+        return statusPath?.let { File(it) } ?: global
+    }
+
     private fun persistBackgroundStatus(
         context: Context,
         statusFile: File,
@@ -260,7 +299,7 @@ object AndroidNativeBackendSeam {
         launchBundle: AndroidNativeBackendLaunchBundlePayload,
         sessionId: String,
         consumerTag: String,
-        launchResult: AndroidNativeBackendLaunchResult,
+        launchResult: AndroidNativeBackendLaunchResult
     ) {
         val effectiveLaunchResult = mergeWithExistingStatusIfFurther(statusFile, launchResult)
         val launchState =
@@ -271,13 +310,13 @@ object AndroidNativeBackendSeam {
                     sessionId = sessionId,
                     consumerTag = consumerTag,
                     phase = effectiveLaunchResult.phase,
-                    detail = effectiveLaunchResult.detail,
+                    detail = effectiveLaunchResult.detail
                 )
             }
         val payload = effectiveLaunchResult.toJson(
             launchBundlePath = launchBundlePath,
             statusPath = statusFile.absolutePath,
-            bundle = launchBundle,
+            bundle = launchBundle
         ).apply {
             put("launch_state", launchState)
         }
@@ -294,9 +333,11 @@ object AndroidNativeBackendSeam {
 
     private fun mergeWithExistingStatusIfFurther(
         statusFile: File,
-        launchResult: AndroidNativeBackendLaunchResult,
+        launchResult: AndroidNativeBackendLaunchResult
     ): AndroidNativeBackendLaunchResult {
-        if (!launchResult.phase.startsWith("launching") && !launchResult.phase.startsWith("starting")) {
+        if (!launchResult.phase.startsWith("launching") &&
+            !launchResult.phase.startsWith("starting")
+        ) {
             return launchResult
         }
 
@@ -327,7 +368,7 @@ object AndroidNativeBackendSeam {
             },
             backendConfigSummary = existing.optString("backend_config_summary").ifBlank {
                 launchResult.backendConfigSummary
-            },
+            }
         )
     }
 }

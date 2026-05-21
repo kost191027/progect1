@@ -1,10 +1,20 @@
 #!/usr/bin/env sh
 
 echo "⚙️ Running Frontend Lint & TS Check..."
-npx lint-staged
+if [ ! -x node_modules/.bin/lint-staged ] || [ ! -x node_modules/.bin/eslint ]; then
+  echo "Frontend dependencies are missing or offloaded. Run npm install, then retry commit."
+  exit 1
+fi
+./node_modules/.bin/lint-staged
 npm run build-check
 
 echo "⚙️ Running Rust Formatting & Clippy (Backend)..."
 cd src-tauri
 cargo fmt --check
 cargo clippy -- -D warnings
+cd ..
+
+if git diff --cached --name-only | grep -Eq '^(src-tauri/gen/android/.*\.(kt|kts)|src-tauri/gen/android/config/detekt\.yml|src-tauri/gen/android/\.editorconfig|scripts/run-android-gradle\.mjs)$'; then
+  echo "⚙️ Running Android Kotlin quality gate..."
+  npm run android:kotlin:check
+fi

@@ -21,7 +21,9 @@ pub const GOOGLE_RULE_SET_TAG: &str = "geosite-google";
 
 pub const DIRECT_ROUTE_RULE_SET_TAGS: &[&str] = &[
     "geoip-ru",
+    "geosite-category-ru",
     "geosite-category-gov-ru",
+    "geosite-tld-ru",
     "geosite-yandex",
     "geosite-vk",
 ];
@@ -69,8 +71,16 @@ pub const REMOTE_RULE_SETS: &[RemoteRuleSet] = &[
         url: "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
     },
     RemoteRuleSet {
+        tag: "geosite-category-ru",
+        url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs",
+    },
+    RemoteRuleSet {
         tag: "geosite-category-gov-ru",
         url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-gov-ru.srs",
+    },
+    RemoteRuleSet {
+        tag: "geosite-tld-ru",
+        url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-tld-ru.srs",
     },
     RemoteRuleSet {
         tag: "geosite-yandex",
@@ -92,7 +102,9 @@ pub const REMOTE_RULE_SETS: &[RemoteRuleSet] = &[
 
 const LOCAL_CLIENT_RULE_SET_TAGS: &[&str] = &[
     "geoip-ru",
+    "geosite-category-ru",
     "geosite-category-gov-ru",
+    "geosite-tld-ru",
     "geosite-yandex",
     "geosite-vk",
     GOOGLE_RULE_SET_TAG,
@@ -116,9 +128,11 @@ fn local_rule_set_path(app: &AppHandle, tag: &str) -> Result<PathBuf, String> {
 fn bundled_rule_set_bytes(tag: &str) -> Option<&'static [u8]> {
     match tag {
         "geoip-ru" => Some(include_bytes!("../assets/rule-set/geoip-ru.srs")),
+        "geosite-category-ru" => Some(include_bytes!("../assets/rule-set/geosite-category-ru.srs")),
         "geosite-category-gov-ru" => Some(include_bytes!(
             "../assets/rule-set/geosite-category-gov-ru.srs"
         )),
+        "geosite-tld-ru" => Some(include_bytes!("../assets/rule-set/geosite-tld-ru.srs")),
         "geosite-yandex" => Some(include_bytes!("../assets/rule-set/geosite-yandex.srs")),
         "geosite-vk" => Some(include_bytes!("../assets/rule-set/geosite-vk.srs")),
         GOOGLE_RULE_SET_TAG => Some(include_bytes!("../assets/rule-set/geosite-google.srs")),
@@ -131,6 +145,17 @@ fn write_rule_set_file(path: &PathBuf, bytes: &[u8]) -> Result<(), String> {
     std::fs::write(&temp_path, bytes).map_err(|e| e.to_string())?;
     std::fs::rename(&temp_path, path).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn local_rule_set_file_is_usable(path: &std::path::Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+
+    let mut magic = [0_u8; 3];
+    use std::io::Read;
+    file.read_exact(&mut magic).is_ok() && magic == *b"SRS"
 }
 
 async fn download_rule_set_file(url: &str, path: &PathBuf) -> Result<(), String> {
@@ -158,6 +183,8 @@ pub async fn ensure_local_client_rule_sets(
     app: &AppHandle,
 ) -> Result<Vec<LocalRuleSetAsset>, String> {
     let mut assets = Vec::new();
+    #[cfg(target_os = "android")]
+    let mut restored_bundled_count = 0_usize;
 
     for tag in LOCAL_CLIENT_RULE_SET_TAGS {
         let Some(rule_set) = REMOTE_RULE_SETS
@@ -170,34 +197,19 @@ pub async fn ensure_local_client_rule_sets(
         let path = local_rule_set_path(app, tag)?;
         #[cfg(target_os = "android")]
         if let Some(bytes) = bundled_rule_set_bytes(rule_set.tag) {
-            let _ = app.emit(
-                "tunnel-log",
-                format!(
-                    "[SYSTEM] Restoring bundled local rule-set {} for Android runtime...",
-                    rule_set.tag
-                ),
-            );
-
-            match write_rule_set_file(&path, bytes) {
-                Ok(()) => {
-                    let _ = app.emit(
-                        "tunnel-log",
-                        format!(
-                            "[SYSTEM] Bundled local rule-set {} restored at {}.",
-                            rule_set.tag,
-                            path.display()
-                        ),
-                    );
-                }
-                Err(error) => {
-                    let _ = app.emit(
-                        "tunnel-log",
-                        format!(
-                            "[WARN] Failed to restore bundled local rule-set {}: {}. Falling back to suffix-only rules for now.",
-                            rule_set.tag, error
-                        ),
-                    );
-                    continue;
+            if !local_rule_set_file_is_usable(&path) {
+                match write_rule_set_file(&path, bytes) {
+                    Ok(()) => restored_bundled_count += 1,
+                    Err(error) => {
+                        let _ = app.emit(
+                            "tunnel-log",
+                            format!(
+                                "[WARN] Failed to restore bundled local rule-set {}: {}. Falling back to suffix-only rules for now.",
+                                rule_set.tag, error
+                            ),
+                        );
+                        continue;
+                    }
                 }
             }
 
@@ -242,6 +254,17 @@ pub async fn ensure_local_client_rule_sets(
             tag: rule_set.tag,
             path,
         });
+    }
+
+    #[cfg(target_os = "android")]
+    if restored_bundled_count > 0 {
+        let _ = app.emit(
+            "tunnel-log",
+            format!(
+                "[SYSTEM] Android local rule-sets restored from bundle: {}.",
+                restored_bundled_count
+            ),
+        );
     }
 
     Ok(assets)

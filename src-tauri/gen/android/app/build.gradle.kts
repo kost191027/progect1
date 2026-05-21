@@ -1,11 +1,17 @@
-import java.util.Properties
+import io.gitlab.arturbosch.detekt.Detekt
+import io.gitlab.arturbosch.detekt.extensions.DetektExtension
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.Properties
+import org.jlleitschuh.gradle.ktlint.KtlintExtension
+import org.jlleitschuh.gradle.ktlint.reporter.ReporterType
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("rust")
+    id("io.gitlab.arturbosch.detekt") version "1.23.8"
+    id("org.jlleitschuh.gradle.ktlint") version "12.1.1"
 }
 
 val tauriProperties = Properties().apply {
@@ -38,12 +44,12 @@ android {
         buildConfigField(
             "boolean",
             "ANDROID_NATIVE_BACKEND_LIBBOX_AAR_PRESENT",
-            hasLocalLibboxAar.toString(),
+            hasLocalLibboxAar.toString()
         )
         buildConfigField(
             "String",
             "ANDROID_NATIVE_BACKEND_LIBBOX_AAR_PATH",
-            "\"${androidLibboxAar.absolutePath}\"",
+            "\"${androidLibboxAar.absolutePath}\""
         )
     }
     buildTypes {
@@ -81,6 +87,28 @@ val androidBundledSingboxSource = file("../../../bins/sing-box-aarch64-linux-and
 val androidBundledSingboxTarget =
     file("src/main/jniLibs/arm64-v8a/libsingbox.so")
 
+tasks.register("removeICloudDuplicateAndroidArtifacts") {
+    doLast {
+        val iCloudDuplicatePattern = Regex(""".* \d+\..*""")
+        listOf(
+            file("src/main/java"),
+            file("src/main/assets"),
+            file("build")
+        ).forEach { root ->
+            if (root.exists()) {
+                root.walkTopDown()
+                    .filter { candidate ->
+                        candidate.isFile &&
+                            candidate.name.matches(iCloudDuplicatePattern)
+                    }
+                    .forEach { duplicate ->
+                        duplicate.delete()
+                    }
+            }
+        }
+    }
+}
+
 tasks.register("prepareAndroidSingboxSidecar") {
     inputs.file(androidBundledSingboxSource)
     outputs.file(androidBundledSingboxTarget)
@@ -88,7 +116,7 @@ tasks.register("prepareAndroidSingboxSidecar") {
     doLast {
         if (!androidBundledSingboxSource.exists()) {
             throw GradleException(
-                "Android sing-box sidecar is missing at ${androidBundledSingboxSource.absolutePath}",
+                "Android sing-box sidecar is missing at ${androidBundledSingboxSource.absolutePath}"
             )
         }
 
@@ -96,7 +124,7 @@ tasks.register("prepareAndroidSingboxSidecar") {
         Files.copy(
             androidBundledSingboxSource.toPath(),
             androidBundledSingboxTarget.toPath(),
-            StandardCopyOption.REPLACE_EXISTING,
+            StandardCopyOption.REPLACE_EXISTING
         )
         androidBundledSingboxTarget.setReadable(true, false)
         androidBundledSingboxTarget.setExecutable(true, false)
@@ -104,7 +132,49 @@ tasks.register("prepareAndroidSingboxSidecar") {
 }
 
 tasks.named("preBuild").configure {
+    dependsOn("removeICloudDuplicateAndroidArtifacts")
     dependsOn("prepareAndroidSingboxSidecar")
+}
+
+configure<DetektExtension> {
+    buildUponDefaultConfig = true
+    allRules = false
+    config.setFrom(rootProject.files("config/detekt.yml"))
+    source.setFrom(files("src/main/java/com/freedom/rkn"))
+    basePath = rootProject.projectDir.absolutePath
+}
+
+tasks.withType<Detekt>().configureEach {
+    jvmTarget = "1.8"
+    exclude("**/generated/**")
+    reports {
+        html.required.set(true)
+        xml.required.set(true)
+        txt.required.set(false)
+        sarif.required.set(false)
+    }
+}
+
+configure<KtlintExtension> {
+    version.set("1.3.1")
+    android.set(true)
+    outputToConsole.set(true)
+    ignoreFailures.set(false)
+    reporters {
+        reporter(ReporterType.CHECKSTYLE)
+    }
+    filter {
+        exclude("**/generated/**")
+        exclude("**/build/**")
+        exclude("**/tauri.build.gradle.kts")
+    }
+}
+
+tasks.register("androidKotlinQuality") {
+    group = "verification"
+    description = "Runs Kotlin static analysis and formatting gates for the Android layer."
+    dependsOn("ktlintCheck")
+    dependsOn("detekt")
 }
 
 dependencies {

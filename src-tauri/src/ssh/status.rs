@@ -83,6 +83,7 @@ pub(crate) async fn ensure_local_transport_is_current(app: &AppHandle) -> Result
     ensure_transport_snapshot_current(app, snapshot_result, true)
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) async fn ensure_local_transport_is_current_quiet(app: &AppHandle) -> Result<(), String> {
     let check_app = app.clone();
     let snapshot_result = tauri::async_runtime::spawn_blocking(move || {
@@ -501,6 +502,10 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
             &rotate_app,
             "ROTATE",
             "Deploying new cover domain to server...",
+        );
+        let _maintenance_guard = crate::begin_remote_transport_maintenance(
+            &rotate_app,
+            "cover-domain rotation is updating the active RKN container.",
         );
         execute_remote_deploy(
             &sess,

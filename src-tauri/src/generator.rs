@@ -438,6 +438,7 @@ pub fn build_client_config(
       "auto_route": true,
       "strict_route": true,
       "stack": "system",
+      "mtu": 1280,
       "endpoint_independent_nat": true
     });
 
@@ -498,9 +499,6 @@ pub fn build_client_config(
           "method": "2022-blake3-aes-128-gcm",
           "password": ss_password,
           "udp_over_tcp": true,
-          "multiplex": {
-            "enabled": true
-          },
           "detour": "shadowtls-out"
         },
         {
@@ -538,13 +536,12 @@ pub fn build_client_config(
             "action": "hijack-dns"
           },
           {
-            "network": "udp",
-            "port": 443,
-            "action": "reject",
-            "method": "default"
+            "domain_suffix": PROXY_PRIORITY_DOMAIN_SUFFIXES,
+            "action": "route",
+            "outbound": "proxy"
           },
           {
-            "domain_suffix": PROXY_PRIORITY_DOMAIN_SUFFIXES,
+            "ip_version": 6,
             "action": "route",
             "outbound": "proxy"
           },
@@ -560,7 +557,10 @@ pub fn build_client_config(
           }
         ],
         "final": "proxy",
-        "default_domain_resolver": "remote-dns",
+        "default_domain_resolver": {
+          "server": "remote-dns",
+          "strategy": "ipv4_only"
+        },
         "auto_detect_interface": true,
         "rule_set": local_rule_set_entries
       }
@@ -611,6 +611,16 @@ pub fn build_client_config(
               "outbound": "direct"
             }));
     }
+
+    config["route"]["rules"]
+        .as_array_mut()
+        .expect("route rules must be an array")
+        .push(json!({
+          "network": "udp",
+          "port": 443,
+          "action": "reject",
+          "method": "default"
+        }));
 
     serde_json::to_string_pretty(&config).unwrap()
 }

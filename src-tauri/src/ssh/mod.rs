@@ -392,10 +392,24 @@ struct SshAttemptContext<'a> {
     emit_stages: bool,
 }
 
+#[derive(Debug)]
+enum SshAttemptError {
+    Auth(String),
+    Other(String),
+}
+
+impl SshAttemptError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Auth(message) | Self::Other(message) => message,
+        }
+    }
+}
+
 fn complete_ssh_session_from_stream(
     tcp: TcpStream,
     ctx: SshAttemptContext<'_>,
-) -> Result<Session, String> {
+) -> Result<Session, SshAttemptError> {
     maybe_emit_ssh_stage(
         ctx.app,
         ctx.emit_stages,
@@ -406,14 +420,14 @@ fn complete_ssh_session_from_stream(
         ),
     );
 
-    let mut sess = Session::new().map_err(|e| e.to_string())?;
+    let mut sess = Session::new().map_err(|e| SshAttemptError::Other(e.to_string()))?;
     sess.set_timeout(SSH_SESSION_TIMEOUT.as_millis() as u32);
     sess.set_tcp_stream(tcp);
     sess.handshake().map_err(|error| {
-        format!(
+        SshAttemptError::Other(format!(
             "SSH handshake failed on port {} via {}: {}",
             ctx.port, ctx.mode, error
-        )
+        ))
     })?;
 
     maybe_emit_ssh_stage(
@@ -428,17 +442,17 @@ fn complete_ssh_session_from_stream(
 
     sess.userauth_password(ctx.user, ctx.pass)
         .map_err(|error| {
-            format!(
-                "Auth failed on port {} via {}: {}",
-                ctx.port, ctx.mode, error
-            )
+            SshAttemptError::Auth(format!(
+                "SSH authentication failed for user '{}' on port {} via {}. Check the SSH username/password saved in Server Access. Details: {}",
+                ctx.user, ctx.port, ctx.mode, error
+            ))
         })?;
 
     if !sess.authenticated() {
-        return Err(format!(
-            "Authentication failed on port {} via {}",
-            ctx.port, ctx.mode
-        ));
+        return Err(SshAttemptError::Auth(format!(
+            "SSH authentication failed for user '{}' on port {} via {}. Check the SSH username/password saved in Server Access.",
+            ctx.user, ctx.port, ctx.mode
+        )));
     }
 
     Ok(sess)
@@ -510,7 +524,11 @@ fn connect_ssh_session_inner(
                 },
             ) {
                 Ok(sess) => return Ok(sess),
-                Err(error) => {
+                Err(SshAttemptError::Auth(error)) => {
+                    maybe_emit_ssh_stage(app, emit_stages, "AUTH", error.clone());
+                    return Err(error);
+                }
+                Err(SshAttemptError::Other(error)) => {
                     maybe_emit_ssh_stage(
                         app,
                         emit_stages,
@@ -556,7 +574,12 @@ fn connect_ssh_session_inner(
                 },
             ) {
                 Ok(sess) => return Ok(sess),
+                Err(SshAttemptError::Auth(error)) => {
+                    maybe_emit_ssh_stage(app, emit_stages, "AUTH", error.clone());
+                    return Err(error);
+                }
                 Err(error) => {
+                    let error = error.into_message();
                     last_error = Some(error.clone());
                     maybe_emit_ssh_stage(
                         app,

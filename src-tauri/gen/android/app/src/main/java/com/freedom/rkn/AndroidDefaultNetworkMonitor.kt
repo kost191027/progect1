@@ -11,19 +11,31 @@ import io.nekohasekai.libbox.InterfaceUpdateListener
 import java.net.NetworkInterface
 
 object AndroidDefaultNetworkMonitor {
+    private const val NETWORK_RESTORE_WAIT_ATTEMPTS = 16
+    private const val NETWORK_RESTORE_WAIT_MS = 125L
+    private const val EMPTY_INTERFACE_DEBOUNCE_MS = 2_500L
+
     @Volatile
     private var defaultNetwork: Network? = null
+
     @Volatile
     private var listener: InterfaceUpdateListener? = null
+
     @Volatile
     private var callbackRegistered = false
+
+    @Volatile
+    private var emptyInterfaceGeneration = 0L
+
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val monitorLock = Any()
 
     fun ensureStarted(context: Context) {
         synchronized(monitorLock) {
             val connectivity =
-                context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                context.applicationContext.getSystemService(
+                    Context.CONNECTIVITY_SERVICE
+                ) as ConnectivityManager
             defaultNetwork = resolveUnderlyingNetwork(connectivity)
 
             if (callbackRegistered) {
@@ -44,8 +56,22 @@ object AndroidDefaultNetworkMonitor {
                     notifyListener(context.applicationContext, defaultNetwork)
                 }
 
-                override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-                    if (defaultNetwork == network || defaultNetwork == null || !isUsableInterface(linkProperties.interfaceName)) {
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities
+                ) {
+                    defaultNetwork = resolveUnderlyingNetwork(connectivity)
+                    notifyListener(context.applicationContext, defaultNetwork)
+                }
+
+                override fun onLinkPropertiesChanged(
+                    network: Network,
+                    linkProperties: LinkProperties
+                ) {
+                    if (defaultNetwork == network ||
+                        defaultNetwork == null ||
+                        !isUsableInterface(linkProperties.interfaceName)
+                    ) {
                         defaultNetwork = resolveUnderlyingNetwork(connectivity)
                         notifyListener(context.applicationContext, defaultNetwork)
                     }
@@ -66,10 +92,23 @@ object AndroidDefaultNetworkMonitor {
     fun currentNetwork(context: Context): Network? {
         ensureStarted(context)
         val connectivity =
-            context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val current = defaultNetwork ?: resolveUnderlyingNetwork(connectivity)
-        defaultNetwork = current
-        return current
+            context.applicationContext.getSystemService(
+                Context.CONNECTIVITY_SERVICE
+            ) as ConnectivityManager
+        repeat(NETWORK_RESTORE_WAIT_ATTEMPTS) { attempt ->
+            val current = resolveUnderlyingNetwork(connectivity)
+            if (current != null) {
+                defaultNetwork = current
+                return current
+            }
+
+            if (attempt < NETWORK_RESTORE_WAIT_ATTEMPTS - 1) {
+                Thread.sleep(NETWORK_RESTORE_WAIT_MS)
+            }
+        }
+
+        defaultNetwork = null
+        return null
     }
 
     fun setListener(context: Context, newListener: InterfaceUpdateListener?) {
@@ -87,25 +126,53 @@ object AndroidDefaultNetworkMonitor {
     private fun notifyListener(context: Context, network: Network?) {
         val currentListener = listener ?: return
         if (network == null) {
-            currentListener.updateDefaultInterface("", -1, false, false)
+            scheduleEmptyInterfaceUpdate(context.applicationContext)
             return
         }
 
         val connectivity =
-            context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            context.applicationContext.getSystemService(
+                Context.CONNECTIVITY_SERVICE
+            ) as ConnectivityManager
         val linkProperties = connectivity.getLinkProperties(network) ?: return
         val interfaceName = linkProperties.interfaceName ?: return
         if (!isUsableInterface(interfaceName)) {
-            currentListener.updateDefaultInterface("", -1, false, false)
+            scheduleEmptyInterfaceUpdate(context.applicationContext)
             return
         }
-        val interfaceIndex = runCatching { NetworkInterface.getByName(interfaceName)?.index ?: -1 }.getOrDefault(-1)
+        val interfaceIndex = runCatching {
+            NetworkInterface.getByName(interfaceName)?.index ?: -1
+        }.getOrDefault(-1)
+        emptyInterfaceGeneration += 1
         currentListener.updateDefaultInterface(interfaceName, interfaceIndex, false, false)
+    }
+
+    private fun scheduleEmptyInterfaceUpdate(context: Context) {
+        val generation = emptyInterfaceGeneration + 1
+        emptyInterfaceGeneration = generation
+        Thread({
+            Thread.sleep(EMPTY_INTERFACE_DEBOUNCE_MS)
+            val connectivity =
+                context.applicationContext.getSystemService(
+                    Context.CONNECTIVITY_SERVICE
+                ) as ConnectivityManager
+            val recoveredNetwork = resolveUnderlyingNetwork(connectivity)
+            if (recoveredNetwork != null) {
+                defaultNetwork = recoveredNetwork
+                notifyListener(context.applicationContext, recoveredNetwork)
+                return@Thread
+            }
+            if (emptyInterfaceGeneration == generation) {
+                listener?.updateDefaultInterface("", -1, false, false)
+            }
+        }, "rkn-default-network-empty-debounce").start()
     }
 
     fun interfaceFlags(context: Context, interfaceName: String): Int {
         val connectivity =
-            context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            context.applicationContext.getSystemService(
+                Context.CONNECTIVITY_SERVICE
+            ) as ConnectivityManager
         val network = currentNetwork(context)
         val capabilities = network?.let { connectivity.getNetworkCapabilities(it) }
         val networkInterface = runCatching { NetworkInterface.getByName(interfaceName) }.getOrNull()
@@ -129,19 +196,29 @@ object AndroidDefaultNetworkMonitor {
 
     fun interfaceType(context: Context, network: Network?): Int {
         val connectivity =
-            context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            context.applicationContext.getSystemService(
+                Context.CONNECTIVITY_SERVICE
+            ) as ConnectivityManager
         val capabilities = network?.let { connectivity.getNetworkCapabilities(it) }
         return when {
-            capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> io.nekohasekai.libbox.Libbox.InterfaceTypeWIFI
-            capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> io.nekohasekai.libbox.Libbox.InterfaceTypeCellular
-            capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> io.nekohasekai.libbox.Libbox.InterfaceTypeEthernet
+            capabilities?.hasTransport(
+                NetworkCapabilities.TRANSPORT_WIFI
+            ) == true -> io.nekohasekai.libbox.Libbox.InterfaceTypeWIFI
+            capabilities?.hasTransport(
+                NetworkCapabilities.TRANSPORT_CELLULAR
+            ) == true -> io.nekohasekai.libbox.Libbox.InterfaceTypeCellular
+            capabilities?.hasTransport(
+                NetworkCapabilities.TRANSPORT_ETHERNET
+            ) == true -> io.nekohasekai.libbox.Libbox.InterfaceTypeEthernet
             else -> io.nekohasekai.libbox.Libbox.InterfaceTypeOther
         }
     }
 
     fun interfaceDnsServers(context: Context, interfaceName: String): List<String> {
         val connectivity =
-            context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            context.applicationContext.getSystemService(
+                Context.CONNECTIVITY_SERVICE
+            ) as ConnectivityManager
         val network = currentNetwork(context) ?: return emptyList()
         val linkProperties = connectivity.getLinkProperties(network) ?: return emptyList()
         if (linkProperties.interfaceName != interfaceName) {
@@ -150,9 +227,7 @@ object AndroidDefaultNetworkMonitor {
         return linkProperties.dnsServers.mapNotNull { it.hostAddress }
     }
 
-    fun isUsableInterfaceName(interfaceName: String?): Boolean {
-        return isUsableInterface(interfaceName)
-    }
+    fun isUsableInterfaceName(interfaceName: String?): Boolean = isUsableInterface(interfaceName)
 
     private fun resolveUnderlyingNetwork(connectivity: ConnectivityManager): Network? {
         val active = connectivity.activeNetwork
@@ -165,10 +240,7 @@ object AndroidDefaultNetworkMonitor {
         }
     }
 
-    private fun isUsableNetwork(
-        connectivity: ConnectivityManager,
-        network: Network,
-    ): Boolean {
+    private fun isUsableNetwork(connectivity: ConnectivityManager, network: Network): Boolean {
         val capabilities = connectivity.getNetworkCapabilities(network) ?: return false
         if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
             return false

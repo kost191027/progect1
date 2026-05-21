@@ -1,9 +1,9 @@
 package com.freedom.rkn
 
 import android.content.Context
+import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.File
 
 object StubAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
     override val runtimeId: String = "stub"
@@ -11,24 +11,22 @@ object StubAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
 
     override fun availability(
         context: Context,
-        bundle: AndroidNativeBackendLaunchBundlePayload,
-    ): AndroidNativeBackendAvailability {
-        return AndroidNativeBackendAvailability(
-            available = true,
-            detail = "stub runtime is bundled as the fallback Android-native backend seam.",
-        )
-    }
+        bundle: AndroidNativeBackendLaunchBundlePayload
+    ): AndroidNativeBackendAvailability = AndroidNativeBackendAvailability(
+        available = true,
+        detail = "stub runtime is bundled as the fallback Android-native backend seam."
+    )
 
     override fun launch(
         context: Context,
-        bundle: AndroidNativeBackendLaunchBundlePayload,
+        bundle: AndroidNativeBackendLaunchBundlePayload
     ): AndroidNativeBackendLaunchResult {
         val summary = readBackendConfigSummary(bundle.backendConfigPath)
         runCatching {
             File(bundle.runtimeLogPath).writeText(
                 "stub runtime consumed session ${bundle.sessionId}\n" +
                     "tun fd ownership: ${bundle.tunFdOwnership}\n" +
-                    "backend summary: $summary\n",
+                    "backend summary: $summary\n"
             )
         }
         val detail =
@@ -39,27 +37,24 @@ object StubAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             phase = "failed",
             detail = detail,
             runtimeName = runtimeName,
-            backendConfigSummary = summary,
+            backendConfigSummary = summary
         )
     }
 
-    override fun stop(handle: AndroidNativeBackendRunningHandle): String {
-        return "idle(runtime=${handle.runtimeId}, session=${handle.sessionId})"
-    }
+    override fun stop(handle: AndroidNativeBackendRunningHandle): String =
+        "idle(runtime=${handle.runtimeId}, session=${handle.sessionId})"
 
-    private fun readBackendConfigSummary(path: String): String {
-        return runCatching {
-            val payload = JSONObject(File(path).readText())
-            val outbounds = payload.optJSONArray("outbounds")
-            val dns = payload.optJSONObject("dns")
-            val route = payload.optJSONObject("route")
-            val outboundTags = outbounds.toTagList()
-            val dnsServers = dns?.optJSONArray("servers")?.length() ?: 0
-            val routeRules = route?.optJSONArray("rules")?.length() ?: 0
-            "outbounds=${outbounds?.length() ?: 0}[$outboundTags], dns_servers=$dnsServers, route_rules=$routeRules"
-        }.getOrElse { error ->
-            "unavailable(${error.message ?: error::class.java.simpleName})"
-        }
+    private fun readBackendConfigSummary(path: String): String = runCatching {
+        val payload = JSONObject(File(path).readText())
+        val outbounds = payload.optJSONArray("outbounds")
+        val dns = payload.optJSONObject("dns")
+        val route = payload.optJSONObject("route")
+        val outboundTags = outbounds.toTagList()
+        val dnsServers = dns?.optJSONArray("servers")?.length() ?: 0
+        val routeRules = route?.optJSONArray("rules")?.length() ?: 0
+        "outbounds=${outbounds?.length() ?: 0}[$outboundTags], dns_servers=$dnsServers, route_rules=$routeRules"
+    }.getOrElse { error ->
+        "unavailable(${error.message ?: error::class.java.simpleName})"
     }
 
     private fun JSONArray?.toTagList(): String {

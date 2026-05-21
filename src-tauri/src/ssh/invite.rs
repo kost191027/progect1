@@ -325,6 +325,10 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
         "issued_invites": synced_invites
     })
     .to_string();
+    let _maintenance_guard = crate::begin_remote_transport_maintenance(
+        app,
+        "invite sync is updating the active RKN container.",
+    );
     execute_remote_deploy(
         &sess,
         app,

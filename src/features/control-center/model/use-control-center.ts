@@ -221,6 +221,7 @@ export function useControlCenter() {
   const [isRunning, setIsRunning] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
+  const [isCheckingAndroidRoutePolicy, setIsCheckingAndroidRoutePolicy] = useState(false);
   const [isRotatingSni, setIsRotatingSni] = useState(false);
   const [isResettingLocalData, setIsResettingLocalData] = useState(false);
   const [isGeneratingInvite, setIsGeneratingInvite] = useState(false);
@@ -253,6 +254,7 @@ export function useControlCenter() {
   const [inviteLinkInput, setInviteLinkInput] = useState("");
   const [inviteLinkError, setInviteLinkError] = useState<string | null>(null);
   const [inviteImportSuccessMessage, setInviteImportSuccessMessage] = useState<string | null>(null);
+  const [isPastingInviteLink, setIsPastingInviteLink] = useState(false);
   const [issuedInviteLinks, setIssuedInviteLinks] = useState<IssuedInviteLink[]>([]);
   const [primaryInviteCopied, setPrimaryInviteCopied] = useState(false);
   const [copiedInviteId, setCopiedInviteId] = useState<string | null>(null);
@@ -349,6 +351,25 @@ export function useControlCenter() {
     logFlushTimerRef.current = window.setTimeout(() => {
       flushPendingLogs();
     }, LOG_FLUSH_INTERVAL_MS);
+  }
+
+  function applyTransportSnapshot(snapshot: TransportStateSnapshot) {
+    setCurrentCoverDomain(snapshot.current_cover_domain ?? snapshot.local_cover_domain);
+    setAvailableCoverDomains(snapshot.available_cover_domains);
+    setRequiresRedeploy(snapshot.requires_redeploy);
+  }
+
+  async function refreshTransportSnapshot(options?: { silent?: boolean }) {
+    try {
+      const snapshot = await invoke<TransportStateSnapshot>("get_transport_state_snapshot");
+      applyTransportSnapshot(snapshot);
+      return snapshot;
+    } catch (error) {
+      if (!options?.silent) {
+        appendLog(`[WARN] Failed to load active cover domain snapshot: ${error}`);
+      }
+      return null;
+    }
   }
 
   async function refreshAndroidRuntimeContext() {
@@ -462,12 +483,12 @@ export function useControlCenter() {
           setPassword(profile.password);
           setSavedProfile(profile);
           setAppRole("master");
-          setCurrentCoverDomain(null);
           setRequiresInviteRefresh(false);
           window.localStorage.setItem(APP_ROLE_KEY, "master");
           window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
           window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
           appendLog("[SYSTEM] Saved server profile loaded.");
+          void refreshTransportSnapshot({ silent: true });
           return;
         }
 
@@ -519,7 +540,7 @@ export function useControlCenter() {
 
     const latestLine = logs[logs.length - 1] ?? "";
     if (
-      latestLine.includes("Android TUN handoff checkpoint reached") ||
+      latestLine.includes("Android TUN handoff prepared") ||
       latestLine.includes("Android VpnService established a real TUN interface") ||
       latestLine.includes("Android launch paths:")
     ) {
@@ -661,6 +682,73 @@ export function useControlCenter() {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (isRunning) {
+      return;
+    }
+
+    let cancelled = false;
+    let restoreInFlight = false;
+
+    async function restoreAfterResume() {
+      if (cancelled || restoreInFlight || isRunning) {
+        return;
+      }
+
+      restoreInFlight = true;
+      try {
+        const pid = await invoke<number | null>("restore_tunnel_session");
+        if (cancelled || pid === null) {
+          return;
+        }
+
+        setIsRunning(true);
+        setGuardState("active");
+        setIsStarting(false);
+        setIsStopping(false);
+        setLastError(null);
+        setLastUserMessage("Tunnel session restored after system resume.");
+        appendLog(
+          pid === 0
+            ? "[SYSTEM] macOS TUN route restored after resume; supervisor PID is being refreshed."
+            : `[SYSTEM] Active sing-box session restored after resume (PID ${pid}).`,
+        );
+      } catch (error) {
+        if (!cancelled) {
+          appendLog(`[WARN] Failed to restore tunnel after resume: ${error}`);
+        }
+      } finally {
+        restoreInFlight = false;
+      }
+    }
+
+    const handleVisibility = () => {
+      if (!document.hidden) {
+        void restoreAfterResume();
+      }
+    };
+    const handleFocus = () => {
+      void restoreAfterResume();
+    };
+
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibility);
+    const intervalId = window.setInterval(() => {
+      if (!document.hidden) {
+        void restoreAfterResume();
+      }
+    }, 10000);
+
+    void restoreAfterResume();
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.clearInterval(intervalId);
+    };
+  }, [isRunning]);
 
   useEffect(() => {
     const unlisten = listen<string>("subordinate-config-outdated", () => {
@@ -882,7 +970,9 @@ export function useControlCenter() {
       { host, user, password },
       {
         logHeader: "--- INITIATING REMOTE SERVER DEPLOYMENT ---",
-        userMessage: "Connecting to the server and applying the current transport configuration.",
+        userMessage: isAndroidRuntime
+          ? "Syncing this phone with the server and applying the current transport configuration."
+          : "Connecting to the server and applying the current transport configuration.",
       },
     );
   }
@@ -934,9 +1024,7 @@ export function useControlCenter() {
       window.localStorage.setItem(APP_ROLE_KEY, "master");
       window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
       window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
-      setCurrentCoverDomain(snapshot.current_cover_domain);
-      setAvailableCoverDomains(snapshot.available_cover_domains);
-      setRequiresRedeploy(snapshot.requires_redeploy);
+      applyTransportSnapshot(snapshot);
       const deployedAt = new Date().toISOString();
       setLastDeployedAt(deployedAt);
       window.localStorage.setItem(LAST_DEPLOYED_AT_KEY, deployedAt);
@@ -959,8 +1047,9 @@ export function useControlCenter() {
 
     await deployWithProfile(profile, {
       logHeader: "--- REFRESHING LOCAL CONFIGURATION FROM SAVED SERVER PROFILE ---",
-      userMessage:
-        "Refreshing this app from the saved server profile so the local tunnel config matches the active remote transport.",
+      userMessage: isAndroidRuntime
+        ? "Refreshing this phone from the saved server profile so its local config matches the active remote transport."
+        : "Refreshing this app from the saved server profile so the local tunnel config matches the active remote transport.",
     });
   }
 
@@ -981,14 +1070,18 @@ export function useControlCenter() {
         await copyTextToClipboard(inviteLink);
         flashPrimaryInviteCopied();
         setLastUserMessage(
-          "Invite link created and copied. You can now send it to another device.",
+          isAndroidRuntime
+            ? "Phone link created and copied. You can now send it to another Android device."
+            : "Invite link created and copied. You can now send it to another device.",
         );
       } catch (clipboardError) {
         appendLog(
           `[WARN] Invite link was generated, but clipboard copy failed: ${clipboardError}`,
         );
         setLastUserMessage(
-          "Invite link created successfully. Clipboard access was blocked, so copy it from the invite list below.",
+          isAndroidRuntime
+            ? "Phone link created successfully. Clipboard access was blocked, so copy it from the phone link list below."
+            : "Invite link created successfully. Clipboard access was blocked, so copy it from the invite list below.",
         );
       }
     } catch (error) {
@@ -1003,7 +1096,9 @@ export function useControlCenter() {
       await copyTextToClipboard(inviteLink);
       flashIssuedInviteCopied(inviteId);
       setLastUserMessage(
-        "Invite link copied from the master list. You can now send it to another device.",
+        isAndroidRuntime
+          ? "Phone link copied from the master list. You can now send it to another Android device."
+          : "Invite link copied from the master list. You can now send it to another device.",
       );
     } catch (error) {
       appendLog(`[WARN] Failed to copy invite link from the master list: ${error}`);
@@ -1048,6 +1143,50 @@ export function useControlCenter() {
     setInviteLinkError(null);
     setInviteImportSuccessMessage(null);
     setLastAutoImportedInvite(null);
+  }
+
+  async function pasteInviteLinkFromClipboard() {
+    setIsPastingInviteLink(true);
+    setInviteLinkError(null);
+    setInviteImportSuccessMessage(null);
+    setLastAutoImportedInvite(null);
+
+    try {
+      const clipboardText = await readTextFromClipboard();
+      const normalizedClipboard = normalizeInviteLink(clipboardText);
+
+      if (!normalizedClipboard) {
+        setInviteLinkError(
+          isAndroidRuntime
+            ? "The Android clipboard is empty. Copy the phone link from the master app, then tap Paste from Clipboard again."
+            : "The clipboard is empty. Copy the invite link from the master app, then paste it again.",
+        );
+        return;
+      }
+
+      setInviteLinkInput(normalizedClipboard);
+      if (looksLikeInviteLink(normalizedClipboard)) {
+        setLastUserMessage(
+          isAndroidRuntime
+            ? "Phone link pasted from the Android clipboard. Import will begin automatically."
+            : "Invite link pasted from the clipboard. Import will begin automatically.",
+        );
+      } else {
+        setInviteLinkError(
+          isAndroidRuntime
+            ? "Clipboard text does not look like a phone link. It should start with rkn://invite/."
+            : "Clipboard text does not look like an invite link. It should start with rkn://invite/.",
+        );
+      }
+    } catch (error) {
+      setInviteLinkError(
+        isAndroidRuntime
+          ? `Android clipboard access failed: ${error}. You can still paste the phone link manually.`
+          : `Clipboard access failed: ${error}. You can still paste the invite link manually.`,
+      );
+    } finally {
+      setIsPastingInviteLink(false);
+    }
   }
 
   function updateHost(value: string) {
@@ -1301,10 +1440,31 @@ export function useControlCenter() {
 
     try {
       await invoke("check_server_status");
+      await refreshTransportSnapshot({ silent: true });
     } catch (error) {
       appendLog(`[MAIN ERROR] Server status check failed: ${error}`);
     } finally {
       setIsCheckingStatus(false);
+    }
+  }
+
+  async function checkAndroidRoutePolicy() {
+    setIsCheckingAndroidRoutePolicy(true);
+    setLastUserMessage("Auditing Android DNS and route policy.");
+    appendLog("--- CHECKING ANDROID ROUTE POLICY ---");
+
+    try {
+      const summary = await invoke<string>("check_android_route_policy");
+      appendLog(`[SYSTEM] ${summary}`);
+      setLastError(null);
+      setLastUserMessage("Android route policy looks OK. Detailed rule-set data is in the activity log.");
+    } catch (error) {
+      const message = String(error);
+      appendLog(`[MAIN ERROR] Android route policy check failed: ${message}`);
+      setLastError(message);
+      setLastUserMessage("Android route policy check failed. See the activity log for details.");
+    } finally {
+      setIsCheckingAndroidRoutePolicy(false);
     }
   }
 
@@ -1641,35 +1801,22 @@ export function useControlCenter() {
       isAndroidRuntime &&
       androidRuntimeContext?.backend_hint === "android_native_handoff_required"
     ) {
+      const backendReady =
+        androidRuntimeContext.backend_session_state.startsWith("ready") ||
+        androidRuntimeContext.consumer_launch_state.startsWith("ready");
+
       return {
-        title: "Android handoff checkpoint",
-        description:
-          "VpnService already owns the mobile TUN interface. The remaining blocker is the next 6A.4.1 backend that must consume this Android-owned interface instead of the standalone CLI path.",
-        tone: "attention",
+        title: backendReady ? "Android native backend ready" : "Android handoff checkpoint",
+        description: backendReady
+          ? "VpnService and the libbox backend are active. Use Android route diagnostics only when DNS/geodata needs a deeper audit."
+          : "VpnService is preparing the mobile tunnel. If this stays here, run Android route diagnostics.",
+        tone: backendReady ? "ready" : "attention",
         details: [
-          `Handoff session: ${androidRuntimeContext.session_id}`,
           `TUN state: ${androidRuntimeContext.tun_state}`,
-          `TUN fd: ${androidRuntimeContext.tun_fd}`,
           `TUN address: ${androidRuntimeContext.tun_address}/${androidRuntimeContext.tun_prefix_length}`,
           `TUN route: ${androidRuntimeContext.tun_route}`,
-          `TUN mtu: ${androidRuntimeContext.tun_mtu}`,
-          `Config: ${androidRuntimeContext.config_path}`,
-          `Backend config: ${androidRuntimeContext.backend_config_path}`,
-          `Log: ${androidRuntimeContext.log_path}`,
-          `Protect API: ${androidRuntimeContext.protect_api_available ? "available" : "unavailable"}`,
           `Backend session: ${androidRuntimeContext.backend_session_state}`,
-          `Backend session id: ${androidRuntimeContext.backend_session_id}`,
-          `Backend session context: ${androidRuntimeContext.backend_session_context_path}`,
-          `Consumer tag: ${androidRuntimeContext.consumer_tag || "not prepared"}`,
-          `Consumer claim: ${androidRuntimeContext.consumer_claim_state}`,
-          `Consumer claim path: ${androidRuntimeContext.consumer_claim_path || "not created"}`,
-          `Consumer seam: ${androidRuntimeContext.consumer_launch_state || "idle"}`,
           `Consumer runtime: ${androidRuntimeContext.consumer_launch_runtime || "unknown"}`,
-          `Consumer selection: ${androidRuntimeContext.consumer_launch_selection || "not resolved"}`,
-          `Consumer summary: ${androidRuntimeContext.consumer_launch_summary || "not available"}`,
-          `Consumer session dir: ${androidRuntimeContext.consumer_session_dir || "not created"}`,
-          `TUN fd ownership: ${androidRuntimeContext.tun_fd_ownership || "not specified"}`,
-          `Consumer seam status: ${androidRuntimeContext.consumer_launch_path || "not created"}`,
         ],
       };
     }
@@ -1783,6 +1930,7 @@ export function useControlCenter() {
     inviteLinkInput,
     inviteLinkError,
     inviteImportSuccessMessage,
+    isPastingInviteLink,
     issuedInviteLinks,
     primaryInviteCopied,
     copiedInviteId,
@@ -1811,6 +1959,7 @@ export function useControlCenter() {
     isRunning,
     isDeploying,
     isCheckingStatus,
+    isCheckingAndroidRoutePolicy,
     isRotatingSni,
     isResettingLocalData,
     isGeneratingInvite,
@@ -1830,12 +1979,14 @@ export function useControlCenter() {
     stopTunnel,
     deployServer,
     checkServerStatus,
+    checkAndroidRoutePolicy,
     rotateSni,
     generateInviteLink,
     copyExistingInvite,
     openInviteLinkModal,
     closeInviteLinkModal,
     setInviteLinkInput: updateInviteLinkInput,
+    pasteInviteLinkFromClipboard,
     importInviteLink,
     refreshConfiguration,
     resetLocalData,
