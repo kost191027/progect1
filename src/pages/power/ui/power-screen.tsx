@@ -17,23 +17,23 @@ type PowerScreenProps = {
 const STARTING_COPY_STEPS = [
   {
     delayMs: 0,
-    label: "Подождите, я настраиваю туннель",
-    description: "Поднимаю защищенный маршрут и готовлю телефон к подключению.",
+    label: "Please wait while I set up the tunnel",
+    description: "Preparing the secure route and getting this phone ready to connect.",
   },
   {
     delayMs: 4_500,
-    label: "Еще немного и будет готово",
-    description: "Проверяю DNS, маршрут и связь с сервером.",
+    label: "Almost ready",
+    description: "Checking DNS, route policy, and the connection to your server.",
   },
   {
     delayMs: 9_500,
-    label: "Один момент, мы почти в сети",
-    description: "Закрепляю защиту, чтобы приложения пошли через туннель.",
+    label: "One moment, we are nearly online",
+    description: "Locking protection in so apps can start using the tunnel.",
   },
   {
     delayMs: 15_000,
-    label: "Проверяю маршрут и закрепляю защиту",
-    description: "Если сеть только проснулась, даю ей пару секунд стабилизироваться.",
+    label: "Final route check",
+    description: "If the network just woke up, I am giving it a few seconds to settle.",
   },
 ];
 
@@ -47,7 +47,8 @@ export function PowerScreen({
   onStart,
   onStop,
 }: PowerScreenProps) {
-  const isStartingTunnel = isBusy && !isRunning;
+  const isStartingTunnel =
+    isAndroidRuntime && isBusy && !isRunning && statusSummary.state === "connecting";
   const [startingStep, setStartingStep] = useState(0);
   const buttonSizeClass = isAndroidRuntime
     ? "h-40 w-40 sm:h-52 sm:w-52 lg:h-60 lg:w-60"
@@ -64,8 +65,7 @@ export function PowerScreen({
       STARTING_COPY_STEPS[Math.min(startingStep, STARTING_COPY_STEPS.length - 1)].description,
     [startingStep],
   );
-  const visibleQuickStatus =
-    isAndroidRuntime && isStartingTunnel ? startingStatusText : powerQuickStatus;
+  const visibleQuickStatus = powerQuickStatus;
   const visibleStatusSummary =
     isAndroidRuntime && isStartingTunnel
       ? {
@@ -139,7 +139,7 @@ export function PowerScreen({
                 }
               >
                 {isStartingTunnel && isAndroidRuntime
-                  ? "Подождите"
+                  ? "Please wait"
                   : isBusy
                     ? "Working"
                   : isRunning

@@ -182,6 +182,22 @@ function stripLogPrefix(message: string) {
     .trim();
 }
 
+function isAndroidRuntimeTechnicalStatus(message: string) {
+  const normalized = stripLogPrefix(message);
+
+  return [
+    "Android TUN handoff prepared:",
+    "Android backend consumer launch prepared:",
+    "Android native backend seam processed the launch bundle:",
+    "Android native backend is ready:",
+    "Android native backend session started inside the app process.",
+    "Android VPN service anchor is active.",
+    "Android VpnService foreground anchor is ready.",
+    "Android route rule-sets prepared locally",
+    "Starting Android runtime negotiation without desktop elevation",
+  ].some((prefix) => normalized.startsWith(prefix));
+}
+
 function isErrorLog(message: string) {
   const lower = message.toLowerCase();
 
@@ -322,6 +338,10 @@ export function useControlCenter() {
         message.startsWith("[WARN]") ||
         message.startsWith("---")
       ) {
+        if (isAndroidRuntime && isAndroidRuntimeTechnicalStatus(message)) {
+          continue;
+        }
+
         setLastUserMessage(stripLogPrefix(message));
       }
     }
