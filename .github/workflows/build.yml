@@ -88,7 +88,20 @@ jobs:
           echo "VITE_APP_VERSION=${version}" >> "$GITHUB_ENV"
 
       - name: Build Tauri release
-        run: npm run tauri build -- --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set +e
+          npm run tauri build -- --target ${{ matrix.target }}
+          status=$?
+          set -e
+
+          if [[ "${status}" -eq 0 ]]; then
+            exit 0
+          fi
+
+          echo "Tauri macOS bundle failed once. Retrying the same build after cleaning the transient bundle directory..."
+          rm -rf "src-tauri/target/${{ matrix.target }}/release/bundle"
+          npm run tauri build -- --target ${{ matrix.target }}
 
       - name: Normalize release asset names
         id: package
@@ -110,15 +123,12 @@ jobs:
           fi
 
           dmg_name="RKN-${version}-${{ matrix.arch }}.dmg"
-          dmg_alias_name="RKN-latest-${{ matrix.arch }}.dmg"
           app_zip_name="RKN-${version}-${{ matrix.arch }}-app.zip"
 
           cp "${dmg_src}" "${release_dir}/${dmg_name}"
-          cp "${dmg_src}" "${release_dir}/${dmg_alias_name}"
           ditto -c -k --sequesterRsrc --keepParent "${app_src}" "${release_dir}/${app_zip_name}"
 
           echo "dmg_path=${release_dir}/${dmg_name}" >> "$GITHUB_OUTPUT"
-          echo "dmg_alias_path=${release_dir}/${dmg_alias_name}" >> "$GITHUB_OUTPUT"
           echo "app_zip_path=${release_dir}/${app_zip_name}" >> "$GITHUB_OUTPUT"
 
       - name: Upload macOS bundle artifacts
@@ -128,7 +138,6 @@ jobs:
           name: RKN-${{ steps.meta.outputs.version }}-${{ matrix.arch }}
           path: |
             ${{ steps.package.outputs.dmg_path }}
-            ${{ steps.package.outputs.dmg_alias_path }}
             ${{ steps.package.outputs.app_zip_path }}
           retention-days: 14
           compression-level: 0
@@ -145,11 +154,8 @@ jobs:
 
             - `RKN-${{ steps.meta.outputs.version }}-x64.dmg` — Intel Mac
             - `RKN-${{ steps.meta.outputs.version }}-arm64.dmg` — Apple Silicon (M-series)
-            - `RKN-latest-x64.dmg` — stable Intel download link
-            - `RKN-latest-arm64.dmg` — stable Apple Silicon download link
           files: |
             ${{ steps.package.outputs.dmg_path }}
-            ${{ steps.package.outputs.dmg_alias_path }}
 
   build-windows:
     name: Build Windows x64
@@ -227,13 +233,10 @@ jobs:
           fi
 
           setup_name="RKN-${version}-x64-setup.exe"
-          setup_alias_name="RKN-latest-x64-setup.exe"
 
           cp "${setup_src}" "${release_dir}/${setup_name}"
-          cp "${setup_src}" "${release_dir}/${setup_alias_name}"
 
           echo "setup_path=${release_dir}/${setup_name}" >> "$GITHUB_OUTPUT"
-          echo "setup_alias_path=${release_dir}/${setup_alias_name}" >> "$GITHUB_OUTPUT"
 
       - name: Upload Windows bundle artifacts
         if: github.ref_type != 'tag'
@@ -242,7 +245,6 @@ jobs:
           name: RKN-${{ steps.meta.outputs.version }}-windows-x64
           path: |
             ${{ steps.package.outputs.setup_path }}
-            ${{ steps.package.outputs.setup_alias_path }}
           retention-days: 14
           compression-level: 0
 
@@ -253,4 +255,194 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: |
             ${{ steps.package.outputs.setup_path }}
-            ${{ steps.package.outputs.setup_alias_path }}
+
+  build-android:
+    name: Build Android arm64
+    runs-on: ubuntu-latest
+    env:
+      VITE_APP_BUILD: ${{ github.run_number }}
+      VITE_GITHUB_RUN_NUMBER: ${{ github.run_number }}
+      ANDROID_NATIVE_BACKEND_RUNTIME: libbox
+      RKN_LIBBOX_ANDROID_PLATFORM: android/arm64
+      RKN_LIBBOX_WITH_TAILSCALE: "0"
+      RKN_ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
+      ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
+      NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
+      NDK: /usr/local/lib/android/sdk/ndk/29.0.14206865
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.24.7
+          cache: true
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;29.0.14206865"
+          test -f "${RKN_ANDROID_NDK_HOME}/source.properties"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Verify version sync
+        run: npm run version:check
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+
+          if [[ "${REF_TYPE}" == "tag" ]]; then
+            tag_version="${REF_NAME#v}"
+            if [[ -n "${tag_version}" && "${tag_version}" != "${version}" ]]; then
+              echo "Tag version ${tag_version} does not match package.json version ${version}."
+              exit 1
+            fi
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "VITE_APP_VERSION=${version}" >> "$GITHUB_ENV"
+
+      - name: Prepare libbox Android runtime
+        run: npm run android:libbox:prepare
+
+      - name: Validate Android build environment
+        run: npm run android:doctor
+
+      - name: Build Android APK
+        shell: bash
+        run: |
+          set +e
+          npm run tauri:android:build:apk
+          status=$?
+          set -e
+
+          if [[ "${status}" -eq 0 ]]; then
+            exit 0
+          fi
+
+          echo "::group::Android Gradle failure diagnostics"
+          src-tauri/gen/android/gradlew \
+            --project-dir src-tauri/gen/android \
+            :app:assembleUniversalRelease \
+            --stacktrace \
+            --warning-mode all \
+            --console=plain || true
+          echo "::endgroup::"
+
+          exit "${status}"
+
+      - name: Build Android AAB
+        shell: bash
+        run: |
+          set +e
+          npm run tauri:android:build:aab
+          status=$?
+          set -e
+
+          if [[ "${status}" -eq 0 ]]; then
+            exit 0
+          fi
+
+          echo "::group::Android Gradle bundle diagnostics"
+          src-tauri/gen/android/gradlew \
+            --project-dir src-tauri/gen/android \
+            :app:bundleUniversalRelease \
+            --stacktrace \
+            --warning-mode all \
+            --console=plain || true
+          echo "::endgroup::"
+
+          exit "${status}"
+
+      - name: Normalize Android release asset names
+        id: package
+        shell: bash
+        run: |
+          version="${{ steps.meta.outputs.version }}"
+          release_dir="dist/release/android-arm64"
+          mkdir -p "${release_dir}"
+
+          apk_src="$(find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' | head -n 1)"
+          aab_src="$(find src-tauri/gen/android/app/build/outputs -type f -name '*.aab' | head -n 1)"
+
+          if [[ -z "${apk_src}" ]]; then
+            echo "Expected Android APK artifact was not produced."
+            find src-tauri/gen/android/app/build/outputs -type f | sort || true
+            exit 1
+          fi
+
+          if [[ -z "${aab_src}" ]]; then
+            echo "Expected Android AAB artifact was not produced."
+            find src-tauri/gen/android/app/build/outputs -type f | sort || true
+            exit 1
+          fi
+
+          apk_name="RKN-${version}-android-arm64.apk"
+          aab_name="RKN-${version}-android-arm64.aab"
+
+          cp "${apk_src}" "${release_dir}/${apk_name}"
+          cp "${aab_src}" "${release_dir}/${aab_name}"
+
+          echo "apk_path=${release_dir}/${apk_name}" >> "$GITHUB_OUTPUT"
+          echo "aab_path=${release_dir}/${aab_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Android bundle artifacts
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: RKN-${{ steps.meta.outputs.version }}-android-arm64
+          path: |
+            ${{ steps.package.outputs.apk_path }}
+            ${{ steps.package.outputs.aab_path }}
+          retention-days: 14
+          compression-level: 0
+
+      - name: Publish release assets for Android arm64
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            ${{ steps.package.outputs.apk_path }}
+            ${{ steps.package.outputs.aab_path }}

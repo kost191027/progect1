@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -71,6 +71,7 @@ pushCheck(
 );
 
 const ndkHome = firstExistingDir([
+  process.env.RKN_ANDROID_NDK_HOME,
   process.env.NDK_HOME,
   process.env.ANDROID_NDK_HOME,
   fallbackNdkHome,
@@ -104,18 +105,44 @@ pushCheck(
   commandExists("sdkmanager", ["--version"]) ? "ok" : "missing",
 );
 
+function resolvePrebuiltBin(ndkPath) {
+  const prebuiltRoot = join(ndkPath || "", "toolchains", "llvm", "prebuilt");
+  if (!existsSync(prebuiltRoot)) {
+    return "";
+  }
+
+  const platform = process.platform;
+  const arch = process.arch === "arm64" ? "aarch64" : "x86_64";
+  const preferredHostTag =
+    platform === "darwin"
+      ? `darwin-${arch}`
+      : platform === "linux"
+        ? "linux-x86_64"
+        : platform === "win32"
+          ? "windows-x86_64"
+          : "";
+  const preferredBin = preferredHostTag
+    ? join(prebuiltRoot, preferredHostTag, "bin")
+    : "";
+
+  if (preferredBin && existsSync(join(preferredBin, "llvm-ranlib"))) {
+    return preferredBin;
+  }
+
+  const discovered =
+    readdirSync(prebuiltRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(prebuiltRoot, entry.name, "bin"))
+      .find((binDir) => existsSync(join(binDir, "llvm-ranlib"))) || "";
+
+  return discovered;
+}
+
+const llvmBin = resolvePrebuiltBin(ndkHome);
 const androidRanlib =
   process.env.TARGET_RANLIB ||
   process.env.RANLIB_aarch64_linux_android ||
-  join(
-    ndkHome || "",
-    "toolchains",
-    "llvm",
-    "prebuilt",
-    "darwin-x86_64",
-    "bin",
-    "llvm-ranlib",
-  );
+  (llvmBin ? join(llvmBin, "llvm-ranlib") : "");
 
 pushCheck(
   "Android llvm-ranlib",
