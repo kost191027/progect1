@@ -37,6 +37,14 @@ export type SavedServerProfile = {
   password: string;
 };
 
+export type SavedServerProfileEntry = {
+  id: string;
+  host: string;
+  user: string;
+  saved_at: number;
+  is_active: boolean;
+};
+
 export type AppRole = "master" | "subordinate";
 export type WindowsRuntimeMode = "tun" | "compatibility";
 export type TransportProtocol = "shadowtls" | "vless";
@@ -51,13 +59,34 @@ export type TransportStateSnapshot = {
 export type IssuedInviteLink = {
   id: string;
   link: string;
+  shadowtls_link: string;
+  vless_link: string | null;
+  vless_available: boolean;
   host: string;
   cover_domain: string;
   generated_at: number;
 };
 
+export type ImportedInviteProfile = {
+  id: string;
+  link: string;
+  host: string;
+  cover_domain: string;
+  preferred_transport: TransportProtocol;
+  generated_at: number;
+  imported_at: number;
+  is_active: boolean;
+};
+
 type GeneratedInviteLinkResult = {
   link: string;
+  shadowtls_link: string;
+  vless_link: string | null;
+};
+
+type RegeneratedVlessInviteLinkResult = {
+  invite_id: string;
+  vless_link: string;
 };
 
 type LocalInstallationState = {
@@ -266,6 +295,9 @@ export function useControlCenter() {
     return window.localStorage.getItem(SERVER_DRAFT_PASSWORD_KEY) ?? "";
   });
   const [savedProfile, setSavedProfile] = useState<SavedServerProfile | null>(null);
+  const [savedServerProfiles, setSavedServerProfiles] = useState<
+    SavedServerProfileEntry[]
+  >([]);
   const [currentCoverDomain, setCurrentCoverDomain] = useState<string | null>(() => {
     return window.localStorage.getItem(SUBORDINATE_COVER_DOMAIN_KEY);
   });
@@ -278,6 +310,7 @@ export function useControlCenter() {
   const [inviteImportSuccessMessage, setInviteImportSuccessMessage] = useState<string | null>(null);
   const [isPastingInviteLink, setIsPastingInviteLink] = useState(false);
   const [issuedInviteLinks, setIssuedInviteLinks] = useState<IssuedInviteLink[]>([]);
+  const [importedInviteProfiles, setImportedInviteProfiles] = useState<ImportedInviteProfile[]>([]);
   const [primaryInviteCopied, setPrimaryInviteCopied] = useState(false);
   const [copiedInviteId, setCopiedInviteId] = useState<string | null>(null);
   const [isInviteServerSyncPending, setIsInviteServerSyncPending] = useState(false);
@@ -302,6 +335,9 @@ export function useControlCenter() {
   const [isCreatingWarpProfile, setIsCreatingWarpProfile] = useState(false);
   const [isImportingWarpProfile, setIsImportingWarpProfile] = useState(false);
   const [isClearingWarpProfile, setIsClearingWarpProfile] = useState(false);
+  const [deletingServerProfileId, setDeletingServerProfileId] = useState<string | null>(
+    null,
+  );
   const [logs, setLogs] = useState<string[]>([]);
   const [trimmedLogCount, setTrimmedLogCount] = useState(0);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -668,7 +704,55 @@ export function useControlCenter() {
       }
     }
 
+    async function loadSavedServerProfiles() {
+      if (appRole !== "master") {
+        setSavedServerProfiles([]);
+        return;
+      }
+
+      try {
+        const profiles = await invoke<SavedServerProfileEntry[]>(
+          "list_saved_server_profiles",
+        );
+        if (!isMounted) {
+          return;
+        }
+
+        setSavedServerProfiles(profiles);
+      } catch (error) {
+        if (!isMounted) {
+          return;
+        }
+
+        appendLog(`[WARN] Failed to load saved server profiles: ${error}`);
+      }
+    }
+
+    async function loadImportedInviteProfiles() {
+      if (appRole !== "subordinate") {
+        setImportedInviteProfiles([]);
+        return;
+      }
+
+      try {
+        const profiles = await invoke<ImportedInviteProfile[]>("list_imported_invite_profiles");
+        if (!isMounted) {
+          return;
+        }
+
+        setImportedInviteProfiles(profiles);
+      } catch (error) {
+        if (!isMounted) {
+          return;
+        }
+
+        appendLog(`[WARN] Failed to load imported invite profiles: ${error}`);
+      }
+    }
+
     void loadIssuedInvites();
+    void loadSavedServerProfiles();
+    void loadImportedInviteProfiles();
 
     return () => {
       isMounted = false;
@@ -1039,9 +1123,10 @@ export function useControlCenter() {
     options: {
       logHeader: string;
       userMessage: string;
+      skipReplacementConfirm?: boolean;
     },
   ) {
-    if (shouldConfirmProfileReplacement(savedProfile, profile)) {
+    if (!options.skipReplacementConfirm && shouldConfirmProfileReplacement(savedProfile, profile)) {
       const confirmed = window.confirm(
         [
           `This will replace the active server profile on this device.`,
@@ -1085,6 +1170,7 @@ export function useControlCenter() {
       const deployedAt = new Date().toISOString();
       setLastDeployedAt(deployedAt);
       window.localStorage.setItem(LAST_DEPLOYED_AT_KEY, deployedAt);
+      await refreshSavedServerProfiles();
     } catch (error) {
       appendLog(`[MAIN ERROR] Deploy failed: ${error}`);
     } finally {
@@ -1106,8 +1192,115 @@ export function useControlCenter() {
       logHeader: "--- REFRESHING LOCAL CONFIGURATION FROM SAVED SERVER PROFILE ---",
       userMessage: isAndroidRuntime
         ? "Refreshing this phone from the saved server profile so its local config matches the active remote transport."
-        : "Refreshing this app from the saved server profile so the local tunnel config matches the active remote transport.",
+      : "Refreshing this app from the saved server profile so the local tunnel config matches the active remote transport.",
     });
+  }
+
+  async function refreshSavedServerProfiles() {
+    if (appRole !== "master") {
+      setSavedServerProfiles([]);
+      return;
+    }
+
+    const profiles = await invoke<SavedServerProfileEntry[]>("list_saved_server_profiles");
+    setSavedServerProfiles(profiles);
+  }
+
+  async function addCurrentServerProfile() {
+    if (!host || !user || !password) {
+      appendLog("[MAIN ERROR] Please fill in Server IP, Login, and Password before saving.");
+      return;
+    }
+
+    try {
+      const profile = await invoke<SavedServerProfile>("add_saved_server_profile", {
+        host,
+        user,
+        password,
+      });
+      setSavedProfile(profile);
+      setAppRole("master");
+      window.localStorage.setItem(APP_ROLE_KEY, "master");
+      window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
+      window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
+      await refreshSavedServerProfiles();
+      setLastUserMessage(`Saved server ${profile.host} to the local server library.`);
+      appendLog(`[SYSTEM] Saved server ${profile.host} to the local server library.`);
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Failed to save server profile: ${error}`);
+    }
+  }
+
+  async function activateSavedServerProfile(profileId: string) {
+    try {
+      const profile = await invoke<SavedServerProfile>("activate_saved_server_profile", {
+        profileId,
+      });
+      setHost(profile.host);
+      setUser(profile.user);
+      setPassword(profile.password);
+      setSavedProfile(profile);
+      setAppRole("master");
+      setRequiresInviteRefresh(false);
+      window.localStorage.setItem(APP_ROLE_KEY, "master");
+      window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
+      window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
+      appendLog(`[SYSTEM] Saved server ${profile.host} selected.`);
+      await deployWithProfile(profile, {
+        logHeader: "--- SWITCHING TO SAVED SERVER ---",
+        userMessage:
+          "Switching to the selected saved server and refreshing the local tunnel config.",
+        skipReplacementConfirm: true,
+      });
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Failed to activate saved server profile: ${error}`);
+    }
+  }
+
+  async function deleteSavedServerProfile(profileId: string) {
+    const confirmed = window.confirm(
+      [
+        "Delete this saved server from this device?",
+        "",
+        "This only removes local credentials. It does not delete the remote VPS.",
+      ].join("\n"),
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingServerProfileId(profileId);
+
+    try {
+      const deletedProfile = savedServerProfiles.find((profile) => profile.id === profileId);
+      await invoke("delete_saved_server_profile", { profileId });
+      const nextSavedProfile = await invoke<SavedServerProfile | null>(
+        "load_saved_server_profile",
+      );
+      if (nextSavedProfile) {
+        setSavedProfile(nextSavedProfile);
+        setHost(nextSavedProfile.host);
+        setUser(nextSavedProfile.user);
+        setPassword(nextSavedProfile.password);
+      } else if (deletedProfile?.is_active) {
+        setSavedProfile(null);
+        setHost("");
+        setUser("root");
+        setPassword("");
+        setCurrentCoverDomain(null);
+        setAvailableCoverDomains([]);
+        setRequiresRedeploy(false);
+        setRequiresInviteRefresh(false);
+      }
+      await refreshSavedServerProfiles();
+      setLastUserMessage("Saved server removed from this device.");
+      appendLog("[SYSTEM] Saved server removed from this device.");
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Failed to delete saved server profile: ${error}`);
+    } finally {
+      setDeletingServerProfileId(null);
+    }
   }
 
   async function generateInviteLink() {
@@ -1119,7 +1312,7 @@ export function useControlCenter() {
 
     try {
       const result = await invoke<GeneratedInviteLinkResult>("generate_invite_link");
-      const inviteLink = result.link;
+      const inviteLink = result.shadowtls_link || result.link;
       const invites = await invoke<IssuedInviteLink[]>("list_issued_invite_links");
       setIssuedInviteLinks(invites);
 
@@ -1159,6 +1352,28 @@ export function useControlCenter() {
       );
     } catch (error) {
       appendLog(`[WARN] Failed to copy invite link from the master list: ${error}`);
+    }
+  }
+
+  async function regenerateInviteVlessLink(inviteId: string) {
+    setInviteSyncTone("pending");
+    setInviteSyncMessage("Preparing a VLESS link for this invite and syncing it to the server.");
+    setLastUserMessage("Preparing a VLESS invite link from the active remote transport.");
+
+    try {
+      const result = await invoke<RegeneratedVlessInviteLinkResult>(
+        "regenerate_invite_vless_link",
+        { inviteId },
+      );
+      const invites = await invoke<IssuedInviteLink[]>("list_issued_invite_links");
+      setIssuedInviteLinks(invites);
+      await copyTextToClipboard(result.vless_link);
+      flashIssuedInviteCopied(`${result.invite_id}:vless`);
+      setLastUserMessage("VLESS invite link created and copied.");
+    } catch (error) {
+      setInviteSyncTone("warning");
+      setInviteSyncMessage("VLESS link regeneration failed. Create a new invite if this link is too old.");
+      appendLog(`[MAIN ERROR] Failed to regenerate VLESS invite link: ${error}`);
     }
   }
 
@@ -1522,6 +1737,10 @@ export function useControlCenter() {
       setWarpProfileInput("");
       setWarpProfileMessage(null);
       setIssuedInviteLinks([]);
+      const importedProfiles = await invoke<ImportedInviteProfile[]>(
+        "list_imported_invite_profiles",
+      );
+      setImportedInviteProfiles(importedProfiles);
       setPrimaryInviteCopied(false);
       setCopiedInviteId(null);
       setIsInviteServerSyncPending(false);
@@ -1552,6 +1771,46 @@ export function useControlCenter() {
       appendLog(`[MAIN ERROR] Invite link import failed: ${message}`);
     } finally {
       setIsImportingInvite(false);
+    }
+  }
+
+  async function activateImportedInviteProfile(profileId: string) {
+    setIsImportingInvite(true);
+    setLastError(null);
+    setLastUserMessage("Switching to the selected imported link and rebuilding the client config.");
+
+    try {
+      const result = await invoke<InviteImportResult>("activate_imported_invite_profile", {
+        profileId,
+      });
+      const profiles = await invoke<ImportedInviteProfile[]>("list_imported_invite_profiles");
+      setImportedInviteProfiles(profiles);
+      window.localStorage.setItem(SUBORDINATE_HOST_KEY, result.host);
+      window.localStorage.setItem(SUBORDINATE_COVER_DOMAIN_KEY, result.cover_domain);
+      setHost(result.host);
+      setCurrentCoverDomain(result.cover_domain);
+      setRequiresInviteRefresh(false);
+      setLastUserMessage(`Imported link activated for ${result.host}.`);
+      appendLog("[SYSTEM] Imported invite profile activated.");
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Failed to activate imported invite profile: ${error}`);
+    } finally {
+      setIsImportingInvite(false);
+    }
+  }
+
+  async function deleteImportedInviteProfile(profileId: string) {
+    setDeletingInviteId(profileId);
+
+    try {
+      await invoke("delete_imported_invite_profile", { profileId });
+      const profiles = await invoke<ImportedInviteProfile[]>("list_imported_invite_profiles");
+      setImportedInviteProfiles(profiles);
+      setLastUserMessage("Imported link removed from this device.");
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Failed to delete imported invite profile: ${error}`);
+    } finally {
+      setDeletingInviteId(null);
     }
   }
 
@@ -1658,7 +1917,9 @@ export function useControlCenter() {
       setUser("root");
       setPassword("");
       setSavedProfile(null);
+      setSavedServerProfiles([]);
       setIssuedInviteLinks([]);
+      setImportedInviteProfiles([]);
       setCurrentCoverDomain(null);
       setAvailableCoverDomains([]);
       setRequiresRedeploy(false);
@@ -2050,6 +2311,7 @@ export function useControlCenter() {
     user,
     password,
     savedProfile,
+    savedServerProfiles,
     currentCoverDomain,
     availableCoverDomains,
     requiresRedeploy,
@@ -2060,6 +2322,7 @@ export function useControlCenter() {
     inviteImportSuccessMessage,
     isPastingInviteLink,
     issuedInviteLinks,
+    importedInviteProfiles,
     primaryInviteCopied,
     copiedInviteId,
     isInviteServerSyncPending,
@@ -2098,6 +2361,7 @@ export function useControlCenter() {
     isCreatingWarpProfile,
     isImportingWarpProfile,
     isClearingWarpProfile,
+    deletingServerProfileId,
     deletingInviteId,
     isStarting,
     isStopping,
@@ -2110,11 +2374,17 @@ export function useControlCenter() {
     startTunnel,
     stopTunnel,
     deployServer,
+    addCurrentServerProfile,
+    activateSavedServerProfile,
+    deleteSavedServerProfile,
     checkServerStatus,
     checkAndroidRoutePolicy,
     rotateSni,
     generateInviteLink,
+    regenerateInviteVlessLink,
     copyExistingInvite,
+    activateImportedInviteProfile,
+    deleteImportedInviteProfile,
     openInviteLinkModal,
     closeInviteLinkModal,
     setInviteLinkInput: updateInviteLinkInput,

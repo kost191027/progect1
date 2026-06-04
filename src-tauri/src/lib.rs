@@ -85,7 +85,7 @@ enum WindowsRuntimeMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum TransportProtocol {
+pub(crate) enum TransportProtocol {
     Shadowtls,
     Vless,
 }
@@ -172,7 +172,7 @@ fn load_selected_transport_protocol(app: &AppHandle) -> Result<TransportProtocol
     })
 }
 
-fn save_selected_transport_protocol(
+pub(crate) fn save_selected_transport_protocol(
     app: &AppHandle,
     protocol: TransportProtocol,
 ) -> Result<(), String> {
@@ -7509,6 +7509,8 @@ async fn reset_local_data(app: AppHandle) -> Result<(), String> {
     }
 
     ssh::clear_issued_invites(&app)?;
+    ssh::clear_imported_invites(&app)?;
+    ssh::clear_saved_server_profiles(&app)?;
     ssh::clear_local_warp_profile_sync(&app)?;
     ssh::clear_cached_transport_bootstrap(&app)?;
     ssh::clear_backend_app_role(&app)?;
@@ -8225,11 +8227,19 @@ pub fn run() {
             get_android_vpn_permission_status,
             ssh::deploy_server,
             ssh::generate_invite_link,
+            ssh::regenerate_invite_vless_link,
             ssh::import_invite_link,
+            ssh::list_imported_invite_profiles,
+            ssh::activate_imported_invite_profile,
+            ssh::delete_imported_invite_profile,
             ssh::get_local_installation_state,
             ssh::list_issued_invite_links,
             ssh::delete_issued_invite_link,
             ssh::get_transport_state_snapshot,
+            ssh::list_saved_server_profiles,
+            ssh::add_saved_server_profile,
+            ssh::activate_saved_server_profile,
+            ssh::delete_saved_server_profile,
             ssh::load_saved_server_profile,
             ssh::get_local_warp_profile_status,
             ssh::import_local_warp_profile,

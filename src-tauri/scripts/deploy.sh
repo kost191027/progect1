@@ -109,6 +109,11 @@ fi
 echo "[INFO] Pulling pinned sing-box image..."
 docker pull "$IMAGE"
 
+echo "[INFO] Validating candidate sing-box server config..."
+docker run --rm \
+    -v "$CANDIDATE_CONFIG:/etc/sing-box/config.json:ro" \
+    "$IMAGE" check -c /etc/sing-box/config.json
+
 if [ -f "$ACTIVE_CONTAINER_FILE" ]; then
     PREVIOUS_CONTAINER="$(cat "$ACTIVE_CONTAINER_FILE" 2>/dev/null || true)"
 fi

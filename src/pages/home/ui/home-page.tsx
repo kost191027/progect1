@@ -89,12 +89,14 @@ export function HomePage({ controlCenter }: HomePageProps) {
         host={controlCenter.host}
         user={controlCenter.user}
         password={controlCenter.password}
+        savedServerProfiles={controlCenter.savedServerProfiles}
         isRunning={controlCenter.isRunning}
         isDeploying={controlCenter.isDeploying}
         isResettingLocalData={controlCenter.isResettingLocalData}
         isCreatingWarpProfile={controlCenter.isCreatingWarpProfile}
         isImportingWarpProfile={controlCenter.isImportingWarpProfile}
         isClearingWarpProfile={controlCenter.isClearingWarpProfile}
+        deletingServerProfileId={controlCenter.deletingServerProfileId}
         deployActionLabel={controlCenter.deployActionLabel}
         hasLocalWarpProfile={controlCenter.localWarpProfileStatus.has_profile}
         localWarpEndpoint={
@@ -117,6 +119,9 @@ export function HomePage({ controlCenter }: HomePageProps) {
         onWarpProfileInputChange={controlCenter.setWarpProfileInput}
         onWindowsRuntimeModeChange={controlCenter.setWindowsRuntimeMode}
         onDeploy={controlCenter.deployServer}
+        onAddServerProfile={controlCenter.addCurrentServerProfile}
+        onActivateServerProfile={controlCenter.activateSavedServerProfile}
+        onDeleteServerProfile={controlCenter.deleteSavedServerProfile}
         onResetLocalData={controlCenter.resetLocalData}
         onCreateWarpProfile={controlCenter.createWarpProfile}
         onImportWarpProfile={controlCenter.importWarpProfile}
@@ -175,6 +180,7 @@ export function HomePage({ controlCenter }: HomePageProps) {
       deletingInviteId={controlCenter.deletingInviteId}
       inviteImportSuccessMessage={controlCenter.inviteImportSuccessMessage}
       issuedInviteLinks={controlCenter.issuedInviteLinks}
+      importedInviteProfiles={controlCenter.importedInviteProfiles}
       primaryInviteCopied={controlCenter.primaryInviteCopied}
       copiedInviteId={controlCenter.copiedInviteId}
       isInviteServerSyncPending={controlCenter.isInviteServerSyncPending}
@@ -185,6 +191,9 @@ export function HomePage({ controlCenter }: HomePageProps) {
       onEnterInvite={controlCenter.openInviteLinkModal}
       onResetLocalData={controlCenter.resetLocalData}
       onCopyExistingInvite={controlCenter.copyExistingInvite}
+      onRegenerateInviteVlessLink={controlCenter.regenerateInviteVlessLink}
+      onActivateImportedInviteProfile={controlCenter.activateImportedInviteProfile}
+      onDeleteImportedInviteProfile={controlCenter.deleteImportedInviteProfile}
       onDeleteInvite={controlCenter.deleteIssuedInviteLink}
       collapsible
       defaultOpen={false}

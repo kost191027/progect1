@@ -502,16 +502,35 @@ pub(crate) fn verify_external_port_reachable(host: &str, external_port: u16) -> 
 fn summarize_transport_smoke_error(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
     if lower.contains("timed out") || lower.contains("context deadline exceeded") {
-        "ShadowTLS/Shadowsocks handshake timed out from this client".to_string()
+        "transport handshake timed out from this client".to_string()
     } else if lower.contains("hmac mismatch") || lower.contains("verify failed") {
         "ShadowTLS secret or cover-domain handshake was rejected by the server".to_string()
     } else if lower.contains("connection refused") {
         "transport port is reachable by TCP scan but refused the real proxy session".to_string()
     } else if lower.contains("eof") {
-        "transport connection closed during ShadowTLS/Shadowsocks handshake".to_string()
+        "transport connection closed during handshake".to_string()
     } else {
         "client transport smoke-check failed".to_string()
     }
+}
+
+#[cfg(not(target_os = "android"))]
+fn client_config_has_outbound_tag(client_cfg: &str, tag: &str) -> Result<bool, String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(client_cfg).map_err(|e| {
+        format!(
+            "Failed to parse generated client config for smoke-check outbound audit: {}",
+            e
+        )
+    })?;
+
+    Ok(parsed
+        .get("outbounds")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|outbounds| {
+            outbounds.iter().any(|outbound| {
+                outbound.get("tag").and_then(serde_json::Value::as_str) == Some(tag)
+            })
+        }))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -537,6 +556,63 @@ fn build_client_transport_smoke_config(client_cfg: &str) -> Result<String, Strin
 }
 
 #[cfg(not(target_os = "android"))]
+fn validate_local_client_config(
+    app: &AppHandle,
+    local_data: &std::path::Path,
+    client_cfg: &str,
+) -> Result<(), String> {
+    std::fs::create_dir_all(local_data).map_err(|e| e.to_string())?;
+    let check_cfg_path = local_data.join("client_config.candidate.check.json");
+    std::fs::write(&check_cfg_path, client_cfg).map_err(|e| {
+        format!(
+            "Failed to write client config candidate {}: {}",
+            check_cfg_path.display(),
+            e
+        )
+    })?;
+
+    let singbox_path = crate::resolve_singbox_path(app)?;
+    let output = std::process::Command::new(&singbox_path)
+        .args([
+            "--disable-color",
+            "check",
+            "-c",
+            check_cfg_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .map_err(|e| {
+            format!(
+                "Failed to start bundled sing-box client config validation with {}: {}",
+                singbox_path, e
+            )
+        });
+
+    let _ = std::fs::remove_file(&check_cfg_path);
+
+    let output = output?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "Generated client config failed bundled sing-box validation. stdout: {} stderr: {}",
+        stdout.trim(),
+        stderr.trim()
+    ))
+}
+
+#[cfg(target_os = "android")]
+fn validate_local_client_config(
+    _app: &AppHandle,
+    _local_data: &std::path::Path,
+    _client_cfg: &str,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
 fn run_client_transport_smoke_check(
     app: &AppHandle,
     local_data: &std::path::Path,
@@ -554,16 +630,55 @@ fn run_client_transport_smoke_check(
     })?;
 
     let singbox_path = crate::resolve_singbox_path(app)?;
+    let mut required_outbounds = vec![("ShadowTLS/Shadowsocks", "proxy")];
+    if client_config_has_outbound_tag(client_cfg, "vless-proxy")? {
+        required_outbounds.push(("VLESS", "vless-proxy"));
+    }
+
+    let mut errors = Vec::new();
+    for (label, outbound_tag) in required_outbounds {
+        match run_client_transport_smoke_check_for_outbound(
+            &singbox_path,
+            &smoke_cfg_path,
+            label,
+            outbound_tag,
+        ) {
+            Ok(()) => {}
+            Err(error) => errors.push(error),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn run_client_transport_smoke_check_for_outbound(
+    singbox_path: &str,
+    smoke_cfg_path: &std::path::Path,
+    label: &str,
+    outbound_tag: &str,
+) -> Result<(), String> {
     let mut errors = Vec::new();
     for target_url in TRANSPORT_SMOKE_TARGETS {
-        match run_client_transport_smoke_check_once(&singbox_path, &smoke_cfg_path, target_url) {
+        match run_client_transport_smoke_check_once(
+            singbox_path,
+            smoke_cfg_path,
+            outbound_tag,
+            target_url,
+        ) {
             Ok(()) => return Ok(()),
             Err(error) => errors.push(format!("{} => {}", target_url, error)),
         }
     }
 
     Err(format!(
-        "all transport smoke targets failed: {}",
+        "{} smoke-check failed for outbound `{}`: all targets failed: {}",
+        label,
+        outbound_tag,
         errors.join("; ")
     ))
 }
@@ -572,6 +687,7 @@ fn run_client_transport_smoke_check(
 fn run_client_transport_smoke_check_once(
     singbox_path: &str,
     smoke_cfg_path: &std::path::Path,
+    outbound_tag: &str,
     target_url: &str,
 ) -> Result<(), String> {
     let mut child = std::process::Command::new(singbox_path)
@@ -582,7 +698,7 @@ fn run_client_transport_smoke_check_once(
             "-c",
             smoke_cfg_path.to_string_lossy().as_ref(),
             "-o",
-            "proxy",
+            outbound_tag,
             target_url,
         ])
         .stdout(std::process::Stdio::piped())
@@ -953,7 +1069,14 @@ pub async fn deploy_server(
             emit_ssh_stage(
                 &app,
                 "VALIDATE",
-                "Running local ShadowTLS transport smoke-check before accepting the existing server...",
+                "Checking generated client config with bundled sing-box before saving it...",
+            );
+            validate_local_client_config(&app, &local_data, &client_cfg)?;
+
+            emit_ssh_stage(
+                &app,
+                "VALIDATE",
+                "Running local ShadowTLS/VLESS transport smoke-check before accepting the existing server...",
             );
             if let Err(error) = run_client_transport_smoke_check(&app, &local_data, &client_cfg) {
                 let _ = app.emit(
@@ -1276,7 +1399,14 @@ pub async fn deploy_server(
         emit_ssh_stage(
             &deploy_app,
             "VALIDATE",
-            "Running local ShadowTLS transport smoke-check through the generated proxy outbound...",
+            "Checking generated client config with bundled sing-box before saving it...",
+        );
+        validate_local_client_config(&deploy_app, &local_data, &client_cfg)?;
+
+        emit_ssh_stage(
+            &deploy_app,
+            "VALIDATE",
+            "Running local ShadowTLS/VLESS transport smoke-check through the generated transport outbounds...",
         );
         if let Err(error) = run_client_transport_smoke_check(&deploy_app, &local_data, &client_cfg) {
             let _ = deploy_app.emit(
@@ -1290,7 +1420,7 @@ pub async fn deploy_server(
             emit_ssh_stage(
                 &deploy_app,
                 "VALIDATE",
-                "Client transport smoke-check passed. Handshake is accepted.",
+                "Client transport smoke-check passed for all provisioned transport outbounds. Handshake is accepted.",
             );
         }
 

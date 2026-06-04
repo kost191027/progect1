@@ -5,7 +5,7 @@ mod warp;
 
 // ── Crate-visible helpers used by lib.rs ────────────────────────────────────
 
-pub(crate) use invite::clear_issued_invites;
+pub(crate) use invite::{clear_imported_invites, clear_issued_invites};
 #[cfg(target_os = "android")]
 pub(crate) use status::ensure_local_transport_is_current;
 #[cfg(not(target_os = "android"))]
@@ -78,6 +78,24 @@ pub struct SavedServerProfile {
     pub host: String,
     pub user: String,
     pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredServerProfile {
+    id: String,
+    host: String,
+    user: String,
+    password: String,
+    saved_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SavedServerProfileEntry {
+    id: String,
+    host: String,
+    user: String,
+    saved_at: u64,
+    is_active: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -723,6 +741,11 @@ pub(crate) fn server_profile_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(local_data.join("server_profile.json"))
 }
 
+fn saved_server_profiles_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    Ok(local_data.join("saved_server_profiles.json"))
+}
+
 fn server_profile_archive_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     Ok(local_data.join("server_profiles"))
@@ -753,6 +776,62 @@ fn archived_server_profile_path(
     Ok(archive_dir.join(format!("{host}__{user}.json")))
 }
 
+fn saved_server_profile_id(profile: &SavedServerProfile) -> String {
+    format!(
+        "{}__{}",
+        sanitize_profile_key_segment(&profile.host),
+        sanitize_profile_key_segment(&profile.user)
+    )
+}
+
+fn load_saved_server_profile_records(app: &AppHandle) -> Result<Vec<StoredServerProfile>, String> {
+    let profiles_path = saved_server_profiles_path(app)?;
+    if !profiles_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let contents = std::fs::read_to_string(&profiles_path).map_err(|e| e.to_string())?;
+    serde_json::from_str::<Vec<StoredServerProfile>>(&contents)
+        .map_err(|e| format!("Failed to parse saved server profiles JSON: {}", e))
+}
+
+fn save_saved_server_profile_records(
+    app: &AppHandle,
+    profiles: &[StoredServerProfile],
+) -> Result<(), String> {
+    let profiles_path = saved_server_profiles_path(app)?;
+    if let Some(parent) = profiles_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let json = serde_json::to_vec_pretty(profiles).map_err(|e| e.to_string())?;
+    std::fs::write(profiles_path, json).map_err(|e| e.to_string())
+}
+
+fn upsert_saved_server_profile_record(
+    app: &AppHandle,
+    profile: &SavedServerProfile,
+) -> Result<(), String> {
+    let mut profiles = load_saved_server_profile_records(app)?;
+    let id = saved_server_profile_id(profile);
+    let saved_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    profiles.retain(|record| record.id != id);
+    profiles.insert(
+        0,
+        StoredServerProfile {
+            id,
+            host: profile.host.clone(),
+            user: profile.user.clone(),
+            password: profile.password.clone(),
+            saved_at,
+        },
+    );
+    save_saved_server_profile_records(app, &profiles)
+}
+
 fn backend_app_role_path(app: &AppHandle) -> Result<PathBuf, String> {
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     Ok(local_data.join("app_role.json"))
@@ -774,13 +853,24 @@ pub(crate) fn save_server_profile(
 
     let profile_json = serde_json::to_vec_pretty(profile).map_err(|e| e.to_string())?;
     std::fs::write(&profile_path, &profile_json).map_err(|e| e.to_string())?;
-    std::fs::write(archived_profile_path, profile_json).map_err(|e| e.to_string())
+    std::fs::write(archived_profile_path, profile_json).map_err(|e| e.to_string())?;
+    upsert_saved_server_profile_record(app, profile)
 }
 
 pub(crate) fn remove_saved_server_profile(app: &AppHandle) -> Result<(), String> {
     let profile_path = server_profile_path(app)?;
 
     match std::fs::remove_file(profile_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub(crate) fn clear_saved_server_profiles(app: &AppHandle) -> Result<(), String> {
+    let profiles_path = saved_server_profiles_path(app)?;
+
+    match std::fs::remove_file(profiles_path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
@@ -1337,11 +1427,121 @@ pub async fn generate_invite_link(
 }
 
 #[tauri::command]
+pub async fn regenerate_invite_vless_link(
+    app: AppHandle,
+    invite_id: String,
+) -> Result<invite::RegeneratedVlessInviteLinkResult, String> {
+    invite::regenerate_invite_vless_link(app, invite_id).await
+}
+
+#[tauri::command]
 pub async fn import_invite_link(
     app: AppHandle,
     invite_link: String,
 ) -> Result<invite::InviteImportResult, String> {
     invite::import_invite_link(app, invite_link).await
+}
+
+#[tauri::command]
+pub fn list_imported_invite_profiles(
+    app: AppHandle,
+) -> Result<Vec<invite::ImportedInviteProfile>, String> {
+    invite::list_imported_invite_profiles(app)
+}
+
+#[tauri::command]
+pub async fn activate_imported_invite_profile(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<invite::InviteImportResult, String> {
+    invite::activate_imported_invite_profile(app, profile_id).await
+}
+
+#[tauri::command]
+pub fn delete_imported_invite_profile(app: AppHandle, profile_id: String) -> Result<(), String> {
+    invite::delete_imported_invite_profile(app, profile_id)
+}
+
+#[tauri::command]
+pub fn list_saved_server_profiles(app: AppHandle) -> Result<Vec<SavedServerProfileEntry>, String> {
+    let active = warp::load_saved_server_profile(app.clone())?;
+    let active_id = active.as_ref().map(saved_server_profile_id);
+    let records = load_saved_server_profile_records(&app)?;
+
+    Ok(records
+        .into_iter()
+        .map(|record| SavedServerProfileEntry {
+            is_active: active_id.as_deref() == Some(record.id.as_str()),
+            id: record.id,
+            host: record.host,
+            user: record.user,
+            saved_at: record.saved_at,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn add_saved_server_profile(
+    app: AppHandle,
+    host: String,
+    user: String,
+    password: String,
+) -> Result<SavedServerProfile, String> {
+    if host.trim().is_empty() || user.trim().is_empty() || password.trim().is_empty() {
+        return Err(
+            "Server IP, login, and password are required before saving a server.".to_string(),
+        );
+    }
+
+    let profile = SavedServerProfile {
+        host: host.trim().to_string(),
+        user: user.trim().to_string(),
+        password,
+    };
+    save_server_profile(&app, &profile)?;
+    save_backend_app_role(&app, BackendAppRole::Master)?;
+    Ok(profile)
+}
+
+#[tauri::command]
+pub fn activate_saved_server_profile(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<SavedServerProfile, String> {
+    let records = load_saved_server_profile_records(&app)?;
+    let Some(record) = records.into_iter().find(|record| record.id == profile_id) else {
+        return Err("Saved server profile not found.".to_string());
+    };
+    let profile = SavedServerProfile {
+        host: record.host,
+        user: record.user,
+        password: record.password,
+    };
+    save_server_profile(&app, &profile)?;
+    save_backend_app_role(&app, BackendAppRole::Master)?;
+    Ok(profile)
+}
+
+#[tauri::command]
+pub fn delete_saved_server_profile(app: AppHandle, profile_id: String) -> Result<(), String> {
+    let mut records = load_saved_server_profile_records(&app)?;
+    let original_len = records.len();
+    records.retain(|record| record.id != profile_id);
+    if records.len() == original_len {
+        return Err("Saved server profile not found.".to_string());
+    }
+    save_saved_server_profile_records(&app, &records)?;
+
+    if warp::load_saved_server_profile(app.clone())?
+        .as_ref()
+        .map(saved_server_profile_id)
+        .as_deref()
+        == Some(profile_id.as_str())
+    {
+        remove_saved_server_profile(&app)?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

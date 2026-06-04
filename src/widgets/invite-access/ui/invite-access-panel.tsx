@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type {
   AppRole,
+  ImportedInviteProfile,
   IssuedInviteLink,
 } from "../../../features/control-center/model/use-control-center";
 import { Button } from "../../../shared/ui/button";
@@ -19,6 +20,7 @@ type InviteAccessPanelProps = {
   deletingInviteId: string | null;
   inviteImportSuccessMessage: string | null;
   issuedInviteLinks: IssuedInviteLink[];
+  importedInviteProfiles: ImportedInviteProfile[];
   primaryInviteCopied: boolean;
   copiedInviteId: string | null;
   isInviteServerSyncPending: boolean;
@@ -32,6 +34,9 @@ type InviteAccessPanelProps = {
   onEnterInvite: () => void;
   onResetLocalData: () => void;
   onCopyExistingInvite: (inviteId: string, inviteLink: string) => void;
+  onRegenerateInviteVlessLink: (inviteId: string) => void;
+  onActivateImportedInviteProfile: (profileId: string) => void;
+  onDeleteImportedInviteProfile: (profileId: string) => void;
   onDeleteInvite: (inviteId: string) => void;
 };
 
@@ -47,6 +52,7 @@ export function InviteAccessPanel({
   deletingInviteId,
   inviteImportSuccessMessage,
   issuedInviteLinks,
+  importedInviteProfiles,
   primaryInviteCopied,
   copiedInviteId,
   isInviteServerSyncPending,
@@ -60,6 +66,9 @@ export function InviteAccessPanel({
   onEnterInvite,
   onResetLocalData,
   onCopyExistingInvite,
+  onRegenerateInviteVlessLink,
+  onActivateImportedInviteProfile,
+  onDeleteImportedInviteProfile,
   onDeleteInvite,
 }: InviteAccessPanelProps) {
   const isMaster = appRole === "master";
@@ -221,19 +230,61 @@ export function InviteAccessPanel({
                           <button
                             type="button"
                             className="mt-2 block w-full cursor-pointer overflow-x-auto whitespace-nowrap rounded-xl border border-zinc-800 bg-[#111212] px-3 py-2 text-left font-mono text-[11px] leading-5 text-zinc-500 transition-colors hover:border-zinc-700 hover:text-zinc-300"
-                            title="Click to copy this invite link"
-                            onClick={() => onCopyExistingInvite(invite.id, invite.link)}
+                            title="Click to copy the ShadowTLS invite link"
+                            onClick={() =>
+                              onCopyExistingInvite(`${invite.id}:shadowtls`, invite.shadowtls_link)
+                            }
                           >
-                            {invite.link}
+                            {invite.shadowtls_link}
                           </button>
+                          <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] font-bold uppercase tracking-[0.12em]">
+                            <span className="rounded-full border border-zinc-800 px-2 py-1 text-zinc-500">
+                              ShadowTLS ready
+                            </span>
+                            <span
+                              className={
+                                invite.vless_available
+                                  ? "rounded-full border border-emerald-900/70 px-2 py-1 text-emerald-400"
+                                  : "rounded-full border border-zinc-800 px-2 py-1 text-zinc-600"
+                              }
+                            >
+                              {invite.vless_available ? "VLESS ready" : "ShadowTLS-only"}
+                            </span>
+                          </div>
                         </div>
-                        <div className="flex gap-2 sm:pl-3">
+                        <div className="flex flex-wrap gap-2 sm:max-w-[190px] sm:justify-end sm:pl-3">
                           <Button
                             variant="secondary"
                             className="px-2.5 py-1.5 text-[10px] tracking-[0.12em]"
-                            onClick={() => onCopyExistingInvite(invite.id, invite.link)}
+                            onClick={() =>
+                              onCopyExistingInvite(`${invite.id}:shadowtls`, invite.shadowtls_link)
+                            }
                           >
-                            {copiedInviteId === invite.id ? "Copied" : "Copy"}
+                            {copiedInviteId === `${invite.id}:shadowtls`
+                              ? "Copied"
+                              : "ShadowTLS Link"}
+                          </Button>
+                          <Button
+                            variant="secondary"
+                            className="px-2.5 py-1.5 text-[10px] tracking-[0.12em]"
+                            title={
+                              invite.vless_available
+                                ? "Copy the VLESS invite link"
+                                : "Create and copy a VLESS invite link for this older ShadowTLS invite."
+                            }
+                            onClick={() => {
+                              if (invite.vless_link) {
+                                onCopyExistingInvite(`${invite.id}:vless`, invite.vless_link);
+                              } else {
+                                onRegenerateInviteVlessLink(invite.id);
+                              }
+                            }}
+                          >
+                            {copiedInviteId === `${invite.id}:vless`
+                              ? "Copied"
+                              : invite.vless_available
+                                ? "VLESS Link"
+                                : "Add VLESS Link"}
                           </Button>
                           <Button
                             variant="danger"
@@ -285,6 +336,83 @@ export function InviteAccessPanel({
               >
                 {isAndroidRuntime ? "Unlink This Phone" : "Unlink This App"}
               </Button>
+            </div>
+            <div className="rounded-2xl border border-zinc-800 bg-[#171818] px-3 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-zinc-100">
+                    Saved access links
+                  </div>
+                  <p className="mt-1 text-sm leading-5 text-zinc-400">
+                    Switch between imported servers and transports without resetting this device.
+                  </p>
+                </div>
+              </div>
+              {importedInviteProfiles.length > 0 ? (
+                <div className="mt-3 flex max-h-[220px] flex-col gap-2 overflow-y-auto pr-1">
+                  {importedInviteProfiles.map((profile) => {
+                    const transportLabel =
+                      profile.preferred_transport === "vless" ? "VLESS" : "ShadowTLS";
+                    return (
+                      <div
+                        key={profile.id}
+                        className="rounded-xl border border-zinc-800 bg-[#111212] px-3 py-2"
+                      >
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-sm font-semibold text-zinc-100">
+                                {profile.host}
+                              </span>
+                              <span
+                                className={
+                                  profile.preferred_transport === "vless"
+                                    ? "rounded-full border border-emerald-900/70 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.12em] text-emerald-400"
+                                    : "rounded-full border border-zinc-700 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.12em] text-zinc-400"
+                                }
+                              >
+                                {transportLabel}
+                              </span>
+                              {profile.is_active ? (
+                                <span className="rounded-full border border-sky-900/70 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.12em] text-sky-300">
+                                  Active
+                                </span>
+                              ) : null}
+                            </div>
+                            <p className="mt-1 text-xs leading-5 text-zinc-500">
+                              {profile.cover_domain}
+                            </p>
+                          </div>
+                          <div className="flex gap-2">
+                            <Button
+                              variant="secondary"
+                              className="px-2.5 py-1.5 text-[10px] tracking-[0.12em]"
+                              disabled={profile.is_active || isImportingInvite}
+                              onClick={() => onActivateImportedInviteProfile(profile.id)}
+                            >
+                              {profile.is_active ? "Active" : "Activate"}
+                            </Button>
+                            <Button
+                              variant="danger"
+                              className="min-w-[36px] px-2 py-1.5 text-xs tracking-[0.08em]"
+                              title="Delete this imported link"
+                              disabled={deletingInviteId === profile.id}
+                              onClick={() => onDeleteImportedInviteProfile(profile.id)}
+                            >
+                              {deletingInviteId === profile.id ? "…" : "X"}
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="mt-3 text-sm leading-6 text-zinc-400">
+                  No imported links saved yet. Paste ShadowTLS or VLESS links here, then switch
+                  between them with one click.
+                </p>
+              )}
             </div>
             {inviteImportSuccessMessage ? (
               <div className="rounded-2xl border border-emerald-900/50 bg-emerald-950/20 px-4 py-3 text-sm leading-6 text-emerald-200">

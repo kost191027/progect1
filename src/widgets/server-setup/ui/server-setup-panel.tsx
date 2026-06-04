@@ -3,18 +3,23 @@ import { Input } from "../../../shared/ui/input";
 import { getLocalDeviceReference } from "../../../shared/lib/runtime-platform";
 import { SETTINGS_PANEL_ICONS } from "../../../shared/lib/settings-panel-icons";
 import { Panel } from "../../../shared/ui/panel";
-import type { WindowsRuntimeMode } from "../../../features/control-center/model/use-control-center";
+import type {
+  SavedServerProfileEntry,
+  WindowsRuntimeMode,
+} from "../../../features/control-center/model/use-control-center";
 
 type ServerSetupPanelProps = {
   host: string;
   user: string;
   password: string;
+  savedServerProfiles: SavedServerProfileEntry[];
   isRunning: boolean;
   isDeploying: boolean;
   isResettingLocalData: boolean;
   isCreatingWarpProfile: boolean;
   isImportingWarpProfile: boolean;
   isClearingWarpProfile: boolean;
+  deletingServerProfileId: string | null;
   deployActionLabel: string;
   hasLocalWarpProfile: boolean;
   localWarpEndpoint: string | null;
@@ -35,6 +40,9 @@ type ServerSetupPanelProps = {
   onWarpProfileInputChange: (value: string) => void;
   onWindowsRuntimeModeChange: (mode: WindowsRuntimeMode) => void;
   onDeploy: () => void;
+  onAddServerProfile: () => void;
+  onActivateServerProfile: (profileId: string) => void;
+  onDeleteServerProfile: (profileId: string) => void;
   onResetLocalData: () => void;
   onCreateWarpProfile: () => void;
   onImportWarpProfile: () => void;
@@ -45,12 +53,14 @@ export function ServerSetupPanel({
   host,
   user,
   password,
+  savedServerProfiles,
   isRunning,
   isDeploying,
   isResettingLocalData,
   isCreatingWarpProfile,
   isImportingWarpProfile,
   isClearingWarpProfile,
+  deletingServerProfileId,
   deployActionLabel,
   hasLocalWarpProfile,
   localWarpEndpoint,
@@ -71,6 +81,9 @@ export function ServerSetupPanel({
   onWarpProfileInputChange,
   onWindowsRuntimeModeChange,
   onDeploy,
+  onAddServerProfile,
+  onActivateServerProfile,
+  onDeleteServerProfile,
   onResetLocalData,
   onCreateWarpProfile,
   onImportWarpProfile,
@@ -172,6 +185,137 @@ export function ServerSetupPanel({
           >
             {isResettingLocalData ? resettingLabel : resetLabel}
           </Button>
+        </div>
+
+        <div className="rounded-2xl border border-zinc-800 bg-[#111212] px-4 py-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-[11px] font-bold uppercase tracking-[0.22em] text-zinc-500">
+                Saved servers
+              </div>
+              <div className="mt-2 text-sm font-semibold text-zinc-100">
+                Switch between installed VPS profiles without clearing local data
+              </div>
+            </div>
+
+            <Button
+              variant="secondary"
+              disabled={
+                isDeploying ||
+                isResettingLocalData ||
+                isCreatingWarpProfile ||
+                isImportingWarpProfile ||
+                isClearingWarpProfile ||
+                !host ||
+                !user ||
+                !password
+              }
+              onClick={onAddServerProfile}
+              className="min-w-14 px-4"
+              title="Save the current Server IP, Login, and Password"
+            >
+              +
+            </Button>
+          </div>
+
+          {savedServerProfiles.length > 0 ? (
+            <div className="mt-4 grid gap-2">
+              {savedServerProfiles.map((profile) => (
+                <div
+                  key={profile.id}
+                  role="button"
+                  tabIndex={0}
+                  className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-zinc-800/80 bg-black/20 px-3 py-3 transition-colors hover:border-zinc-700 hover:bg-black/30"
+                  onClick={() => {
+                    if (
+                      profile.is_active ||
+                      isRunning ||
+                      isDeploying ||
+                      isResettingLocalData ||
+                      deletingServerProfileId === profile.id
+                    ) {
+                      return;
+                    }
+
+                    onActivateServerProfile(profile.id);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      if (
+                        profile.is_active ||
+                        isRunning ||
+                        isDeploying ||
+                        isResettingLocalData ||
+                        deletingServerProfileId === profile.id
+                      ) {
+                        return;
+                      }
+
+                      onActivateServerProfile(profile.id);
+                    }
+                  }}
+                >
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="truncate text-sm font-semibold text-zinc-100">
+                        {profile.host}
+                      </span>
+                      {profile.is_active ? (
+                        <span className="rounded-full border border-emerald-700/60 bg-emerald-950/30 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-emerald-200">
+                          Active
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="mt-1 text-xs text-zinc-500">
+                      Login: {profile.user}
+                    </div>
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-2">
+                    <Button
+                      variant={profile.is_active ? "success" : "secondary"}
+                      disabled={
+                        profile.is_active ||
+                        isRunning ||
+                        isDeploying ||
+                        isResettingLocalData ||
+                        deletingServerProfileId === profile.id
+                      }
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onActivateServerProfile(profile.id);
+                      }}
+                      className="px-3 py-2 text-[11px]"
+                    >
+                      {profile.is_active ? "Selected" : "Activate"}
+                    </Button>
+
+                    <Button
+                      variant="danger"
+                      disabled={
+                        isRunning ||
+                        isDeploying ||
+                        isResettingLocalData ||
+                        deletingServerProfileId === profile.id
+                      }
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onDeleteServerProfile(profile.id);
+                      }}
+                      className="px-3 py-2 text-[11px]"
+                    >
+                      {deletingServerProfileId === profile.id ? "..." : "X"}
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-4 text-sm leading-6 text-zinc-500">
+              No saved servers yet. Fill in the credentials above and press + to save one.
+            </p>
+          )}
         </div>
 
         {isAndroidRuntime ? (

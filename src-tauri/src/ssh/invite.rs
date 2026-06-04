@@ -26,6 +26,8 @@ use super::{
 struct InviteLinkPayload {
     version: u8,
     invite_id: String,
+    #[serde(default)]
+    preferred_transport: InvitePreferredTransport,
     host: String,
     external_port: u16,
     #[serde(default)]
@@ -38,10 +40,22 @@ struct InviteLinkPayload {
     generated_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum InvitePreferredTransport {
+    #[default]
+    Shadowtls,
+    Vless,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredInviteLinkRecord {
     id: String,
     link: String,
+    #[serde(default)]
+    shadowtls_link: String,
+    #[serde(default)]
+    vless_link: String,
     host: String,
     cover_domain: String,
     generated_at: u64,
@@ -57,6 +71,9 @@ struct StoredInviteLinkRecord {
 pub struct IssuedInviteLink {
     id: String,
     link: String,
+    shadowtls_link: String,
+    vless_link: Option<String>,
+    vless_available: bool,
     host: String,
     cover_domain: String,
     generated_at: u64,
@@ -75,9 +92,40 @@ pub struct InviteImportResult {
     cover_domain: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImportedInviteProfileRecord {
+    id: String,
+    link: String,
+    host: String,
+    cover_domain: String,
+    preferred_transport: InvitePreferredTransport,
+    generated_at: u64,
+    imported_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportedInviteProfile {
+    id: String,
+    link: String,
+    host: String,
+    cover_domain: String,
+    preferred_transport: InvitePreferredTransport,
+    generated_at: u64,
+    imported_at: u64,
+    is_active: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GeneratedInviteLinkResult {
     link: String,
+    shadowtls_link: String,
+    vless_link: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RegeneratedVlessInviteLinkResult {
+    invite_id: String,
+    vless_link: String,
 }
 
 fn invite_sync_revision() -> &'static AtomicU64 {
@@ -101,6 +149,18 @@ fn issued_invites_path(app: &AppHandle) -> Result<PathBuf, String> {
     let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
 
     Ok(local_data.join("issued_invites.json"))
+}
+
+fn imported_invites_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+
+    Ok(local_data.join("imported_invites.json"))
+}
+
+fn active_imported_invite_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+
+    Ok(local_data.join("active_imported_invite_id.json"))
 }
 
 fn load_issued_invite_records(app: &AppHandle) -> Result<Vec<StoredInviteLinkRecord>, String> {
@@ -139,6 +199,75 @@ pub(crate) fn clear_issued_invites(app: &AppHandle) -> Result<(), String> {
     }
 }
 
+fn load_imported_invite_records(
+    app: &AppHandle,
+) -> Result<Vec<ImportedInviteProfileRecord>, String> {
+    let invites_path = imported_invites_path(app)?;
+
+    if !invites_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let contents = std::fs::read_to_string(&invites_path).map_err(|e| e.to_string())?;
+    serde_json::from_str::<Vec<ImportedInviteProfileRecord>>(&contents)
+        .map_err(|e| format!("Failed to parse imported invites JSON: {}", e))
+}
+
+fn save_imported_invite_records(
+    app: &AppHandle,
+    invites: &[ImportedInviteProfileRecord],
+) -> Result<(), String> {
+    let invites_path = imported_invites_path(app)?;
+
+    if let Some(parent) = invites_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let json = serde_json::to_vec_pretty(invites).map_err(|e| e.to_string())?;
+    std::fs::write(invites_path, json).map_err(|e| e.to_string())
+}
+
+fn load_active_imported_invite_id(app: &AppHandle) -> Result<Option<String>, String> {
+    let path = active_imported_invite_path(app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    serde_json::from_str::<String>(&raw)
+        .map(Some)
+        .map_err(|e| format!("Failed to parse active imported invite id: {}", e))
+}
+
+fn save_active_imported_invite_id(app: &AppHandle, invite_id: &str) -> Result<(), String> {
+    let path = active_imported_invite_path(app)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let raw = serde_json::to_string(invite_id).map_err(|e| e.to_string())?;
+    std::fs::write(path, raw).map_err(|e| e.to_string())
+}
+
+fn clear_active_imported_invite_id(app: &AppHandle) -> Result<(), String> {
+    let path = active_imported_invite_path(app)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub(crate) fn clear_imported_invites(app: &AppHandle) -> Result<(), String> {
+    let invites_path = imported_invites_path(app)?;
+    match std::fs::remove_file(invites_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    clear_active_imported_invite_id(app)
+}
+
 fn issue_invite_id() -> Result<String, String> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -146,6 +275,110 @@ fn issue_invite_id() -> Result<String, String> {
         .as_nanos();
 
     Ok(format!("invite-{:x}", timestamp))
+}
+
+fn encode_invite_link(payload: &InviteLinkPayload) -> Result<String, String> {
+    let payload_json =
+        serde_json::to_vec(payload).map_err(|e| format!("Invite payload error: {}", e))?;
+    Ok(format!(
+        "rkn://invite/{}",
+        URL_SAFE_NO_PAD.encode(payload_json)
+    ))
+}
+
+fn imported_invite_profile_id(payload: &InviteLinkPayload) -> String {
+    let transport = match payload.preferred_transport {
+        InvitePreferredTransport::Shadowtls => "shadowtls",
+        InvitePreferredTransport::Vless => "vless",
+    };
+    format!(
+        "{}:{}:{}:{}",
+        payload.host, payload.external_port, payload.invite_id, transport
+    )
+}
+
+fn selected_protocol_from_invite_payload(payload: &InviteLinkPayload) -> crate::TransportProtocol {
+    match payload.preferred_transport {
+        InvitePreferredTransport::Vless
+            if payload.vless_external_port > 0 && !payload.vless_uuid.trim().is_empty() =>
+        {
+            crate::TransportProtocol::Vless
+        }
+        _ => crate::TransportProtocol::Shadowtls,
+    }
+}
+
+fn apply_invite_payload_to_local_client(
+    app: &AppHandle,
+    local_data: &std::path::Path,
+    payload: &InviteLinkPayload,
+) -> Result<InviteImportResult, String> {
+    let selected_protocol = selected_protocol_from_invite_payload(payload);
+    let local_rule_sets = ensure_local_client_rule_sets_sync(app)?;
+    let client_cfg = crate::generator::build_client_config(crate::generator::ClientConfigParams {
+        server_ip: &payload.host,
+        shadow_pass: &payload.shadow_pass,
+        ss_password: &payload.ss_password,
+        vless_uuid: &payload.vless_uuid,
+        external_port: payload.external_port,
+        vless_external_port: payload.vless_external_port,
+        cover_domain: &payload.cover_domain,
+        local_rule_sets: &local_rule_sets,
+    });
+
+    std::fs::create_dir_all(local_data).map_err(|e| e.to_string())?;
+    let client_cfg_path = local_data.join("client_config.json");
+    std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
+    remove_saved_server_profile(app)?;
+    clear_issued_invites(app)?;
+    clear_local_warp_profile_sync(app)?;
+    clear_cached_transport_bootstrap(app)?;
+    save_backend_app_role(app, BackendAppRole::Subordinate)?;
+    crate::save_selected_transport_protocol(app, selected_protocol)?;
+    crate::refresh_tray_toggle_item(app);
+
+    let _ = app.emit(
+        "tunnel-log",
+        format!(
+            "[SYSTEM] Invite link activated successfully. Client config updated at: {:?}",
+            client_cfg_path
+        ),
+    );
+
+    Ok(InviteImportResult {
+        host: payload.host.clone(),
+        cover_domain: payload.cover_domain.clone(),
+    })
+}
+
+fn save_imported_invite_profile(
+    app: &AppHandle,
+    invite_link: &str,
+    payload: &InviteLinkPayload,
+) -> Result<String, String> {
+    let profile_id = imported_invite_profile_id(payload);
+    let imported_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let mut records = load_imported_invite_records(app)?;
+    records.retain(|record| record.id != profile_id);
+    records.insert(
+        0,
+        ImportedInviteProfileRecord {
+            id: profile_id.clone(),
+            link: invite_link.to_string(),
+            host: payload.host.clone(),
+            cover_domain: payload.cover_domain.clone(),
+            preferred_transport: payload.preferred_transport,
+            generated_at: payload.generated_at,
+            imported_at,
+        },
+    );
+    save_imported_invite_records(app, &records)?;
+    save_active_imported_invite_id(app, &profile_id)?;
+
+    Ok(profile_id)
 }
 
 fn compose_multi_user_ss_password(server_password: &str, user_password: &str) -> String {
@@ -219,12 +452,28 @@ pub fn list_issued_invite_links(app: AppHandle) -> Result<Vec<IssuedInviteLink>,
 
     Ok(records
         .into_iter()
-        .map(|record| IssuedInviteLink {
-            id: record.id,
-            link: record.link,
-            host: record.host,
-            cover_domain: record.cover_domain,
-            generated_at: record.generated_at,
+        .map(|record| {
+            let shadowtls_link = if record.shadowtls_link.trim().is_empty() {
+                record.link.clone()
+            } else {
+                record.shadowtls_link
+            };
+            let vless_link = if record.vless_link.trim().is_empty() {
+                None
+            } else {
+                Some(record.vless_link)
+            };
+
+            IssuedInviteLink {
+                id: record.id,
+                link: record.link,
+                shadowtls_link,
+                vless_available: vless_link.is_some(),
+                vless_link,
+                host: record.host,
+                cover_domain: record.cover_domain,
+                generated_at: record.generated_at,
+            }
         })
         .collect())
 }
@@ -253,7 +502,6 @@ pub async fn delete_issued_invite_link(app: AppHandle, invite_id: String) -> Res
 }
 
 fn build_remote_invites_from_records(
-    app: &AppHandle,
     records: &[StoredInviteLinkRecord],
     remote_bootstrap: &RemoteTransportBootstrap,
 ) -> Result<Vec<RemoteInviteRecord>, String> {
@@ -261,16 +509,11 @@ fn build_remote_invites_from_records(
         .iter()
         .map(|record| {
             if !record.shadow_pass.trim().is_empty() && !record.ss_user_password.trim().is_empty() {
-                let vless_uuid = if record.vless_uuid.trim().is_empty() {
-                    tauri::async_runtime::block_on(crate::generator::generate_vless_uuid(app))?
-                } else {
-                    record.vless_uuid.clone()
-                };
                 return Ok(RemoteInviteRecord {
                     id: record.id.clone(),
                     shadow_pass: record.shadow_pass.clone(),
                     ss_user_password: record.ss_user_password.clone(),
-                    vless_uuid,
+                    vless_uuid: record.vless_uuid.clone(),
                     generated_at: record.generated_at,
                 });
             }
@@ -291,11 +534,36 @@ fn build_remote_invites_from_records(
         .collect()
 }
 
+fn ensure_local_invite_vless_uuids(
+    app: &AppHandle,
+    records: &mut [StoredInviteLinkRecord],
+) -> Result<bool, String> {
+    let mut changed = false;
+
+    for record in records.iter_mut() {
+        if record.shadow_pass.trim().is_empty()
+            || record.ss_user_password.trim().is_empty()
+            || !record.vless_uuid.trim().is_empty()
+        {
+            continue;
+        }
+
+        record.vless_uuid =
+            tauri::async_runtime::block_on(crate::generator::generate_vless_uuid(app))?;
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
 fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String> {
     let _mutation_guard = acquire_remote_mutation_lock()?;
     let profile = load_saved_server_profile(app.clone())?
         .ok_or_else(|| "Saved server profile not found. Deploy once first.".to_string())?;
-    let records = load_issued_invite_records(app)?;
+    let mut records = load_issued_invite_records(app)?;
+    if ensure_local_invite_vless_uuids(app, &mut records)? {
+        save_issued_invite_records(app, &records)?;
+    }
 
     let sess = connect_ssh_session(app, &profile.host, &profile.user, &profile.password)?;
     let remote_bootstrap = load_remote_transport_bootstrap(&sess)?.ok_or_else(|| {
@@ -305,7 +573,7 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
         "Remote RKN container is not active. Deploy the server first.".to_string()
     })?;
 
-    let synced_invites = build_remote_invites_from_records(app, &records, &remote_bootstrap)?;
+    let synced_invites = build_remote_invites_from_records(&records, &remote_bootstrap)?;
     let (ss_server_password, master_ss_user_password, master_combined_password) =
         resolve_master_ss_transport(app, &remote_bootstrap)?;
     let warp_config = if remote_bootstrap.routing_mode == "warp" {
@@ -572,9 +840,10 @@ pub async fn generate_invite_link(app: AppHandle) -> Result<GeneratedInviteLinkR
             let invite_ss_password =
                 compose_multi_user_ss_password(&ss_server_password, &invite_ss_user_password);
 
-            let payload = InviteLinkPayload {
+            let shadowtls_payload = InviteLinkPayload {
                 version: 1,
                 invite_id: invite_id.clone(),
+                preferred_transport: InvitePreferredTransport::Shadowtls,
                 host: host.clone(),
                 external_port: bootstrap.external_port,
                 vless_external_port: bootstrap.vless_external_port,
@@ -584,17 +853,27 @@ pub async fn generate_invite_link(app: AppHandle) -> Result<GeneratedInviteLinkR
                 vless_uuid: invite_vless_uuid.clone(),
                 generated_at,
             };
-            let payload_json =
-                serde_json::to_vec(&payload).map_err(|e| format!("Invite payload error: {}", e))?;
-            let encoded = URL_SAFE_NO_PAD.encode(payload_json);
-            let link = format!("rkn://invite/{}", encoded);
+            let shadowtls_link = encode_invite_link(&shadowtls_payload)?;
+
+            let vless_link =
+                if bootstrap.vless_external_port > 0 && !bootstrap.vless_uuid.trim().is_empty() {
+                    let vless_payload = InviteLinkPayload {
+                        preferred_transport: InvitePreferredTransport::Vless,
+                        ..shadowtls_payload.clone()
+                    };
+                    Some(encode_invite_link(&vless_payload)?)
+                } else {
+                    None
+                };
 
             let mut records = load_issued_invite_records(&invite_app)?;
             records.insert(
                 0,
                 StoredInviteLinkRecord {
                     id: invite_id,
-                    link: link.clone(),
+                    link: shadowtls_link.clone(),
+                    shadowtls_link: shadowtls_link.clone(),
+                    vless_link: vless_link.clone().unwrap_or_default(),
                     host,
                     cover_domain: bootstrap.cover_domain.clone(),
                     generated_at,
@@ -605,7 +884,11 @@ pub async fn generate_invite_link(app: AppHandle) -> Result<GeneratedInviteLinkR
             );
             save_issued_invite_records(&invite_app, &records)?;
 
-            Ok(GeneratedInviteLinkResult { link })
+            Ok(GeneratedInviteLinkResult {
+                link: shadowtls_link.clone(),
+                shadowtls_link,
+                vless_link,
+            })
         },
     )
     .await
@@ -614,6 +897,81 @@ pub async fn generate_invite_link(app: AppHandle) -> Result<GeneratedInviteLinkR
     schedule_invite_remote_sync(
         &app,
         "Applying the latest invite changes on the server in the background.",
+    );
+
+    Ok(result)
+}
+
+pub async fn regenerate_invite_vless_link(
+    app: AppHandle,
+    invite_id: String,
+) -> Result<RegeneratedVlessInviteLinkResult, String> {
+    ensure_master_role(&app, "regenerate VLESS invite links")?;
+
+    let regenerate_app = app.clone();
+    let invite_id_for_task = invite_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(
+        move || -> Result<RegeneratedVlessInviteLinkResult, String> {
+            let (bootstrap, host) = resolve_bootstrap_for_invite(&regenerate_app)?;
+            if bootstrap.vless_external_port == 0 || bootstrap.vless_uuid.trim().is_empty() {
+                return Err("The current server profile does not include VLESS yet. Run Deploy/Update before creating a VLESS invite link.".to_string());
+            }
+
+            let mut records = load_issued_invite_records(&regenerate_app)?;
+            let Some(record) = records
+                .iter_mut()
+                .find(|record| record.id == invite_id_for_task)
+            else {
+                return Err("Invite link not found in the local master list.".to_string());
+            };
+
+            if record.shadow_pass.trim().is_empty() || record.ss_user_password.trim().is_empty() {
+                return Err("This older invite cannot be upgraded because its local server-side secrets are missing. Create a new invite link instead.".to_string());
+            }
+
+            if record.vless_uuid.trim().is_empty() {
+                record.vless_uuid =
+                    tauri::async_runtime::block_on(crate::generator::generate_vless_uuid(
+                        &regenerate_app,
+                    ))?;
+            }
+
+            let (ss_server_password, _, _) =
+                resolve_master_ss_transport(&regenerate_app, &bootstrap)?;
+            let invite_ss_password =
+                compose_multi_user_ss_password(&ss_server_password, &record.ss_user_password);
+            let vless_payload = InviteLinkPayload {
+                version: 1,
+                invite_id: record.id.clone(),
+                preferred_transport: InvitePreferredTransport::Vless,
+                host,
+                external_port: bootstrap.external_port,
+                vless_external_port: bootstrap.vless_external_port,
+                cover_domain: bootstrap.cover_domain.clone(),
+                shadow_pass: record.shadow_pass.clone(),
+                ss_password: invite_ss_password,
+                vless_uuid: record.vless_uuid.clone(),
+                generated_at: record.generated_at,
+            };
+            let vless_link = encode_invite_link(&vless_payload)?;
+            record.vless_link = vless_link.clone();
+            if record.shadowtls_link.trim().is_empty() {
+                record.shadowtls_link = record.link.clone();
+            }
+            save_issued_invite_records(&regenerate_app, &records)?;
+
+            Ok(RegeneratedVlessInviteLinkResult {
+                invite_id: invite_id_for_task,
+                vless_link,
+            })
+        },
+    )
+    .await
+    .unwrap()?;
+
+    schedule_invite_remote_sync(
+        &app,
+        "Applying the regenerated VLESS invite link on the server in the background.",
     );
 
     Ok(result)
@@ -639,41 +997,17 @@ pub async fn import_invite_link(
         let app = app.clone();
         move || -> Result<InviteImportResult, String> {
             let payload = parse_invite_link_payload(&invite_link)?;
-            let local_rule_sets = ensure_local_client_rule_sets_sync(&app)?;
-            let client_cfg =
-                crate::generator::build_client_config(crate::generator::ClientConfigParams {
-                    server_ip: &payload.host,
-                    shadow_pass: &payload.shadow_pass,
-                    ss_password: &payload.ss_password,
-                    vless_uuid: &payload.vless_uuid,
-                    external_port: payload.external_port,
-                    vless_external_port: payload.vless_external_port,
-                    cover_domain: &payload.cover_domain,
-                    local_rule_sets: &local_rule_sets,
-                });
-
-            std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
-            let client_cfg_path = local_data.join("client_config.json");
-            std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
-            remove_saved_server_profile(&app)?;
-            clear_issued_invites(&app)?;
-            clear_local_warp_profile_sync(&app)?;
-            clear_cached_transport_bootstrap(&app)?;
-            save_backend_app_role(&app, BackendAppRole::Subordinate)?;
-            crate::refresh_tray_toggle_item(&app);
-
+            let result = apply_invite_payload_to_local_client(&app, &local_data, &payload)?;
+            let profile_id = save_imported_invite_profile(&app, &invite_link, &payload)?;
             let _ = app.emit(
                 "tunnel-log",
                 format!(
-                    "[SYSTEM] Invite link imported successfully. Client config updated at: {:?}",
-                    client_cfg_path
+                    "[SYSTEM] Imported invite profile is now active: {}",
+                    profile_id
                 ),
             );
 
-            Ok(InviteImportResult {
-                host: payload.host,
-                cover_domain: payload.cover_domain,
-            })
+            Ok(result)
         }
     })
     .await
@@ -686,4 +1020,79 @@ pub async fn import_invite_link(
     .await?;
 
     Ok(result)
+}
+
+pub fn list_imported_invite_profiles(app: AppHandle) -> Result<Vec<ImportedInviteProfile>, String> {
+    let active_id = load_active_imported_invite_id(&app)?;
+    let records = load_imported_invite_records(&app)?;
+
+    Ok(records
+        .into_iter()
+        .map(|record| ImportedInviteProfile {
+            is_active: active_id.as_deref() == Some(record.id.as_str()),
+            id: record.id,
+            link: record.link,
+            host: record.host,
+            cover_domain: record.cover_domain,
+            preferred_transport: record.preferred_transport,
+            generated_at: record.generated_at,
+            imported_at: record.imported_at,
+        })
+        .collect())
+}
+
+pub async fn activate_imported_invite_profile(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<InviteImportResult, String> {
+    if load_saved_server_profile(app.clone())?.is_some() {
+        return Err("This app is currently a master app. Reset local data before activating imported invite profiles here.".to_string());
+    }
+
+    let local_data = app
+        .path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+
+    let result = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        let profile_id = profile_id.clone();
+        move || -> Result<InviteImportResult, String> {
+            let records = load_imported_invite_records(&app)?;
+            let Some(record) = records.iter().find(|record| record.id == profile_id) else {
+                return Err("Imported invite profile not found.".to_string());
+            };
+            let payload = parse_invite_link_payload(&record.link)?;
+            let result = apply_invite_payload_to_local_client(&app, &local_data, &payload)?;
+            save_active_imported_invite_id(&app, &profile_id)?;
+            Ok(result)
+        }
+    })
+    .await
+    .unwrap()?;
+
+    crate::restart_tunnel_if_running(
+        &app,
+        "Tunnel config changed after switching imported invite profile. Restarting core to apply the selected link.",
+    )
+    .await?;
+
+    Ok(result)
+}
+
+pub fn delete_imported_invite_profile(app: AppHandle, profile_id: String) -> Result<(), String> {
+    let mut records = load_imported_invite_records(&app)?;
+    let original_len = records.len();
+    records.retain(|record| record.id != profile_id);
+
+    if records.len() == original_len {
+        return Err("Imported invite profile not found.".to_string());
+    }
+
+    save_imported_invite_records(&app, &records)?;
+    if load_active_imported_invite_id(&app)?.as_deref() == Some(profile_id.as_str()) {
+        clear_active_imported_invite_id(&app)?;
+    }
+
+    Ok(())
 }
