@@ -39,6 +39,7 @@ export type SavedServerProfile = {
 
 export type AppRole = "master" | "subordinate";
 export type WindowsRuntimeMode = "tun" | "compatibility";
+export type TransportProtocol = "shadowtls" | "vless";
 
 export type TransportStateSnapshot = {
   current_cover_domain: string | null;
@@ -68,6 +69,11 @@ type WindowsRuntimeModeStatus = {
   mode: WindowsRuntimeMode;
   is_windows: boolean;
   supports_compatibility_mode: boolean;
+};
+
+type TransportProtocolStatus = {
+  protocol: TransportProtocol;
+  vless_provisioned: boolean;
 };
 
 type InviteImportResult = {
@@ -284,6 +290,9 @@ export function useControlCenter() {
   const [isWindowsRuntime, setIsWindowsRuntime] = useState(false);
   const [windowsRuntimeMode, setWindowsRuntimeMode] = useState<WindowsRuntimeMode>("tun");
   const [isSavingWindowsRuntimeMode, setIsSavingWindowsRuntimeMode] = useState(false);
+  const [transportProtocol, setTransportProtocol] = useState<TransportProtocol>("shadowtls");
+  const [isVlessProvisioned, setIsVlessProvisioned] = useState(false);
+  const [isSavingTransportProtocol, setIsSavingTransportProtocol] = useState(false);
   const [isAwaitingAndroidVpnPermission, setIsAwaitingAndroidVpnPermission] =
     useState(false);
   const [androidRuntimeContext, setAndroidRuntimeContext] =
@@ -590,6 +599,34 @@ export function useControlCenter() {
     }
 
     void loadWindowsRuntimeMode();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadTransportProtocol() {
+      try {
+        const status = await invoke<TransportProtocolStatus>("get_selected_transport_protocol");
+        if (!isMounted) {
+          return;
+        }
+
+        setTransportProtocol(status.protocol);
+        setIsVlessProvisioned(status.vless_provisioned);
+      } catch (error) {
+        if (!isMounted) {
+          return;
+        }
+
+        appendLog(`[WARN] Failed to load selected transport protocol: ${error}`);
+      }
+    }
+
+    void loadTransportProtocol();
 
     return () => {
       isMounted = false;
@@ -905,7 +942,7 @@ export function useControlCenter() {
         setGuardState(event.payload);
         if (event.payload === "engaged") {
           setLastUserMessage(
-            "Proxy path is degraded. Protected routes remain blocked until the tunnel is healthy again.",
+            "Proxy path is degraded. The tunnel is not working correctly. Please restart the application.",
           );
         } else if (event.payload === "active") {
           setLastError(null);
@@ -1263,6 +1300,75 @@ export function useControlCenter() {
     }
   }
 
+  async function switchTransportProtocol(protocol: TransportProtocol) {
+    if (transportProtocol === protocol || isStarting || isStopping || isSavingTransportProtocol) {
+      return;
+    }
+
+    setIsSavingTransportProtocol(true);
+    setLastError(null);
+    setLastUserMessage(
+      protocol === "shadowtls"
+        ? "Switching the next tunnel start back to ShadowTLS."
+        : "Switching the next tunnel start to VLESS.",
+    );
+
+    try {
+      if (isRunning) {
+        setIsStopping(true);
+        setLastUserMessage("Stopping the active tunnel before switching transport protocol.");
+        appendLog("[SYSTEM] Stopping the active tunnel before transport switch.");
+        await invoke("stop_tunnel");
+        appendLog("[SYSTEM] Tunnel routing stopped for transport switch.");
+        setIsRunning(false);
+        setGuardState("inactive");
+        setIsStopping(false);
+        await refreshAndroidRuntimeContext();
+      }
+
+      const status = await invoke<TransportProtocolStatus>("set_selected_transport_protocol", {
+        protocol,
+      });
+      setTransportProtocol(status.protocol);
+      setIsVlessProvisioned(status.vless_provisioned);
+
+      if (status.protocol === "vless" && !status.vless_provisioned) {
+        setLastUserMessage(
+          "VLESS is selected, but this server profile does not include a VLESS transport yet. Switch back to ShadowTLS to start now.",
+        );
+        return;
+      }
+
+      setLastUserMessage(
+        status.protocol === "shadowtls"
+          ? "ShadowTLS is selected for the next tunnel start."
+          : "VLESS is selected for the next tunnel start.",
+      );
+
+      if (isRunning) {
+        setIsStarting(true);
+        setLastUserMessage(
+          status.protocol === "shadowtls"
+            ? "Restarting protection with ShadowTLS."
+            : "Restarting protection with VLESS.",
+        );
+        await invoke("start_tunnel");
+        appendLog(
+          status.protocol === "shadowtls"
+            ? "[SYSTEM] Tunnel routing active on ShadowTLS."
+            : "[SYSTEM] Tunnel routing active on VLESS.",
+        );
+        await refreshAndroidRuntimeContext();
+      }
+    } catch (error) {
+      appendLog(`[MAIN ERROR] Failed to switch transport protocol: ${error}`);
+    } finally {
+      setIsStarting(false);
+      setIsStopping(false);
+      setIsSavingTransportProtocol(false);
+    }
+  }
+
   function flashPrimaryInviteCopied() {
     setPrimaryInviteCopied(true);
     window.setTimeout(() => {
@@ -1568,6 +1674,8 @@ export function useControlCenter() {
       setLastDeployedAt(null);
       setHasCompletedFirstStart(false);
       setAppRole("master");
+      setTransportProtocol("shadowtls");
+      setIsVlessProvisioned(false);
       window.localStorage.removeItem(APP_ROLE_KEY);
       window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
       window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
@@ -1642,8 +1750,8 @@ export function useControlCenter() {
         title: "Protection degraded",
         description:
           isAndroidRuntime
-            ? "The proxy path is unhealthy. Some safe direct routes may still work, while protected phone traffic stays blocked instead of leaking."
-            : "The proxy path is unhealthy. Safe direct routes may still work, while protected traffic stays blocked instead of leaking.",
+            ? "The proxy path is unhealthy. The tunnel is not working correctly. Please restart the application."
+            : "The proxy path is unhealthy. The tunnel is not working correctly. Please restart the application.",
       };
     }
 
@@ -1960,9 +2068,12 @@ export function useControlCenter() {
     localWarpProfileStatus,
     isWindowsRuntime,
     windowsRuntimeMode,
+    transportProtocol,
+    isVlessProvisioned,
     isAndroidRuntime,
     localDeviceReference,
     isSavingWindowsRuntimeMode,
+    isSavingTransportProtocol,
     warpProfileInput,
     warpProfileMessage,
     localDataResetMessage,
@@ -1995,6 +2106,7 @@ export function useControlCenter() {
     setPassword: updatePassword,
     setWarpProfileInput: updateWarpProfileInput,
     setWindowsRuntimeMode: switchWindowsRuntimeMode,
+    setTransportProtocol: switchTransportProtocol,
     startTunnel,
     stopTunnel,
     deployServer,

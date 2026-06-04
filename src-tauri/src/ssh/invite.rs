@@ -28,9 +28,13 @@ struct InviteLinkPayload {
     invite_id: String,
     host: String,
     external_port: u16,
+    #[serde(default)]
+    vless_external_port: u16,
     cover_domain: String,
     shadow_pass: String,
     ss_password: String,
+    #[serde(default)]
+    vless_uuid: String,
     generated_at: u64,
 }
 
@@ -45,6 +49,8 @@ struct StoredInviteLinkRecord {
     shadow_pass: String,
     #[serde(default)]
     ss_user_password: String,
+    #[serde(default)]
+    vless_uuid: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -247,6 +253,7 @@ pub async fn delete_issued_invite_link(app: AppHandle, invite_id: String) -> Res
 }
 
 fn build_remote_invites_from_records(
+    app: &AppHandle,
     records: &[StoredInviteLinkRecord],
     remote_bootstrap: &RemoteTransportBootstrap,
 ) -> Result<Vec<RemoteInviteRecord>, String> {
@@ -254,10 +261,16 @@ fn build_remote_invites_from_records(
         .iter()
         .map(|record| {
             if !record.shadow_pass.trim().is_empty() && !record.ss_user_password.trim().is_empty() {
+                let vless_uuid = if record.vless_uuid.trim().is_empty() {
+                    tauri::async_runtime::block_on(crate::generator::generate_vless_uuid(app))?
+                } else {
+                    record.vless_uuid.clone()
+                };
                 return Ok(RemoteInviteRecord {
                     id: record.id.clone(),
                     shadow_pass: record.shadow_pass.clone(),
                     ss_user_password: record.ss_user_password.clone(),
+                    vless_uuid,
                     generated_at: record.generated_at,
                 });
             }
@@ -292,7 +305,7 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
         "Remote RKN container is not active. Deploy the server first.".to_string()
     })?;
 
-    let synced_invites = build_remote_invites_from_records(&records, &remote_bootstrap)?;
+    let synced_invites = build_remote_invites_from_records(app, &records, &remote_bootstrap)?;
     let (ss_server_password, master_ss_user_password, master_combined_password) =
         resolve_master_ss_transport(app, &remote_bootstrap)?;
     let warp_config = if remote_bootstrap.routing_mode == "warp" {
@@ -303,9 +316,11 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
     let server_cfg =
         crate::generator::build_server_config_with_invites(crate::generator::ServerConfigParams {
             master_shadow_pass: &remote_bootstrap.shadow_pass,
+            master_vless_uuid: &remote_bootstrap.vless_uuid,
             ss_server_password: &ss_server_password,
             master_ss_user_password: &master_ss_user_password,
             external_port: remote_bootstrap.external_port,
+            vless_external_port: remote_bootstrap.vless_external_port,
             internal_ss_port: remote_bootstrap.internal_ss_port,
             routing_mode: &remote_bootstrap.routing_mode,
             cover_domain: &remote_bootstrap.cover_domain,
@@ -315,12 +330,14 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
         });
     let bootstrap_cfg = json!({
         "external_port": remote_bootstrap.external_port,
+        "vless_external_port": remote_bootstrap.vless_external_port,
         "internal_ss_port": remote_bootstrap.internal_ss_port,
         "routing_mode": remote_bootstrap.routing_mode,
         "cover_domain": remote_bootstrap.cover_domain,
         "fallback_cover_domains": remote_bootstrap.fallback_cover_domains,
         "shadow_pass": remote_bootstrap.shadow_pass,
         "ss_password": master_combined_password,
+        "vless_uuid": remote_bootstrap.vless_uuid,
         "ss_server_password": ss_server_password,
         "issued_invites": synced_invites
     })
@@ -335,6 +352,7 @@ fn sync_invites_remote_from_local_records(app: &AppHandle) -> Result<(), String>
         &RemoteDeployExecution {
             container_name: &container_name,
             external_port: remote_bootstrap.external_port,
+            vless_external_port: remote_bootstrap.vless_external_port,
             internal_ss_port: remote_bootstrap.internal_ss_port,
             sing_box_image: pinned_sing_box_image_for_routing_mode(&remote_bootstrap.routing_mode),
             server_cfg: &server_cfg,
@@ -539,6 +557,7 @@ pub async fn generate_invite_link(app: AppHandle) -> Result<GeneratedInviteLinkR
 
     let invite_shadow_pass = crate::generator::generate_shadowtls_password(&app).await?;
     let invite_ss_user_password = crate::generator::generate_ss_password(&app).await?;
+    let invite_vless_uuid = crate::generator::generate_vless_uuid(&app).await?;
 
     let invite_app = app.clone();
     let result = tauri::async_runtime::spawn_blocking(
@@ -558,9 +577,11 @@ pub async fn generate_invite_link(app: AppHandle) -> Result<GeneratedInviteLinkR
                 invite_id: invite_id.clone(),
                 host: host.clone(),
                 external_port: bootstrap.external_port,
+                vless_external_port: bootstrap.vless_external_port,
                 cover_domain: bootstrap.cover_domain.clone(),
                 shadow_pass: invite_shadow_pass.clone(),
                 ss_password: invite_ss_password,
+                vless_uuid: invite_vless_uuid.clone(),
                 generated_at,
             };
             let payload_json =
@@ -579,6 +600,7 @@ pub async fn generate_invite_link(app: AppHandle) -> Result<GeneratedInviteLinkR
                     generated_at,
                     shadow_pass: invite_shadow_pass,
                     ss_user_password: invite_ss_user_password,
+                    vless_uuid: invite_vless_uuid,
                 },
             );
             save_issued_invite_records(&invite_app, &records)?;
@@ -618,14 +640,17 @@ pub async fn import_invite_link(
         move || -> Result<InviteImportResult, String> {
             let payload = parse_invite_link_payload(&invite_link)?;
             let local_rule_sets = ensure_local_client_rule_sets_sync(&app)?;
-            let client_cfg = crate::generator::build_client_config(
-                &payload.host,
-                &payload.shadow_pass,
-                &payload.ss_password,
-                payload.external_port,
-                &payload.cover_domain,
-                &local_rule_sets,
-            );
+            let client_cfg =
+                crate::generator::build_client_config(crate::generator::ClientConfigParams {
+                    server_ip: &payload.host,
+                    shadow_pass: &payload.shadow_pass,
+                    ss_password: &payload.ss_password,
+                    vless_uuid: &payload.vless_uuid,
+                    external_port: payload.external_port,
+                    vless_external_port: payload.vless_external_port,
+                    cover_domain: &payload.cover_domain,
+                    local_rule_sets: &local_rule_sets,
+                });
 
             std::fs::create_dir_all(&local_data).map_err(|e| e.to_string())?;
             let client_cfg_path = local_data.join("client_config.json");

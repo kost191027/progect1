@@ -741,7 +741,7 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
 
         override fun underNetworkExtension(): Boolean = false
 
-        override fun includeAllNetworks(): Boolean = false
+        override fun includeAllNetworks(): Boolean = true
 
         override fun clearDNSCache() {
         }

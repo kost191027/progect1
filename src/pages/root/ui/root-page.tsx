@@ -126,9 +126,13 @@ export function RootPage() {
               guardState={controlCenter.guardState}
               statusSummary={controlCenter.statusSummary}
               powerQuickStatus={controlCenter.powerQuickStatus}
+              transportProtocol={controlCenter.transportProtocol}
+              isVlessProvisioned={controlCenter.isVlessProvisioned}
+              isSavingTransportProtocol={controlCenter.isSavingTransportProtocol}
               isAndroidRuntime={controlCenter.isAndroidRuntime}
               onStart={controlCenter.startTunnel}
               onStop={controlCenter.stopTunnel}
+              onTransportProtocolChange={controlCenter.setTransportProtocol}
             />
           )}
           {activeScreen === "info" && <InfoScreen />}

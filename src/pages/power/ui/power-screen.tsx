@@ -1,5 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import type { GuardState, StatusSummary } from "../../../features/control-center/model/use-control-center";
+import type {
+  GuardState,
+  StatusSummary,
+  TransportProtocol,
+} from "../../../features/control-center/model/use-control-center";
 import { PowerIcon } from "../../../shared/ui/icons";
 import { ScreenHeader } from "../../../shared/ui/screen-header";
 
@@ -9,9 +13,13 @@ type PowerScreenProps = {
   guardState: GuardState;
   statusSummary: StatusSummary;
   powerQuickStatus: string;
+  transportProtocol: TransportProtocol;
+  isVlessProvisioned: boolean;
+  isSavingTransportProtocol: boolean;
   isAndroidRuntime?: boolean;
   onStart: () => void;
   onStop: () => void;
+  onTransportProtocolChange: (protocol: TransportProtocol) => void;
 };
 
 const STARTING_COPY_STEPS = [
@@ -43,9 +51,13 @@ export function PowerScreen({
   guardState,
   statusSummary,
   powerQuickStatus,
+  transportProtocol,
+  isVlessProvisioned,
+  isSavingTransportProtocol,
   isAndroidRuntime = false,
   onStart,
   onStop,
+  onTransportProtocolChange,
 }: PowerScreenProps) {
   const isStartingTunnel =
     isAndroidRuntime && isBusy && !isRunning && statusSummary.state === "connecting";
@@ -66,6 +78,7 @@ export function PowerScreen({
     [startingStep],
   );
   const visibleQuickStatus = powerQuickStatus;
+  const protocolSwitchDisabled = isBusy || isSavingTransportProtocol;
   const visibleStatusSummary =
     isAndroidRuntime && isStartingTunnel
       ? {
@@ -162,6 +175,38 @@ export function PowerScreen({
           >
             {visibleQuickStatus}
           </div>
+
+          <div className="flex items-center gap-1 rounded-full border border-zinc-800 bg-[#121313] p-1 text-[11px] font-bold uppercase tracking-[0.18em] text-zinc-500">
+            {(["shadowtls", "vless"] as const).map((protocol) => {
+              const isSelected = transportProtocol === protocol;
+              const label = protocol === "shadowtls" ? "ShadowTLS" : "VLESS";
+
+              return (
+                <button
+                  key={protocol}
+                  type="button"
+                  disabled={protocolSwitchDisabled}
+                  onClick={() => onTransportProtocolChange(protocol)}
+                  className={`rounded-full px-3 py-1.5 transition-colors ${
+                    isSelected
+                      ? "bg-[#263127] text-[#bde8c8]"
+                      : protocolSwitchDisabled
+                        ? "text-zinc-700"
+                        : "cursor-pointer text-zinc-500 hover:bg-zinc-900 hover:text-zinc-300"
+                  }`}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+
+          {transportProtocol === "vless" && !isVlessProvisioned ? (
+            <p className="max-w-[520px] text-center text-xs leading-5 text-zinc-500">
+              VLESS is selected, but this server profile does not include VLESS yet. Use
+              ShadowTLS to start now.
+            </p>
+          ) : null}
         </div>
 
         <div

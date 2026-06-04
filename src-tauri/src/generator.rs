@@ -14,6 +14,27 @@ use crate::geodata::{
 
 pub const INTERNAL_SS_PORT: u16 = 14433;
 
+fn constrain_fakeip_dns_rules_to_ip_queries(config: &mut Value) {
+    let Some(rules) = config
+        .get_mut("dns")
+        .and_then(|value| value.get_mut("rules"))
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+
+    for rule in rules {
+        let uses_fakeip = rule
+            .get("server")
+            .and_then(|value| value.as_str())
+            .is_some_and(|server| server == "fakeip-dns");
+
+        if uses_fakeip && rule.get("query_type").is_none() {
+            rule["query_type"] = json!(["A", "AAAA"]);
+        }
+    }
+}
+
 /// ShadowTLS cover domains.
 ///
 /// Stable domains used for first deploys.
@@ -250,11 +271,45 @@ pub async fn generate_ss_password(app: &AppHandle) -> Result<String, String> {
     }
 }
 
+pub async fn generate_vless_uuid(app: &AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        let bytes = random_bytes(16)?;
+        Ok(format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            (bytes[6] & 0x0f) | 0x40,
+            bytes[7],
+            (bytes[8] & 0x3f) | 0x80,
+            bytes[9],
+            bytes[10],
+            bytes[11],
+            bytes[12],
+            bytes[13],
+            bytes[14],
+            bytes[15]
+        ))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        run_singbox_generate(app, &["generate", "uuid"]).await
+    }
+}
+
 pub struct ServerConfigParams<'a> {
     pub master_shadow_pass: &'a str,
+    pub master_vless_uuid: &'a str,
     pub ss_server_password: &'a str,
     pub master_ss_user_password: &'a str,
     pub external_port: u16,
+    pub vless_external_port: u16,
     pub internal_ss_port: u16,
     pub routing_mode: &'a str,
     pub cover_domain: &'a str,
@@ -286,6 +341,20 @@ pub fn build_server_config_with_invites(params: ServerConfigParams<'_>) -> Strin
           "name": invite.id,
           "password": invite.ss_user_password
         })
+    }));
+    let mut vless_users = vec![json!({
+      "name": "master",
+      "uuid": params.master_vless_uuid
+    })];
+    vless_users.extend(params.issued_invites.iter().filter_map(|invite| {
+        if invite.vless_uuid.trim().is_empty() {
+            None
+        } else {
+            Some(json!({
+              "name": invite.id,
+              "uuid": invite.vless_uuid
+            }))
+        }
     }));
 
     let mut shadowtls_inbound = json!({
@@ -376,6 +445,16 @@ pub fn build_server_config_with_invites(params: ServerConfigParams<'_>) -> Strin
       "inbounds": [
         shadowtls_inbound,
         {
+          "type": "vless",
+          "tag": "vless-in",
+          "listen": listen_host,
+          "listen_port": params.vless_external_port,
+          "users": vless_users,
+          "multiplex": {
+            "enabled": true
+          }
+        },
+        {
           "type": "shadowsocks",
           "tag": "ss-in",
           "listen": "127.0.0.1",
@@ -398,15 +477,20 @@ pub fn build_server_config_with_invites(params: ServerConfigParams<'_>) -> Strin
     serde_json::to_string_pretty(&config).unwrap()
 }
 
-pub fn build_client_config(
-    server_ip: &str,
-    shadow_pass: &str,
-    ss_password: &str,
-    external_port: u16,
-    cover_domain: &str,
-    local_rule_sets: &[LocalRuleSetAsset],
-) -> String {
-    let local_rule_set_entries = local_rule_sets
+pub struct ClientConfigParams<'a> {
+    pub server_ip: &'a str,
+    pub shadow_pass: &'a str,
+    pub ss_password: &'a str,
+    pub vless_uuid: &'a str,
+    pub external_port: u16,
+    pub vless_external_port: u16,
+    pub cover_domain: &'a str,
+    pub local_rule_sets: &'a [LocalRuleSetAsset],
+}
+
+pub fn build_client_config(params: ClientConfigParams<'_>) -> String {
+    let local_rule_set_entries = params
+        .local_rule_sets
         .iter()
         .map(|rule_set| {
             json!({
@@ -417,7 +501,8 @@ pub fn build_client_config(
             })
         })
         .collect::<Vec<_>>();
-    let available_direct_rule_tags = local_rule_sets
+    let available_direct_rule_tags = params
+        .local_rule_sets
         .iter()
         .filter(|rule_set| DIRECT_ROUTE_RULE_SET_TAGS.contains(&rule_set.tag))
         .map(|rule_set| rule_set.tag)
@@ -427,7 +512,8 @@ pub fn build_client_config(
         .copied()
         .filter(|tag| !tag.starts_with("geoip-"))
         .collect::<Vec<_>>();
-    let google_rule_set_available = local_rule_sets
+    let google_rule_set_available = params
+        .local_rule_sets
         .iter()
         .any(|rule_set| rule_set.tag == GOOGLE_RULE_SET_TAG);
 
@@ -494,27 +580,38 @@ pub fn build_client_config(
         {
           "type": "shadowsocks",
           "tag": "proxy",
-          "server": server_ip,
-          "server_port": external_port,
+          "server": params.server_ip,
+          "server_port": params.external_port,
           "method": "2022-blake3-aes-128-gcm",
-          "password": ss_password,
+          "password": params.ss_password,
           "udp_over_tcp": true,
           "detour": "shadowtls-out"
         },
         {
           "type": "shadowtls",
           "tag": "shadowtls-out",
-          "server": server_ip,
-          "server_port": external_port,
+          "server": params.server_ip,
+          "server_port": params.external_port,
           "version": 3,
-          "password": shadow_pass,
+          "password": params.shadow_pass,
           "tls": {
             "enabled": true,
-            "server_name": cover_domain,
+              "server_name": params.cover_domain,
             "utls": {
               "enabled": true,
               "fingerprint": "chrome"
             }
+          }
+        },
+        {
+          "type": "vless",
+          "tag": "vless-proxy",
+          "server": params.server_ip,
+          "server_port": params.vless_external_port,
+          "uuid": params.vless_uuid,
+          "packet_encoding": "xudp",
+          "multiplex": {
+            "enabled": true
           }
         },
         {
@@ -546,7 +643,7 @@ pub fn build_client_config(
             "outbound": "proxy"
           },
           {
-            "ip_cidr": [format!("{}/32", server_ip)],
+            "ip_cidr": [format!("{}/32", params.server_ip)],
             "action": "route",
             "outbound": "direct"
           },
@@ -612,6 +709,12 @@ pub fn build_client_config(
             }));
     }
 
+    if params.vless_uuid.trim().is_empty() || params.vless_external_port == 0 {
+        if let Some(outbounds) = config["outbounds"].as_array_mut() {
+            outbounds.retain(|outbound| outbound["tag"] != "vless-proxy");
+        }
+    }
+
     config["route"]["rules"]
         .as_array_mut()
         .expect("route rules must be an array")
@@ -621,6 +724,8 @@ pub fn build_client_config(
           "action": "reject",
           "method": "default"
         }));
+
+    constrain_fakeip_dns_rules_to_ip_queries(&mut config);
 
     serde_json::to_string_pretty(&config).unwrap()
 }

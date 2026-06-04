@@ -16,6 +16,7 @@ use super::{
     snapshot_for_cover_domain, stream_remote_deploy_output, BackendAppRole, RemoteDeployTarget,
     RemoteTransportBootstrap, SavedServerProfile, TransportStateSnapshot, EXTERNAL_PORT_CANDIDATES,
     INTERNAL_SS_PORT_CANDIDATES, LEGACY_CONTAINER_NAME, PRIMARY_EXTERNAL_PORT,
+    VLESS_EXTERNAL_PORT_CANDIDATES,
 };
 
 const TRANSPORT_SMOKE_TARGETS: &[&str] = &[
@@ -57,6 +58,7 @@ fn backup_local_file_if_exists(path: &std::path::Path) -> Result<(), String> {
 pub(crate) struct RemoteDeployExecution<'a> {
     pub(crate) container_name: &'a str,
     pub(crate) external_port: u16,
+    pub(crate) vless_external_port: u16,
     pub(crate) internal_ss_port: u16,
     pub(crate) sing_box_image: &'a str,
     pub(crate) server_cfg: &'a str,
@@ -68,6 +70,11 @@ pub(crate) fn select_remote_deploy_target(
     short_id: &str,
 ) -> Result<RemoteDeployTarget, String> {
     let candidates = EXTERNAL_PORT_CANDIDATES
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let vless_candidates = VLESS_EXTERNAL_PORT_CANDIDATES
         .iter()
         .map(u16::to_string)
         .collect::<Vec<_>>()
@@ -84,8 +91,10 @@ pub(crate) fn select_remote_deploy_target(
 CONFIG_DIR="/opt/rkn"
 ACTIVE_CONTAINER_FILE="$CONFIG_DIR/container_name"
 ACTIVE_CONFIG="$CONFIG_DIR/config.json"
+ACTIVE_BOOTSTRAP="$CONFIG_DIR/bootstrap.json"
 PREVIOUS_CONTAINER=""
 SELECTED_PORT=""
+SELECTED_VLESS_PORT=""
 INTERNAL_PORT=""
 RKN_MANAGED_LABEL="com.freedom.rkn.managed=true"
 
@@ -120,13 +129,24 @@ if command -v docker >/dev/null 2>&1; then
     CURRENT_INTERNAL_PORT=""
     if [ -f "$ACTIVE_CONFIG" ] && command -v jq >/dev/null 2>&1; then
       CURRENT_PORT="$(jq -r '"'"'[.inbounds[]? | select(.type=="shadowtls") | .listen_port][0] // empty'"'"' "$ACTIVE_CONFIG" 2>/dev/null || true)"
+      CURRENT_VLESS_PORT="$(jq -r '"'"'[.inbounds[]? | select(.type=="vless") | .listen_port][0] // empty'"'"' "$ACTIVE_CONFIG" 2>/dev/null || true)"
       CURRENT_INTERNAL_PORT="$(jq -r '"'"'[.inbounds[]? | select(.type=="shadowsocks") | .listen_port][0] // empty'"'"' "$ACTIVE_CONFIG" 2>/dev/null || true)"
     fi
     if [ -z "$CURRENT_PORT" ] && [ -f "$ACTIVE_CONFIG" ]; then
       CURRENT_PORT="$(grep '"'"'"listen_port"'"' "$ACTIVE_CONFIG" | sed -n '1p' | sed -E '"'"'s/[^0-9]*([0-9]+).*/\1/'"'"' || true)"
     fi
+    if [ -z "$CURRENT_VLESS_PORT" ] && [ -f "$ACTIVE_BOOTSTRAP" ]; then
+      CURRENT_VLESS_PORT="$(grep '"'"'"vless_external_port"'"' "$ACTIVE_BOOTSTRAP" | sed -E '"'"'s/[^0-9]*([0-9]+).*/\1/'"'"' || true)"
+    fi
     if [ -z "$CURRENT_INTERNAL_PORT" ] && [ -f "$ACTIVE_CONFIG" ]; then
-      CURRENT_INTERNAL_PORT="$(grep '"'"'"listen_port"'"' "$ACTIVE_CONFIG" | sed -n '2p' | sed -E '"'"'s/[^0-9]*([0-9]+).*/\1/'"'"' || true)"
+      if [ -n "$CURRENT_VLESS_PORT" ]; then
+        CURRENT_INTERNAL_PORT="$(grep '"'"'"listen_port"'"' "$ACTIVE_CONFIG" | sed -n '3p' | sed -E '"'"'s/[^0-9]*([0-9]+).*/\1/'"'"' || true)"
+      else
+        CURRENT_INTERNAL_PORT="$(grep '"'"'"listen_port"'"' "$ACTIVE_CONFIG" | sed -n '2p' | sed -E '"'"'s/[^0-9]*([0-9]+).*/\1/'"'"' || true)"
+      fi
+    fi
+    if [ -z "$CURRENT_INTERNAL_PORT" ] && [ -f "$ACTIVE_BOOTSTRAP" ]; then
+      CURRENT_INTERNAL_PORT="$(grep '"'"'"internal_ss_port"'"' "$ACTIVE_BOOTSTRAP" | sed -E '"'"'s/[^0-9]*([0-9]+).*/\1/'"'"' || true)"
     fi
     if [ -n "$CURRENT_PORT" ]; then
       SELECTED_PORT="$CURRENT_PORT"
@@ -134,6 +154,10 @@ if command -v docker >/dev/null 2>&1; then
       echo "container=$PREVIOUS_CONTAINER"
       echo "reuse=true"
       echo "migrate_primary=false"
+      if [ -n "$CURRENT_VLESS_PORT" ]; then
+        SELECTED_VLESS_PORT="$CURRENT_VLESS_PORT"
+        echo "vless_port=$CURRENT_VLESS_PORT"
+      fi
       if [ -n "$CURRENT_INTERNAL_PORT" ]; then
         INTERNAL_PORT="$CURRENT_INTERNAL_PORT"
         echo "internal_port=$CURRENT_INTERNAL_PORT"
@@ -167,9 +191,25 @@ if [ -z "$INTERNAL_PORT" ]; then
   fi
 fi
 
-if [ -z "$SELECTED_PORT" ] || [ -z "$INTERNAL_PORT" ]; then
+if [ -z "$SELECTED_VLESS_PORT" ]; then
+  for port in {vless_candidates}; do
+    if [ "$port" = "$SELECTED_PORT" ]; then
+      continue
+    fi
+    if ! is_tcp_port_listening "$port"; then
+      SELECTED_VLESS_PORT="$port"
+      echo "vless_port=$port"
+      break
+    fi
+  done
+fi
+
+if [ -z "$SELECTED_PORT" ] || [ -z "$SELECTED_VLESS_PORT" ] || [ -z "$INTERNAL_PORT" ]; then
   if [ -z "$SELECTED_PORT" ]; then
     echo "missing_external_port=true"
+  fi
+  if [ -z "$SELECTED_VLESS_PORT" ]; then
+    echo "missing_vless_external_port=true"
   fi
   if [ -z "$INTERNAL_PORT" ]; then
     echo "missing_internal_port=true"
@@ -186,6 +226,7 @@ exit 0
 "#,
         legacy_container_name = LEGACY_CONTAINER_NAME,
         candidates = candidates,
+        vless_candidates = vless_candidates,
         internal_candidates = internal_candidates,
         generated_container_name = generated_container_name
     );
@@ -207,6 +248,7 @@ exit 0
     }
 
     let mut selected_port = None;
+    let mut selected_vless_port = None;
     let mut selected_internal_port = None;
     let mut selected_container_name = None;
     let mut reusing_existing_instance = false;
@@ -215,6 +257,8 @@ exit 0
     for line in stdout.lines() {
         if let Some(value) = line.trim().strip_prefix("port=") {
             selected_port = value.trim().parse::<u16>().ok();
+        } else if let Some(value) = line.trim().strip_prefix("vless_port=") {
+            selected_vless_port = value.trim().parse::<u16>().ok();
         } else if let Some(value) = line.trim().strip_prefix("internal_port=") {
             selected_internal_port = value.trim().parse::<u16>().ok();
         } else if let Some(value) = line.trim().strip_prefix("container=") {
@@ -234,6 +278,12 @@ exit 0
             stdout
         )
     })?;
+    let vless_external_port = selected_vless_port.ok_or_else(|| {
+        format!(
+            "Failed to parse remote selected VLESS port from output: {}",
+            stdout
+        )
+    })?;
     let internal_ss_port = selected_internal_port.ok_or_else(|| {
         format!(
             "Failed to parse remote selected internal SS port from output: {}",
@@ -244,6 +294,7 @@ exit 0
 
     Ok(RemoteDeployTarget {
         external_port,
+        vless_external_port,
         internal_ss_port,
         container_name,
         reusing_existing_instance,
@@ -293,9 +344,25 @@ fi
                 stdout.trim()
             )
         })?;
+    let vless_external_port = VLESS_EXTERNAL_PORT_CANDIDATES
+        .iter()
+        .copied()
+        .find(|port| *port != external_port && !socket_dump_contains_port(&stdout, *port))
+        .ok_or_else(|| {
+            format!(
+                "No free VLESS external ports found in fallback socket dump. Candidates: {}. Output: {}",
+                VLESS_EXTERNAL_PORT_CANDIDATES
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                stdout.trim()
+            )
+        })?;
 
     Ok(RemoteDeployTarget {
         external_port,
+        vless_external_port,
         internal_ss_port,
         container_name: build_container_name(short_id),
         reusing_existing_instance: false,
@@ -318,6 +385,7 @@ pub(crate) fn validate_remote_runtime(
     sess: &Session,
     container_name: &str,
     external_port: u16,
+    vless_external_port: u16,
     internal_ss_port: u16,
 ) -> Result<(), String> {
     let command = format!(
@@ -345,6 +413,13 @@ echo "$socket_dump" | grep -Eq ":{external_port}\b" || {{
   exit 1
 }}
 
+echo "$socket_dump" | grep -Eq ":{vless_external_port}\b" || {{
+  echo "[error] VLESS external port {vless_external_port} is not listening"
+  echo "[docker_logs]"
+  docker logs --tail 40 "{container_name}" 2>&1 || true
+  exit 1
+}}
+
 echo "$socket_dump" | grep -Eq ":{internal_ss_port}\b" || {{
   echo "[error] internal Shadowsocks port {internal_ss_port} is not listening"
   echo "[docker_logs]"
@@ -354,6 +429,7 @@ echo "$socket_dump" | grep -Eq ":{internal_ss_port}\b" || {{
 '"#,
         container_name = container_name,
         external_port = external_port,
+        vless_external_port = vless_external_port,
         internal_ss_port = internal_ss_port
     );
 
@@ -652,6 +728,7 @@ BOOTSTRAPEOF
         sess,
         execution.container_name,
         execution.external_port,
+        execution.vless_external_port,
         execution.internal_ss_port,
     )?;
 
@@ -803,11 +880,21 @@ pub async fn deploy_server(
                 );
             }
 
+            if remote_bootstrap.vless_external_port == 0 || remote_bootstrap.vless_uuid.is_empty() {
+                let _ = app.emit(
+                    "tunnel-log",
+                    "[SSH] Existing RKN runtime does not include VLESS yet. Falling back to Deploy/Update so both ShadowTLS and VLESS are provisioned."
+                        .to_string(),
+                );
+                return Ok(None);
+            }
+
             if let Err(error) =
                 validate_remote_runtime(
                     &sess,
                     &container_name,
                     remote_bootstrap.external_port,
+                    remote_bootstrap.vless_external_port,
                     remote_bootstrap.internal_ss_port,
                 )
             {
@@ -833,20 +920,35 @@ pub async fn deploy_server(
                 );
                 return Ok(None);
             }
+            if let Err(error) =
+                verify_external_port_reachable(&host, remote_bootstrap.vless_external_port)
+            {
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SSH WARN] Existing VLESS metadata was found, but the VLESS port is not reachable from this client. Falling back to a fresh deploy. Details: {}",
+                        error
+                    ),
+                );
+                return Ok(None);
+            }
 
             let effective_bootstrap = super::RemoteTransportBootstrap {
                 routing_mode: effective_routing_mode.to_string(),
                 ..remote_bootstrap.clone()
             };
             let local_rule_sets = ensure_local_client_rule_sets_sync(&app)?;
-            let client_cfg = crate::generator::build_client_config(
-                &host,
-                &effective_bootstrap.shadow_pass,
-                &effective_bootstrap.ss_password,
-                effective_bootstrap.external_port,
-                &effective_bootstrap.cover_domain,
-                &local_rule_sets,
-            );
+            let client_cfg =
+                crate::generator::build_client_config(crate::generator::ClientConfigParams {
+                    server_ip: &host,
+                    shadow_pass: &effective_bootstrap.shadow_pass,
+                    ss_password: &effective_bootstrap.ss_password,
+                    vless_uuid: &effective_bootstrap.vless_uuid,
+                    external_port: effective_bootstrap.external_port,
+                    vless_external_port: effective_bootstrap.vless_external_port,
+                    cover_domain: &effective_bootstrap.cover_domain,
+                    local_rule_sets: &local_rule_sets,
+                });
 
             emit_ssh_stage(
                 &app,
@@ -939,6 +1041,7 @@ pub async fn deploy_server(
 
         let deploy_target = select_remote_deploy_target(&sess, &short_id)?;
         let external_port = deploy_target.external_port;
+        let vless_external_port = deploy_target.vless_external_port;
         let internal_ss_port = deploy_target.internal_ss_port;
         let container_name = deploy_target.container_name;
 
@@ -976,7 +1079,7 @@ pub async fn deploy_server(
         let existing_bootstrap = load_remote_transport_bootstrap(&sess)?;
         let has_local_warp_profile = has_local_warp_profile_sync(&deploy_app)?;
         let has_remote_warp_profile = load_remote_warp_config(&sess)?.is_some();
-        let (shadow_pass, ss_server_password, master_ss_user_password, ss_password, routing_mode, cover_domain, fallback_cover_domains, issued_invites) =
+        let (shadow_pass, vless_uuid, ss_server_password, master_ss_user_password, ss_password, routing_mode, cover_domain, fallback_cover_domains, issued_invites) =
             if let Some(existing_bootstrap) = existing_bootstrap.clone() {
                 let _ = deploy_app.emit(
                     "tunnel-log",
@@ -998,8 +1101,17 @@ pub async fn deploy_server(
                 } else {
                     existing_bootstrap.routing_mode.clone()
                 };
+                let vless_uuid = if existing_bootstrap.vless_uuid.trim().is_empty() {
+                    tauri::async_runtime::block_on(crate::generator::generate_vless_uuid(
+                        &deploy_app,
+                    ))
+                    .map_err(|e| format!("VLESS UUID error: {}", e))?
+                } else {
+                    existing_bootstrap.vless_uuid.clone()
+                };
                 (
                     existing_bootstrap.shadow_pass.clone(),
+                    vless_uuid,
                     ss_server_password,
                     master_ss_user_password,
                     master_combined_password,
@@ -1034,8 +1146,13 @@ pub async fn deploy_server(
                 )
                     .map_err(|e| format!("Shadowsocks user password error: {}", e))?;
                 let ss_password = compose_multi_user_ss_password(&ss_server_password, &ss_user_password);
+                let vless_uuid = tauri::async_runtime::block_on(
+                    crate::generator::generate_vless_uuid(&deploy_app),
+                )
+                    .map_err(|e| format!("VLESS UUID error: {}", e))?;
                 (
                     shadow_pass,
+                    vless_uuid,
                     ss_server_password,
                     ss_user_password,
                     ss_password,
@@ -1062,6 +1179,13 @@ pub async fn deploy_server(
         );
         let _ = deploy_app.emit(
             "tunnel-log",
+            format!(
+                "[SYSTEM] VLESS fallback transport will listen on external port {}.",
+                vless_external_port
+            ),
+        );
+        let _ = deploy_app.emit(
+            "tunnel-log",
             format!("[SSH] ShadowTLS cover domain: {}", cover_domain),
         );
         let warp_config = if routing_mode == "warp" {
@@ -1077,9 +1201,11 @@ pub async fn deploy_server(
         let server_cfg = crate::generator::build_server_config_with_invites(
             crate::generator::ServerConfigParams {
                 master_shadow_pass: &shadow_pass,
+                master_vless_uuid: &vless_uuid,
                 ss_server_password: &ss_server_password,
                 master_ss_user_password: &master_ss_user_password,
                 external_port,
+                vless_external_port,
                 internal_ss_port,
                 routing_mode: &routing_mode,
                 cover_domain: &cover_domain,
@@ -1088,22 +1214,27 @@ pub async fn deploy_server(
                 warp: warp_config.as_ref(),
             },
         );
-        let client_cfg = crate::generator::build_client_config(
-            &host,
-            &shadow_pass,
-            &ss_password,
-            external_port,
-            &cover_domain,
-            &local_rule_sets,
-        );
+        let client_cfg =
+            crate::generator::build_client_config(crate::generator::ClientConfigParams {
+                server_ip: &host,
+                shadow_pass: &shadow_pass,
+                ss_password: &ss_password,
+                vless_uuid: &vless_uuid,
+                external_port,
+                vless_external_port,
+                cover_domain: &cover_domain,
+                local_rule_sets: &local_rule_sets,
+            });
         let bootstrap_cfg = json!({
             "external_port": external_port,
+            "vless_external_port": vless_external_port,
             "internal_ss_port": internal_ss_port,
             "routing_mode": routing_mode,
             "cover_domain": cover_domain,
             "fallback_cover_domains": fallback_cover_domains,
             "shadow_pass": shadow_pass,
             "ss_password": ss_password,
+            "vless_uuid": vless_uuid,
             "ss_server_password": ss_server_password,
             "issued_invites": issued_invites
         })
@@ -1123,6 +1254,7 @@ pub async fn deploy_server(
             &RemoteDeployExecution {
                 container_name: &container_name,
                 external_port,
+                vless_external_port,
                 internal_ss_port,
                 sing_box_image,
                 server_cfg: &server_cfg,
@@ -1139,6 +1271,7 @@ pub async fn deploy_server(
             ),
         );
         verify_external_port_reachable(&host, external_port)?;
+        verify_external_port_reachable(&host, vless_external_port)?;
 
         emit_ssh_stage(
             &deploy_app,
@@ -1170,12 +1303,14 @@ pub async fn deploy_server(
         save_backend_app_role(&deploy_app, BackendAppRole::Master)?;
         let fresh_bootstrap = RemoteTransportBootstrap {
             external_port,
+            vless_external_port,
             internal_ss_port,
             routing_mode,
             cover_domain: cover_domain.to_string(),
             fallback_cover_domains,
             shadow_pass: shadow_pass.clone(),
             ss_password: ss_password.clone(),
+            vless_uuid: vless_uuid.clone(),
             ss_server_password: ss_server_password.clone(),
             issued_invites,
         };

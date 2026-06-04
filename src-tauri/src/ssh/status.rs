@@ -24,6 +24,7 @@ fn local_transport_requires_redeploy(
         || local_state.cover_domain != remote_bootstrap.cover_domain
         || local_state.shadow_pass != remote_bootstrap.shadow_pass
         || local_state.ss_password != remote_bootstrap.ss_password
+        || local_state.vless_uuid != remote_bootstrap.vless_uuid
 }
 
 fn load_transport_state_snapshot_sync(
@@ -465,9 +466,11 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
         let server_cfg = crate::generator::build_server_config_with_invites(
             crate::generator::ServerConfigParams {
                 master_shadow_pass: &remote_bootstrap.shadow_pass,
+                master_vless_uuid: &remote_bootstrap.vless_uuid,
                 ss_server_password: &ss_server_password,
                 master_ss_user_password: &master_ss_user_password,
                 external_port: remote_bootstrap.external_port,
+                vless_external_port: remote_bootstrap.vless_external_port,
                 internal_ss_port: remote_bootstrap.internal_ss_port,
                 routing_mode: &remote_bootstrap.routing_mode,
                 cover_domain,
@@ -477,22 +480,27 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
             },
         );
         let local_rule_sets = ensure_local_client_rule_sets_sync(&rotate_app)?;
-        let client_cfg = crate::generator::build_client_config(
-            &profile.host,
-            &remote_bootstrap.shadow_pass,
-            &master_combined_password,
-            remote_bootstrap.external_port,
-            cover_domain,
-            &local_rule_sets,
-        );
+        let client_cfg =
+            crate::generator::build_client_config(crate::generator::ClientConfigParams {
+                server_ip: &profile.host,
+                shadow_pass: &remote_bootstrap.shadow_pass,
+                ss_password: &master_combined_password,
+                vless_uuid: &remote_bootstrap.vless_uuid,
+                external_port: remote_bootstrap.external_port,
+                vless_external_port: remote_bootstrap.vless_external_port,
+                cover_domain,
+                local_rule_sets: &local_rule_sets,
+            });
         let bootstrap_cfg = json!({
             "external_port": remote_bootstrap.external_port,
+            "vless_external_port": remote_bootstrap.vless_external_port,
             "internal_ss_port": remote_bootstrap.internal_ss_port,
             "routing_mode": remote_bootstrap.routing_mode,
             "cover_domain": cover_domain,
             "fallback_cover_domains": fallback_cover_domains,
             "shadow_pass": remote_bootstrap.shadow_pass,
             "ss_password": master_combined_password,
+            "vless_uuid": remote_bootstrap.vless_uuid,
             "ss_server_password": ss_server_password,
             "issued_invites": remote_bootstrap.issued_invites
         })
@@ -513,6 +521,7 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
             &RemoteDeployExecution {
                 container_name: &container_name,
                 external_port: remote_bootstrap.external_port,
+                vless_external_port: remote_bootstrap.vless_external_port,
                 internal_ss_port: remote_bootstrap.internal_ss_port,
                 sing_box_image: pinned_sing_box_image_for_routing_mode(
                     &remote_bootstrap.routing_mode,
@@ -528,12 +537,14 @@ pub async fn rotate_sni(app: AppHandle, target_domain: Option<String>) -> Result
 
         let rotated_bootstrap = super::RemoteTransportBootstrap {
             external_port: remote_bootstrap.external_port,
+            vless_external_port: remote_bootstrap.vless_external_port,
             internal_ss_port: remote_bootstrap.internal_ss_port,
             routing_mode: remote_bootstrap.routing_mode,
             cover_domain: cover_domain.to_string(),
             fallback_cover_domains,
             shadow_pass: remote_bootstrap.shadow_pass,
             ss_password: master_combined_password,
+            vless_uuid: remote_bootstrap.vless_uuid,
             ss_server_password,
             issued_invites: remote_bootstrap.issued_invites,
         };

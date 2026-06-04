@@ -6,7 +6,7 @@ use jni::JavaVM;
 use std::io::Write;
 #[cfg(not(any(target_os = "windows", target_os = "android")))]
 use std::os::unix::fs::MetadataExt;
-#[cfg(any(target_os = "windows", target_os = "android"))]
+#[cfg(target_os = "windows")]
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::{fs, path::PathBuf};
@@ -83,11 +83,24 @@ enum WindowsRuntimeMode {
     Compatibility,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TransportProtocol {
+    Shadowtls,
+    Vless,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 struct WindowsRuntimeModeStatus {
     mode: WindowsRuntimeMode,
     is_windows: bool,
     supports_compatibility_mode: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct TransportProtocolStatus {
+    protocol: TransportProtocol,
+    vless_provisioned: bool,
 }
 
 fn tunnel_pid_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -136,6 +149,40 @@ fn load_windows_runtime_mode(app: &AppHandle) -> Result<WindowsRuntimeMode, Stri
             )
         })
     }
+}
+
+fn selected_transport_protocol_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let local_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    Ok(local_data.join("selected_transport_protocol.json"))
+}
+
+fn load_selected_transport_protocol(app: &AppHandle) -> Result<TransportProtocol, String> {
+    let protocol_path = selected_transport_protocol_path(app)?;
+    if !protocol_path.exists() {
+        return Ok(TransportProtocol::Shadowtls);
+    }
+
+    let raw = fs::read_to_string(&protocol_path).map_err(|e| e.to_string())?;
+    serde_json::from_str::<TransportProtocol>(&raw).map_err(|e| {
+        format!(
+            "Invalid transport protocol config at {}: {}",
+            protocol_path.display(),
+            e
+        )
+    })
+}
+
+fn save_selected_transport_protocol(
+    app: &AppHandle,
+    protocol: TransportProtocol,
+) -> Result<(), String> {
+    let protocol_path = selected_transport_protocol_path(app)?;
+    if let Some(parent) = protocol_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let raw = serde_json::to_string(&protocol).map_err(|e| e.to_string())?;
+    fs::write(&protocol_path, raw).map_err(|e| e.to_string())
 }
 
 fn save_windows_runtime_mode(app: &AppHandle, mode: WindowsRuntimeMode) -> Result<(), String> {
@@ -285,12 +332,40 @@ fn client_config_exists(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-fn local_client_config_requires_refresh(app: &AppHandle) -> Result<bool, String> {
-    let config_path = app
+fn local_client_config_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
         .path()
         .app_local_data_dir()
         .map_err(|e| e.to_string())?
-        .join("client_config.json");
+        .join("client_config.json"))
+}
+
+fn local_client_config_has_vless_outbound(app: &AppHandle) -> Result<bool, String> {
+    let config_path = local_client_config_path(app)?;
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let contents = fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+    let config: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("Invalid client config JSON: {}", e))?;
+
+    Ok(config
+        .get("outbounds")
+        .and_then(|value| value.as_array())
+        .map(|outbounds| {
+            outbounds.iter().any(|outbound| {
+                outbound
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("vless"))
+            })
+        })
+        .unwrap_or(false))
+}
+
+fn local_client_config_requires_refresh(app: &AppHandle) -> Result<bool, String> {
+    let config_path = local_client_config_path(app)?;
 
     if !config_path.exists() {
         return Ok(false);
@@ -328,11 +403,7 @@ fn local_client_config_requires_refresh(app: &AppHandle) -> Result<bool, String>
 }
 
 fn normalize_local_client_config_for_runtime(app: &AppHandle) -> Result<(), String> {
-    let config_path = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("client_config.json");
+    let config_path = local_client_config_path(app)?;
 
     if !config_path.exists() {
         return Ok(());
@@ -391,6 +462,9 @@ fn normalize_local_client_config_for_runtime(app: &AppHandle) -> Result<(), Stri
     if force_route_default_domain_resolver_ipv4(&mut config) {
         changed = true;
     }
+    if constrain_fakeip_dns_rules_to_ip_queries(&mut config) {
+        changed = true;
+    }
 
     if changed {
         let rendered = serde_json::to_string_pretty(&config)
@@ -405,6 +479,66 @@ fn normalize_local_client_config_for_runtime(app: &AppHandle) -> Result<(), Stri
     }
 
     Ok(())
+}
+
+fn constrain_fakeip_dns_rules_to_ip_queries(cfg: &mut serde_json::Value) -> bool {
+    let Some(dns_rules) = cfg
+        .get_mut("dns")
+        .and_then(|value| value.get_mut("rules"))
+        .and_then(|value| value.as_array_mut())
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+
+    for rule in dns_rules {
+        let uses_fakeip = rule
+            .get("server")
+            .and_then(|value| value.as_str())
+            .is_some_and(|server| server == "fakeip-dns");
+
+        if uses_fakeip && rule.get("query_type").is_none() {
+            rule["query_type"] = serde_json::json!(["A", "AAAA"]);
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn apply_selected_transport_protocol_to_runtime_config(
+    cfg: &mut serde_json::Value,
+    protocol: TransportProtocol,
+) {
+    if protocol == TransportProtocol::Shadowtls {
+        return;
+    }
+
+    replace_runtime_proxy_tag(cfg, "vless-proxy");
+}
+
+fn replace_runtime_proxy_tag(value: &mut serde_json::Value, replacement: &str) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                if matches!(key.as_str(), "outbound" | "detour" | "final")
+                    && child.as_str() == Some("proxy")
+                {
+                    *child = serde_json::Value::String(replacement.to_string());
+                    continue;
+                }
+
+                replace_runtime_proxy_tag(child, replacement);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                replace_runtime_proxy_tag(item, replacement);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn route_ipv6_to_proxy_before_direct_rules(cfg: &mut serde_json::Value) -> bool {
@@ -554,7 +688,23 @@ fn process_exists(pid: u32) -> bool {
             .unwrap_or(false)
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output();
+
+        output
+            .map(|output| {
+                output.status.success()
+                    || String::from_utf8_lossy(&output.stderr)
+                        .to_ascii_lowercase()
+                        .contains("operation not permitted")
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         std::process::Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "pid="])
@@ -1192,11 +1342,6 @@ fn android_route_policy_error(message: &str) -> String {
 }
 
 #[cfg(any(target_os = "android", test))]
-fn android_direct_rule_set_dns_server() -> &'static str {
-    "local-dns"
-}
-
-#[cfg(any(target_os = "android", test))]
 fn inject_android_local_rule_sets(
     raw_config: &str,
     local_rule_sets: &[crate::geodata::LocalRuleSetAsset],
@@ -1263,23 +1408,31 @@ fn validate_android_runtime_route_policy(cfg: &serde_json::Value) -> Result<(), 
         .iter()
         .filter_map(|rule_set| rule_set.get("tag").and_then(|value| value.as_str()))
         .collect::<Vec<_>>();
+    let protected_outbound = route
+        .get("final")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| android_route_policy_error("route.final is missing"))?;
 
-    if route.get("final").and_then(|value| value.as_str()) != Some("proxy") {
-        return Err(android_route_policy_error("route.final must stay proxy"));
+    if !matches!(protected_outbound, "proxy" | "vless-proxy") {
+        return Err(android_route_policy_error(
+            "route.final must stay on a protected outbound",
+        ));
     }
 
     if route
         .get("default_domain_resolver")
         .and_then(|value| value.as_str())
-        != Some("local-dns")
+        != Some("remote-dns")
     {
         return Err(android_route_policy_error(
-            "route.default_domain_resolver must stay local-dns on Android",
+            "route.default_domain_resolver must stay remote-dns on Android",
         ));
     }
 
-    if dns.get("final").and_then(|value| value.as_str()) != Some("local-dns") {
-        return Err(android_route_policy_error("dns.final must stay local-dns"));
+    if dns.get("final").and_then(|value| value.as_str()) != Some("remote-dns") {
+        return Err(android_route_policy_error(
+            "dns.final must stay remote-dns in Android proxy safe-mode",
+        ));
     }
 
     let generic_udp_direct = route_rules.iter().any(|rule| {
@@ -1302,7 +1455,11 @@ fn validate_android_runtime_route_policy(cfg: &serde_json::Value) -> Result<(), 
 
     if route_rule_set_tags.contains(&crate::geodata::GOOGLE_RULE_SET_TAG) {
         let google_routes_proxy = route_rules.iter().any(|rule| {
-            android_rule_routes_rule_set_to(rule, crate::geodata::GOOGLE_RULE_SET_TAG, "proxy")
+            android_rule_routes_rule_set_to(
+                rule,
+                crate::geodata::GOOGLE_RULE_SET_TAG,
+                protected_outbound,
+            )
         });
         let google_dns_fakeip = dns_rules.iter().any(|rule| {
             android_dns_rule_uses_server(rule, crate::geodata::GOOGLE_RULE_SET_TAG, "fakeip-dns")
@@ -1326,19 +1483,18 @@ fn validate_android_runtime_route_policy(cfg: &serde_json::Value) -> Result<(), 
                 .iter()
                 .any(|rule| android_rule_routes_rule_set_to(rule, tag, "direct"))
         });
-        let dns_server = android_direct_rule_set_dns_server();
-        let dns_local = direct_rule_tags
+        let dns_direct = direct_rule_tags
             .iter()
             .filter(|tag| !tag.starts_with("geoip-"))
-            .all(|tag| {
+            .any(|tag| {
                 dns_rules
                     .iter()
-                    .any(|rule| android_dns_rule_uses_server(rule, tag, dns_server))
+                    .any(|rule| android_dns_rule_uses_server(rule, tag, "local-dns"))
             });
 
-        if !routes_direct || !dns_local {
+        if !routes_direct || dns_direct {
             return Err(android_route_policy_error(
-                "RU rule-sets must route direct and use the Android direct rule-set DNS server for domain rule-sets",
+                "Android RU rule-sets must route direct, but must not use local-dns on mobile; DNS stays remote/proxy to avoid split-DNS session breakage",
             ));
         }
     }
@@ -1347,9 +1503,13 @@ fn validate_android_runtime_route_policy(cfg: &serde_json::Value) -> Result<(), 
 }
 
 #[cfg(any(target_os = "android", test))]
-fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Result<String, String> {
+fn build_android_runtime_client_config(
+    raw_config: &str,
+    log_path: &str,
+    protocol: TransportProtocol,
+) -> Result<String, String> {
     if ANDROID_PROXY_FALLBACK_MODE {
-        return build_android_proxy_runtime_client_config(raw_config, log_path);
+        return build_android_proxy_runtime_client_config(raw_config, log_path, protocol);
     }
 
     let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
@@ -1382,6 +1542,10 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             }
 
             if let Some(object) = inbound.as_object_mut() {
+                object.insert(
+                    "address".to_string(),
+                    serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]),
+                );
                 object.remove("interface_name");
                 object.remove("gso");
                 // Newer libbox/sing-box rejects legacy sniff fields on inbounds.
@@ -1437,7 +1601,7 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         route.remove("network_strategy");
         route.insert(
             "default_domain_resolver".to_string(),
-            serde_json::json!("local-dns"),
+            serde_json::json!("remote-dns"),
         );
 
         let mut direct_rule_set_tags = Vec::<String>::new();
@@ -1536,13 +1700,6 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             }));
         }
 
-        route_rules.push(serde_json::json!({
-            "network": "udp",
-            "port": 443,
-            "action": "reject",
-            "method": "default"
-        }));
-
         route.insert("rules".to_string(), serde_json::json!(route_rules));
         route.insert("final".to_string(), serde_json::json!("proxy"));
     }
@@ -1553,7 +1710,6 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
-    let mut direct_dns_rule_set_tags = Vec::<String>::new();
     let mut google_dns_rule_set_available = false;
     for rule_set in route_rule_sets {
         let tag = rule_set
@@ -1562,9 +1718,6 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             .unwrap_or_default();
         if tag == crate::geodata::GOOGLE_RULE_SET_TAG {
             google_dns_rule_set_available = true;
-        }
-        if crate::geodata::DIRECT_ROUTE_RULE_SET_TAGS.contains(&tag) && !tag.starts_with("geoip-") {
-            direct_dns_rule_set_tags.push(tag.to_string());
         }
     }
 
@@ -1592,17 +1745,10 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
                 }
             ]),
         );
-        let android_direct_dns_server = android_direct_rule_set_dns_server();
-        let mut dns_rules = vec![
-            serde_json::json!({
-                "domain_suffix": crate::geodata::PROXY_PRIORITY_DOMAIN_SUFFIXES,
-                "server": "fakeip-dns"
-            }),
-            serde_json::json!({
-                "domain_suffix": crate::geodata::CURATED_RU_DOMAIN_SUFFIXES,
-                "server": android_direct_dns_server
-            }),
-        ];
+        let mut dns_rules = vec![serde_json::json!({
+            "domain_suffix": crate::geodata::PROXY_PRIORITY_DOMAIN_SUFFIXES,
+            "server": "fakeip-dns"
+        })];
 
         if google_dns_rule_set_available {
             dns_rules.insert(
@@ -1614,18 +1760,13 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
             );
         }
 
-        if !direct_dns_rule_set_tags.is_empty() {
-            dns_rules.push(serde_json::json!({
-                "rule_set": direct_dns_rule_set_tags,
-                "server": android_direct_dns_server
-            }));
-        }
-
         dns.insert("rules".to_string(), serde_json::json!(dns_rules));
-        dns.insert("final".to_string(), serde_json::json!("local-dns"));
+        dns.insert("final".to_string(), serde_json::json!("remote-dns"));
         dns.insert("strategy".to_string(), serde_json::json!("ipv4_only"));
     }
 
+    apply_selected_transport_protocol_to_runtime_config(&mut cfg, protocol);
+    constrain_fakeip_dns_rules_to_ip_queries(&mut cfg);
     validate_android_runtime_route_policy(&cfg)?;
 
     serde_json::to_string_pretty(&cfg)
@@ -1636,6 +1777,7 @@ fn build_android_runtime_client_config(raw_config: &str, log_path: &str) -> Resu
 fn build_android_proxy_runtime_client_config(
     raw_config: &str,
     log_path: &str,
+    protocol: TransportProtocol,
 ) -> Result<String, String> {
     let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
         format!(
@@ -1737,6 +1879,8 @@ fn build_android_proxy_runtime_client_config(
         dns.insert("final".to_string(), serde_json::json!("remote-dns"));
         dns.insert("strategy".to_string(), serde_json::json!("ipv4_only"));
     }
+
+    apply_selected_transport_protocol_to_runtime_config(&mut cfg, protocol);
 
     serde_json::to_string_pretty(&cfg).map_err(|e| {
         format!(
@@ -2074,7 +2218,10 @@ fn move_udp_443_reject_rule_to_route_tail(cfg: &mut serde_json::Value) {
 }
 
 #[cfg(not(target_os = "android"))]
-fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, String> {
+fn build_desktop_runtime_client_config(
+    raw_config: &str,
+    protocol: TransportProtocol,
+) -> Result<String, String> {
     let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
         format!(
             "Failed to parse generated client config for desktop runtime: {}",
@@ -2105,6 +2252,7 @@ fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, Strin
                     "address".to_string(),
                     serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]),
                 );
+                object.insert("mtu".to_string(), serde_json::json!(1500));
                 object.remove("sniff");
                 object.remove("sniff_override_destination");
             }
@@ -2149,7 +2297,9 @@ fn build_desktop_runtime_client_config(raw_config: &str) -> Result<String, Strin
 
     route_ipv6_to_proxy_before_direct_rules(&mut cfg);
     force_route_default_domain_resolver_ipv4(&mut cfg);
+    constrain_fakeip_dns_rules_to_ip_queries(&mut cfg);
     move_udp_443_reject_rule_to_route_tail(&mut cfg);
+    apply_selected_transport_protocol_to_runtime_config(&mut cfg, protocol);
 
     if let Some(dns_servers) = cfg
         .get_mut("dns")
@@ -2190,6 +2340,7 @@ fn build_windows_runtime_client_config(
     raw_config: &str,
     log_path: &str,
     mode: WindowsRuntimeMode,
+    protocol: TransportProtocol,
 ) -> Result<String, String> {
     let mut cfg = serde_json::from_str::<serde_json::Value>(raw_config).map_err(|e| {
         format!(
@@ -2372,6 +2523,8 @@ fn build_windows_runtime_client_config(
             }
         }
     }
+
+    apply_selected_transport_protocol_to_runtime_config(&mut cfg, protocol);
 
     serde_json::to_string_pretty(&cfg)
         .map_err(|e| format!("Failed to serialize Windows runtime client config: {}", e))
@@ -3009,7 +3162,7 @@ fn register_proxy_failure(app: &AppHandle, state: &AppState) {
     *engaged = true;
     let _ = app.emit(
         "tunnel-log",
-        "[GUARD] Proxy path is degraded. Kill-switch remains engaged for non-direct traffic."
+        "[GUARD] Proxy path is degraded. The tunnel is not working correctly. Please restart the application. Kill-switch remains engaged for non-direct traffic."
             .to_string(),
     );
     emit_guard_state(app, "engaged");
@@ -3028,18 +3181,27 @@ fn register_proxy_failure(app: &AppHandle, state: &AppState) {
 
     #[cfg(target_os = "macos")]
     {
-        if request_desktop_supervisor_core_restart(app, "Proxy transport is failing repeatedly.")
-            .is_err()
-        {
-            let _ = app.emit(
-                "tunnel-log",
-                "[SYSTEM] Proxy transport is failing repeatedly, but the desktop supervisor restart signal could not be created. Toggle the tunnel manually if traffic does not recover."
-                    .to_string(),
-            );
-        }
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Proxy transport reported a degraded burst. Keeping the current macOS tunnel session alive; the supervisor will only restart after an actual core exit or route loss."
+                .to_string(),
+        );
     }
 
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    #[cfg(target_os = "android")]
+    {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Proxy transport reported a degraded burst. Keeping the current Android VPN session alive instead of restarting the backend."
+                .to_string(),
+        );
+    }
+
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(target_os = "macos"),
+        not(target_os = "android")
+    ))]
     {
         if !begin_recovery(state) {
             return;
@@ -3068,7 +3230,8 @@ fn register_proxy_failure(app: &AppHandle, state: &AppState) {
 fn classify_proxy_failure(line: &str) -> bool {
     let lower = line.to_lowercase();
 
-    let proxy_outbound_failure = lower.contains("outbound/shadowsocks[proxy]")
+    let proxy_outbound_failure = (lower.contains("outbound/shadowsocks[proxy]")
+        || lower.contains("outbound/vless[vless-proxy]"))
         && (lower.contains("context deadline exceeded")
             || lower.contains("connection refused")
             || lower.contains("connection upload closed")
@@ -4818,6 +4981,7 @@ async fn prepare_android_runtime_launch(
     local_data: &std::path::Path,
     config_path: &std::path::Path,
     log_path: &str,
+    protocol: TransportProtocol,
     announce_prompt: bool,
 ) -> Result<AndroidRuntimeLaunchPlan, String> {
     let raw = std::fs::read_to_string(config_path).map_err(|e| {
@@ -4842,7 +5006,7 @@ async fn prepare_android_runtime_launch(
         ),
     );
     let android_config_path = local_data.join("client_config_android.json");
-    let runtime_cfg = match build_android_runtime_client_config(&raw, log_path) {
+    let runtime_cfg = match build_android_runtime_client_config(&raw, log_path, protocol) {
         Ok(config) => config,
         Err(error) => {
             if error.starts_with("[SECURITY]") {
@@ -5012,6 +5176,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
 
     let log_path = tunnel_log_path();
     let _ = std::fs::remove_file(log_path);
+    let selected_protocol = load_selected_transport_protocol(app)?;
 
     #[cfg(target_os = "windows")]
     {
@@ -5035,7 +5200,8 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                 e
             )
         })?;
-        let runtime_cfg = build_windows_runtime_client_config(&raw, log_path, runtime_mode)?;
+        let runtime_cfg =
+            build_windows_runtime_client_config(&raw, log_path, runtime_mode, selected_protocol)?;
         std::fs::write(&win_config_path, runtime_cfg).map_err(|e| {
             format!(
                 "Failed to write Windows runtime client config {}: {}",
@@ -5087,6 +5253,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                 &local_data,
                 &config_path,
                 log_path,
+                selected_protocol,
                 announce_prompt,
             )
             .await?
@@ -5211,7 +5378,7 @@ async fn launch_tunnel_process(app: &AppHandle, announce_prompt: bool) -> Result
                 )
             })?;
             let server_ip = extract_server_ip_from_config(&parsed);
-            let runtime_cfg = build_desktop_runtime_client_config(&raw)?;
+            let runtime_cfg = build_desktop_runtime_client_config(&raw, selected_protocol)?;
             std::fs::write(&desktop_config_path, runtime_cfg).map_err(|e| {
                 format!(
                     "Failed to write desktop runtime client config {}: {}",
@@ -5294,6 +5461,7 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
 
     let log_path = tunnel_log_path();
     let _ = std::fs::remove_file(log_path);
+    let selected_protocol = load_selected_transport_protocol(app)?;
 
     #[cfg(target_os = "android")]
     let restart_message = "[SYSTEM] Restarting Android VPN runtime after transport recovery...";
@@ -5314,7 +5482,8 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
                 e
             )
         })?;
-        let runtime_cfg = build_windows_runtime_client_config(&raw, log_path, runtime_mode)?;
+        let runtime_cfg =
+            build_windows_runtime_client_config(&raw, log_path, runtime_mode, selected_protocol)?;
         std::fs::write(&win_config_path, runtime_cfg).map_err(|e| {
             format!(
                 "Failed to write Windows runtime client config {}: {}",
@@ -5366,8 +5535,15 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
                 );
             }
 
-            match prepare_android_runtime_launch(app, &local_data, &config_path, log_path, false)
-                .await?
+            match prepare_android_runtime_launch(
+                app,
+                &local_data,
+                &config_path,
+                log_path,
+                selected_protocol,
+                false,
+            )
+            .await?
             {
                 AndroidRuntimeLaunchPlan::TunHandoffRequired {
                     tun_fd,
@@ -5489,7 +5665,7 @@ async fn restart_tunnel_process(app: &AppHandle, old_pid: u32) -> Result<u32, St
                 )
             })?;
             let server_ip = extract_server_ip_from_config(&parsed);
-            let runtime_cfg = build_desktop_runtime_client_config(&raw)?;
+            let runtime_cfg = build_desktop_runtime_client_config(&raw, selected_protocol)?;
             std::fs::write(&desktop_config_path, runtime_cfg).map_err(|e| {
                 format!(
                     "Failed to write desktop runtime client config {}: {}",
@@ -5876,6 +6052,9 @@ fn spawn_log_reader(app: AppHandle, pid: u32, log_path: &'static str) {
 
 fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
     tauri::async_runtime::spawn(async move {
+        #[cfg(target_os = "android")]
+        let mut android_stale_checks = 0_u8;
+
         loop {
             sleep(Duration::from_secs(2)).await;
 
@@ -5895,6 +6074,21 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
                     android_native_backend_status_state().unwrap_or_else(|_| "unknown".to_string());
                 let tun_ready = android_tun_interface_ready().unwrap_or(false);
                 if backend_state.starts_with("ready") && tun_ready {
+                    android_stale_checks = 0;
+                    continue;
+                }
+
+                android_stale_checks = android_stale_checks.saturating_add(1);
+                if android_stale_checks < 4 {
+                    if android_stale_checks == 1 {
+                        let _ = app.emit(
+                            "tunnel-log",
+                            format!(
+                                "[SYSTEM] Android runtime health check is briefly unsettled. Waiting before recovery. Backend state: {}, tun_ready={}",
+                                backend_state, tun_ready
+                            ),
+                        );
+                    }
                     continue;
                 }
 
@@ -5971,6 +6165,16 @@ fn spawn_process_exit_monitor(app: AppHandle, pid: u32) {
             }
 
             if !process_exists(pid) {
+                #[cfg(target_os = "macos")]
+                if macos_tun_route_ready() {
+                    let _ = app.emit(
+                        "tunnel-log",
+                        "[SYSTEM] macOS supervisor PID is temporarily not visible, but the TUN route is still active. Keeping the tunnel tracked without requesting administrator privileges."
+                            .to_string(),
+                    );
+                    continue;
+                }
+
                 #[cfg(target_os = "windows")]
                 {
                     // Old Windows systems can occasionally return a transient
@@ -6104,6 +6308,8 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
         let mut last_tick = std::time::Instant::now();
         #[cfg(target_os = "windows")]
         let mut adapter_missing = false;
+        #[cfg(target_os = "macos")]
+        let mut macos_missing_route_checks = 0_u8;
 
         loop {
             sleep(Duration::from_secs(5)).await;
@@ -6129,6 +6335,18 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
 
             #[cfg(target_os = "macos")]
             if !macos_tun_route_ready() {
+                macos_missing_route_checks = macos_missing_route_checks.saturating_add(1);
+                if macos_missing_route_checks < 3 {
+                    if macos_missing_route_checks == 1 {
+                        let _ = app.emit(
+                            "tunnel-log",
+                            "[SYSTEM] macOS TUN route is briefly unsettled. Waiting before refreshing the desktop core."
+                                .to_string(),
+                        );
+                    }
+                    continue;
+                }
+
                 let should_recover = {
                     let state = app.state::<AppState>();
                     begin_recovery(&state)
@@ -6163,6 +6381,11 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                 }
 
                 continue;
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                macos_missing_route_checks = 0;
             }
 
             #[cfg(target_os = "windows")]
@@ -6221,7 +6444,57 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                 }
             }
 
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "android")]
+            if elapsed >= Duration::from_secs(20) {
+                let state = app.state::<AppState>();
+                if begin_recovery(&state) {
+                    if let Some(fingerprint) = current_fingerprint.clone() {
+                        set_network_fingerprint(&state, Some(fingerprint));
+                    } else {
+                        set_network_fingerprint(&state, None);
+                    }
+
+                    reset_guard_state(&state);
+                    emit_guard_state(&app, "active");
+                    let _ = app.emit(
+                        "tunnel-log",
+                        "[SYSTEM] Android app resumed after sleep or backgrounding. Keeping the VPN backend alive and refreshing recovery state."
+                            .to_string(),
+                    );
+                    finish_recovery(&state);
+                }
+
+                continue;
+            }
+
+            #[cfg(target_os = "macos")]
+            if elapsed >= Duration::from_secs(20) {
+                let state = app.state::<AppState>();
+                if begin_recovery(&state) {
+                    if let Some(fingerprint) = current_fingerprint.clone() {
+                        set_network_fingerprint(&state, Some(fingerprint));
+                    } else {
+                        set_network_fingerprint(&state, None);
+                    }
+
+                    reset_guard_state(&state);
+                    emit_guard_state(&app, "active");
+                    let _ = app.emit(
+                        "tunnel-log",
+                        "[SYSTEM] macOS app resumed after sleep or suspension. Keeping the current privileged supervisor session alive."
+                            .to_string(),
+                    );
+                    finish_recovery(&state);
+                }
+
+                continue;
+            }
+
+            #[cfg(all(
+                not(target_os = "windows"),
+                not(target_os = "android"),
+                not(target_os = "macos")
+            ))]
             if elapsed >= Duration::from_secs(20) {
                 let should_recover = {
                     let state = app.state::<AppState>();
@@ -6279,7 +6552,43 @@ fn spawn_network_recovery_monitor(app: AppHandle, pid: u32) {
                 }
             }
 
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "android")]
+            {
+                if begin_recovery(&state) {
+                    if let Some(fingerprint) = current_fingerprint.clone() {
+                        set_network_fingerprint(&state, Some(fingerprint));
+                    }
+
+                    reset_guard_state(&state);
+                    emit_guard_state(&app, "active");
+                    let _ = app.emit(
+                        "tunnel-log",
+                        "[SYSTEM] Android network context changed. Keeping the current VPN backend alive and refreshing recovery state."
+                            .to_string(),
+                    );
+                    finish_recovery(&state);
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                if begin_recovery(&state) {
+                    reset_guard_state(&state);
+                    emit_guard_state(&app, "active");
+                    let _ = app.emit(
+                        "tunnel-log",
+                        "[SYSTEM] macOS network context changed. Keeping the current tunnel session alive and refreshing recovery state."
+                            .to_string(),
+                    );
+                    finish_recovery(&state);
+                }
+            }
+
+            #[cfg(all(
+                not(target_os = "windows"),
+                not(target_os = "android"),
+                not(target_os = "macos")
+            ))]
             {
                 let should_recover = {
                     let state = app.state::<AppState>();
@@ -6338,13 +6647,25 @@ fn spawn_post_start_transport_sync_check(app: AppHandle, pid: u32) {
 
 #[cfg(target_os = "android")]
 async fn wait_for_android_backend_shutdown(app: &AppHandle) {
+    let mut settled_checks = 0_u8;
+
     for _ in 0..60 {
         let backend_state =
             android_native_backend_status_state().unwrap_or_else(|_| "unknown".to_string());
+        let handoff_state =
+            android_backend_handoff_state().unwrap_or_else(|_| "unknown".to_string());
         let tun_ready = android_tun_interface_ready().unwrap_or(false);
 
-        if android_backend_state_is_stopped(&backend_state) && !tun_ready {
-            return;
+        if !tun_ready
+            && (android_backend_state_is_stopped(&backend_state)
+                || android_backend_state_is_stopped(&handoff_state))
+        {
+            settled_checks = settled_checks.saturating_add(1);
+            if settled_checks >= 3 {
+                return;
+            }
+        } else {
+            settled_checks = 0;
         }
 
         sleep(Duration::from_millis(200)).await;
@@ -6358,11 +6679,41 @@ async fn wait_for_android_backend_shutdown(app: &AppHandle) {
 }
 
 #[cfg(target_os = "android")]
-fn spawn_android_backend_shutdown_cleanup(app: &AppHandle) {
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        wait_for_android_backend_shutdown(&app).await;
-    });
+async fn stop_android_backend_runtime_and_wait(app: &AppHandle, reason: &str) {
+    if let Ok(session_id) = android_backend_handoff_session_id() {
+        let session_id = session_id.trim();
+        if !session_id.is_empty() {
+            let _ = android_abort_native_backend_session(session_id, reason);
+        }
+    }
+
+    let _ = stop_android_tunnel_service();
+    wait_for_android_backend_shutdown(app).await;
+    clear_android_native_backend_runtime_artifacts(app);
+}
+
+#[cfg(target_os = "android")]
+async fn prepare_android_backend_for_fresh_start(app: &AppHandle) {
+    let backend_state =
+        android_native_backend_status_state().unwrap_or_else(|_| "unknown".to_string());
+    let handoff_state = android_backend_handoff_state().unwrap_or_else(|_| "unknown".to_string());
+    let tun_ready = android_tun_interface_ready().unwrap_or(false);
+
+    if tun_ready
+        || android_backend_state_is_pending(&backend_state)
+        || android_backend_state_is_ready(&backend_state)
+        || android_backend_state_is_pending(&handoff_state)
+        || android_backend_state_is_ready(&handoff_state)
+    {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] Android backend is still settling from the previous session. Preparing a clean restart..."
+                .to_string(),
+        );
+        stop_android_backend_runtime_and_wait(app, "fresh-start-cleanup").await;
+    }
+
+    clear_android_native_backend_runtime_artifacts(app);
 }
 
 #[cfg(target_os = "android")]
@@ -6405,17 +6756,7 @@ fn clear_android_native_backend_runtime_artifacts(app: &AppHandle) {
 
 #[cfg(target_os = "android")]
 async fn rollback_android_tunnel_start_failure(app: &AppHandle, reason: &str) {
-    if let Ok(local_data) = app.path().app_local_data_dir() {
-        if let Ok(Some(snapshot)) = load_android_runtime_context(&local_data) {
-            if !snapshot.session_id.is_empty() {
-                let _ = android_abort_native_backend_session(&snapshot.session_id, reason);
-            }
-        }
-    }
-
-    let _ = stop_android_tunnel_service();
-    wait_for_android_backend_shutdown(app).await;
-    clear_android_native_backend_runtime_artifacts(app);
+    stop_android_backend_runtime_and_wait(app, reason).await;
 }
 
 async fn verify_tunnel_start_or_cleanup(
@@ -6439,9 +6780,8 @@ mod tests {
     use super::{
         android_local_proxy_inbound_error, build_android_runtime_client_config, escape_applescript,
         find_android_local_proxy_inbound_violation, inject_android_local_rule_sets,
-        shell_single_quote, validate_android_runtime_route_policy,
+        shell_single_quote, validate_android_runtime_route_policy, TransportProtocol,
     };
-    use crate::android_direct_rule_set_dns_server;
 
     #[test]
     fn escape_applescript_preserves_shell_special_chars_inside_string_literal() {
@@ -6637,6 +6977,7 @@ mod tests {
         let rendered = build_android_runtime_client_config(
             &android_policy_base_config(),
             "/data/user/0/com.freedom.rkn/files/rkn-tun.log",
+            TransportProtocol::Shadowtls,
         )
         .expect("Android runtime config should be generated");
         let config = serde_json::from_str::<serde_json::Value>(&rendered)
@@ -6654,6 +6995,10 @@ mod tests {
         assert_eq!(tun["strict_route"], false);
         assert_eq!(tun["stack"], "gvisor");
         assert_eq!(tun["mtu"], 1280);
+        assert_eq!(
+            tun["address"],
+            serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"])
+        );
         assert!(tun.get("interface_name").is_none());
         assert!(tun.get("sniff").is_none());
 
@@ -6672,23 +7017,11 @@ mod tests {
             }) && rule["outbound"] == "direct"
         }));
 
-        let ru_route_index = route_rules
-            .iter()
-            .position(|rule| {
-                rule["rule_set"].as_array().is_some_and(|rule_sets| {
-                    rule_sets.iter().any(|value| value == "geosite-category-ru")
-                }) && rule["outbound"] == "direct"
-            })
-            .expect("RU geodata route rule should exist");
-        let udp_443_reject_index = route_rules
-            .iter()
-            .position(|rule| {
-                rule["action"] == "reject" && rule["network"] == "udp" && rule["port"] == 443
-            })
-            .expect("UDP/443 fallback reject should exist");
         assert!(
-            ru_route_index < udp_443_reject_index,
-            "RU direct geodata must be evaluated before generic UDP/443 reject"
+            route_rules.iter().all(|rule| {
+                !(rule["network"] == "udp" && rule["action"] == "reject")
+            }),
+            "Android gameplay UDP must remain routable through route.final=proxy instead of being rejected"
         );
         assert!(
             route_rules.iter().all(|rule| {
@@ -6702,19 +7035,65 @@ mod tests {
         let dns_rules = config["dns"]["rules"]
             .as_array()
             .expect("dns rules should be an array");
-        assert_eq!(config["route"]["default_domain_resolver"], "local-dns");
-        assert_eq!(config["dns"]["final"], "local-dns");
+        assert_eq!(config["route"]["default_domain_resolver"], "remote-dns");
+        assert_eq!(config["dns"]["final"], "remote-dns");
         assert!(dns_rules.iter().any(|rule| {
             rule["rule_set"]
                 .as_array()
                 .is_some_and(|rule_sets| rule_sets.iter().any(|value| value == "geosite-google"))
                 && rule["server"] == "fakeip-dns"
+                && rule["query_type"] == serde_json::json!(["A", "AAAA"])
         }));
-        assert!(dns_rules.iter().any(|rule| {
-            rule["rule_set"].as_array().is_some_and(|rule_sets| {
+        assert!(dns_rules.iter().all(|rule| {
+            !(rule["rule_set"].as_array().is_some_and(|rule_sets| {
                 rule_sets.iter().any(|value| value == "geosite-category-ru")
-            }) && rule["server"] == android_direct_rule_set_dns_server()
+            }) && rule["server"] == "local-dns")
         }));
+    }
+
+    #[test]
+    fn android_runtime_config_can_switch_protected_outbound_to_vless() {
+        let mut config = serde_json::from_str::<serde_json::Value>(&android_policy_base_config())
+            .expect("base config must parse");
+        config["outbounds"]
+            .as_array_mut()
+            .expect("outbounds should be an array")
+            .insert(
+                0,
+                serde_json::json!({
+                    "type": "vless",
+                    "tag": "vless-proxy",
+                    "server": "203.0.113.10",
+                    "server_port": 8443,
+                    "uuid": "11111111-1111-4111-8111-111111111111"
+                }),
+            );
+
+        let rendered = build_android_runtime_client_config(
+            &config.to_string(),
+            "/data/user/0/com.freedom.rkn/files/rkn-tun.log",
+            TransportProtocol::Vless,
+        )
+        .expect("Android VLESS runtime config should be generated");
+        let runtime_config = serde_json::from_str::<serde_json::Value>(&rendered)
+            .expect("runtime config should parse");
+
+        assert_eq!(runtime_config["route"]["final"], "vless-proxy");
+        assert!(runtime_config["route"]["rules"]
+            .as_array()
+            .expect("route rules should be an array")
+            .iter()
+            .any(|rule| rule["rule_set"]
+                .as_array()
+                .is_some_and(|rule_sets| rule_sets.iter().any(|value| value == "geosite-google"))
+                && rule["outbound"] == "vless-proxy"));
+        assert!(runtime_config["dns"]["servers"]
+            .as_array()
+            .expect("dns servers should be an array")
+            .iter()
+            .any(|server| server["tag"] == "remote-dns" && server["detour"] == "vless-proxy"));
+        validate_android_runtime_route_policy(&runtime_config)
+            .expect("VLESS protected route policy should pass audit");
     }
 
     #[test]
@@ -6726,6 +7105,7 @@ mod tests {
         let error = build_android_runtime_client_config(
             &config.to_string(),
             "/data/user/0/com.freedom.rkn/files/rkn-tun.log",
+            TransportProtocol::Shadowtls,
         )
         .expect_err("Android runtime must reject remote rule-set entries");
 
@@ -6762,6 +7142,7 @@ mod tests {
         let rendered = build_android_runtime_client_config(
             &injected,
             "/data/user/0/com.freedom.rkn/files/rkn-tun.log",
+            TransportProtocol::Shadowtls,
         )
         .expect("Android runtime config should use injected local rule-sets");
         let runtime_config = serde_json::from_str::<serde_json::Value>(&rendered)
@@ -6791,17 +7172,75 @@ mod tests {
 
 async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    {
+    let existing_pid = {
         let guard = state.singbox_pid.lock().unwrap();
-        if guard.is_some() {
+        *guard
+    };
+
+    if let Some(pid) = existing_pid {
+        #[cfg(target_os = "android")]
+        {
+            if is_android_native_backend_pid(pid) {
+                let backend_state =
+                    android_native_backend_status_state().unwrap_or_else(|_| "unknown".to_string());
+                let tun_ready = android_tun_interface_ready().unwrap_or(false);
+
+                if !android_backend_state_is_ready(&backend_state) || !tun_ready {
+                    let _ = app.emit(
+                        "tunnel-log",
+                        format!(
+                            "[SYSTEM] Android previous tunnel session is stale before start. Cleaning it up first. Backend state: {}, tun_ready={}",
+                            backend_state, tun_ready
+                        ),
+                    );
+                    {
+                        let mut guard = state.singbox_pid.lock().unwrap();
+                        if guard.as_ref() == Some(&pid) {
+                            *guard = None;
+                        }
+                    }
+                    clear_saved_tunnel_pid(&app);
+                    stop_android_backend_runtime_and_wait(&app, "stale-start-cleanup").await;
+                } else {
+                    return Err("Tunnel is already running".to_string());
+                }
+            } else {
+                return Err("Tunnel is already running".to_string());
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = pid;
             return Err("Tunnel is already running".to_string());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    if macos_tun_route_ready() {
+        let _ = app.emit(
+            "tunnel-log",
+            "[SYSTEM] macOS has an active orphaned tunnel route before start. Cleaning stale desktop runtime state first."
+                .to_string(),
+        );
+        macos_force_stop_orphaned_desktop_tunnel(&app);
+        sleep(Duration::from_millis(800)).await;
+        clear_saved_tunnel_pid(&app);
     }
 
     #[cfg(target_os = "macos")]
     clear_desktop_manual_stop_marker(&app);
 
     normalize_local_client_config_for_runtime(&app)?;
+
+    let selected_protocol = load_selected_transport_protocol(&app)?;
+    if selected_protocol == TransportProtocol::Vless
+        && !local_client_config_has_vless_outbound(&app)?
+    {
+        let message = "VLESS transport is selected, but this server profile has not provisioned VLESS yet. Switch back to ShadowTLS or deploy a server profile with VLESS support before starting the tunnel.";
+        let _ = app.emit("tunnel-log", format!("[ERROR] {}", message));
+        return Err(message.to_string());
+    }
 
     if local_client_config_requires_refresh(&app)? {
         let _ = app.emit(
@@ -6822,7 +7261,7 @@ async fn start_tunnel_inner(app: AppHandle) -> Result<(), String> {
 
     #[cfg(target_os = "android")]
     {
-        clear_android_native_backend_runtime_artifacts(&app);
+        prepare_android_backend_for_fresh_start(&app).await;
 
         if ANDROID_PROXY_FALLBACK_MODE {
             let _ = app.emit(
@@ -6961,14 +7400,11 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             } else if cfg!(target_os = "android") && is_android_native_backend_pid(pid) {
                 #[cfg(target_os = "android")]
                 {
-                    let _ = stop_android_tunnel_service();
-                    clear_android_native_backend_runtime_artifacts(&app);
-                    spawn_android_backend_shutdown_cleanup(&app);
+                    stop_android_backend_runtime_and_wait(&app, "user-stop").await;
                 }
                 let _ = app.emit(
                     "tunnel-log",
-                    "[SYSTEM] Android native backend stop signal sent. Routing disabled."
-                        .to_string(),
+                    "[SYSTEM] Android native backend stopped. Routing disabled.".to_string(),
                 );
             } else if terminate_root_process(Some(&app), pid).is_ok() {
                 let _ = app.emit(
@@ -6992,9 +7428,7 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             let _ = clear_windows_system_proxy();
             #[cfg(target_os = "android")]
             if !is_android_native_backend_pid(pid) {
-                let _ = stop_android_tunnel_service();
-                clear_android_native_backend_runtime_artifacts(&app);
-                spawn_android_backend_shutdown_cleanup(&app);
+                stop_android_backend_runtime_and_wait(&app, "process-stop").await;
             }
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
@@ -7028,9 +7462,7 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             let _ = clear_windows_system_proxy();
             #[cfg(target_os = "android")]
             {
-                let _ = stop_android_tunnel_service();
-                clear_android_native_backend_runtime_artifacts(&app);
-                spawn_android_backend_shutdown_cleanup(&app);
+                stop_android_backend_runtime_and_wait(&app, "no-active-tunnel-stop").await;
             }
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
@@ -7059,6 +7491,7 @@ async fn reset_local_data(app: AppHandle) -> Result<(), String> {
         local_data.join("elevated_singbox_bootstrap.ps1"),
         local_data.join("elevated_singbox.pid"),
         local_data.join("windows_runtime_mode.json"),
+        local_data.join("selected_transport_protocol.json"),
     ];
 
     for path in files_to_remove {
@@ -7093,6 +7526,46 @@ async fn reset_local_data(app: AppHandle) -> Result<(), String> {
     );
 
     Ok(())
+}
+
+#[tauri::command]
+async fn get_selected_transport_protocol(
+    app: AppHandle,
+) -> Result<TransportProtocolStatus, String> {
+    Ok(TransportProtocolStatus {
+        protocol: load_selected_transport_protocol(&app)?,
+        vless_provisioned: local_client_config_has_vless_outbound(&app)?,
+    })
+}
+
+#[tauri::command]
+async fn set_selected_transport_protocol(
+    app: AppHandle,
+    protocol: TransportProtocol,
+) -> Result<TransportProtocolStatus, String> {
+    save_selected_transport_protocol(&app, protocol)?;
+
+    let vless_provisioned = local_client_config_has_vless_outbound(&app)?;
+    let message = match protocol {
+        TransportProtocol::Shadowtls => {
+            "[SYSTEM] ShadowTLS transport selected. Existing ShadowTLS/Shadowsocks profile remains active."
+                .to_string()
+        }
+        TransportProtocol::Vless if vless_provisioned => {
+            "[SYSTEM] VLESS transport selected. A VLESS outbound is present in the local client profile."
+                .to_string()
+        }
+        TransportProtocol::Vless => {
+            "[SYSTEM] VLESS transport selected, but this server profile has not provisioned VLESS yet. Switch back to ShadowTLS to start now."
+                .to_string()
+        }
+    };
+    let _ = app.emit("tunnel-log", message);
+
+    Ok(TransportProtocolStatus {
+        protocol,
+        vless_provisioned,
+    })
 }
 
 #[tauri::command]
@@ -7734,6 +8207,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_tunnel,
             stop_tunnel,
+            get_selected_transport_protocol,
+            set_selected_transport_protocol,
             get_windows_runtime_mode,
             get_android_runtime_context,
             check_android_route_policy,

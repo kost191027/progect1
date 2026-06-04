@@ -63,6 +63,208 @@ function resolvePrebuiltBin(ndkHome) {
   return hostDir ? join(hostDir, "bin") : "";
 }
 
+function optionConsumesValue(option) {
+  return new Set([
+    "--features",
+    "-f",
+    "--config",
+    "-c",
+    "--additional-watch-folders",
+    "--host",
+    "--port",
+    "--root-certificate-path",
+  ]).has(option);
+}
+
+function hasExplicitAndroidDevice(commandArgs) {
+  let consumeNext = false;
+  for (const arg of commandArgs.slice(1)) {
+    if (arg === "--") {
+      return false;
+    }
+    if (consumeNext) {
+      consumeNext = false;
+      continue;
+    }
+    if (optionConsumesValue(arg)) {
+      consumeNext = true;
+      continue;
+    }
+    if (arg.startsWith("-")) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+function resolveAdbPath(androidHome) {
+  const sdkAdb = join(androidHome, "platform-tools", "adb");
+  return existsSync(sdkAdb) ? sdkAdb : "adb";
+}
+
+function parseAdbDevices(output) {
+  return output
+    .split(/\r?\n/)
+    .slice(1)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [serial = "", state = ""] = line.split(/\s+/, 2);
+      return { serial, state, line };
+    })
+    .filter((device) => device.serial);
+}
+
+function detectAndroidDeviceForRun(adbPath) {
+  const startResult = spawnSync(adbPath, ["start-server"], {
+    encoding: "utf8",
+  });
+
+  if (startResult.status !== 0) {
+    const message = [startResult.stderr, startResult.stdout].filter(Boolean).join("\n").trim();
+    fail(
+      [
+        "Android launcher could not start adb server.",
+        message,
+        "",
+        "Try:",
+        "  adb kill-server",
+        "  adb start-server",
+        "  adb devices -l",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  }
+
+  const devicesResult = spawnSync(adbPath, ["devices", "-l"], {
+    encoding: "utf8",
+  });
+
+  if (devicesResult.status !== 0) {
+    const message = [devicesResult.stderr, devicesResult.stdout].filter(Boolean).join("\n").trim();
+    fail(
+      [
+        "Android launcher could not list adb devices.",
+        message,
+        "",
+        "Try:",
+        "  adb kill-server",
+        "  adb start-server",
+        "  adb devices -l",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  }
+
+  const devices = parseAdbDevices(devicesResult.stdout);
+  const readyDevices = devices.filter((device) => device.state === "device");
+
+  if (readyDevices.length === 1) {
+    return readyDevices[0].serial;
+  }
+
+  if (readyDevices.length > 1) {
+    fail(
+      [
+        "Multiple Android devices are connected. Pass the device serial explicitly.",
+        "",
+        devicesResult.stdout.trim(),
+        "",
+        "Example:",
+        `  npm run tauri:android:run -- ${readyDevices[0].serial}`,
+      ].join("\n"),
+    );
+  }
+
+  const unauthorized = devices.filter((device) => device.state === "unauthorized");
+  if (unauthorized.length > 0) {
+    fail(
+      [
+        "Android device is connected, but USB debugging is not authorized.",
+        "",
+        devicesResult.stdout.trim(),
+        "",
+        "Unlock the phone, accept the USB debugging fingerprint prompt, then run:",
+        "  adb devices -l",
+        "  npm run tauri:android:run",
+      ].join("\n"),
+    );
+  }
+
+  const offline = devices.filter((device) => device.state === "offline");
+  if (offline.length > 0) {
+    fail(
+      [
+        "Android device is visible to adb but currently offline.",
+        "",
+        devicesResult.stdout.trim(),
+        "",
+        "Try reconnecting USB, then run:",
+        "  adb kill-server",
+        "  adb start-server",
+        "  adb devices -l",
+      ].join("\n"),
+    );
+  }
+
+  fail(
+    [
+      "No Android device in adb state 'device'. Tauri would fall back to emulator detection and fail.",
+      "",
+      devicesResult.stdout.trim(),
+      "",
+      "Check on the phone:",
+      "  USB debugging is enabled",
+      "  the USB debugging fingerprint prompt is accepted",
+      "  USB mode is file transfer / media transfer",
+      "",
+      "Then run:",
+      "  adb devices -l",
+      "  npm run tauri:android:run",
+    ].join("\n"),
+  );
+}
+
+function androidDebugApkPath() {
+  return join(
+    cwd,
+    "src-tauri",
+    "gen",
+    "android",
+    "app",
+    "build",
+    "outputs",
+    "apk",
+    "arm64",
+    "debug",
+    "app-arm64-debug.apk",
+  );
+}
+
+function installAndLaunchAndroidDebugApk(adbPath, deviceSerial) {
+  const apkPath = androidDebugApkPath();
+  if (!existsSync(apkPath)) {
+    fail(`Android debug APK was not produced at ${apkPath}.`);
+  }
+
+  const installResult = spawnSync(adbPath, ["-s", deviceSerial, "install", "-r", apkPath], {
+    stdio: "inherit",
+  });
+  if (installResult.status !== 0) {
+    process.exit(installResult.status ?? 1);
+  }
+
+  const launchResult = spawnSync(
+    adbPath,
+    ["-s", deviceSerial, "shell", "am", "start", "-n", "com.freedom.rkn/.MainActivity"],
+    { stdio: "inherit" },
+  );
+  process.exit(launchResult.status ?? 1);
+}
+
 const fallbackJavaHome = firstExistingDir(fallbackJavaHomes);
 const javaHome =
   isAndroidCompatibleJavaHome(process.env.JAVA_HOME || "")
@@ -132,6 +334,60 @@ if (passthroughIndex === -1) {
   androidArgs.push(...configArgs);
 } else {
   androidArgs.splice(passthroughIndex, 0, ...configArgs);
+}
+
+const command = androidArgs[0];
+let selectedAndroidDevice = process.env.ANDROID_SERIAL || "";
+if ((command === "run" || command === "dev") && !hasExplicitAndroidDevice(androidArgs)) {
+  selectedAndroidDevice = detectAndroidDeviceForRun(resolveAdbPath(androidHome));
+  const nextPassthroughIndex = androidArgs.indexOf("--");
+  if (nextPassthroughIndex === -1) {
+    androidArgs.push(selectedAndroidDevice);
+  } else {
+    androidArgs.splice(nextPassthroughIndex, 0, selectedAndroidDevice);
+  }
+}
+
+if (selectedAndroidDevice) {
+  env.ANDROID_SERIAL = selectedAndroidDevice;
+}
+
+if (command === "run") {
+  if (!selectedAndroidDevice) {
+    selectedAndroidDevice = detectAndroidDeviceForRun(resolveAdbPath(androidHome));
+    env.ANDROID_SERIAL = selectedAndroidDevice;
+  }
+
+  const buildArgs = [
+    "android",
+    "build",
+    "--debug",
+    "--apk",
+    "--target",
+    "aarch64",
+    "--config",
+    androidDevConfig,
+  ];
+
+  // Keep this custom run path. Tauri CLI 2.x can fall back to emulator
+  // discovery even when adb sees a physical USB device. Our project run command
+  // must remain one-step and stable: build the debug APK, then install/launch
+  // it on the adb-detected phone explicitly.
+  const buildResult = spawnSync("tauri", buildArgs, {
+    cwd,
+    env,
+    stdio: "inherit",
+  });
+
+  if (buildResult.error) {
+    fail(`Failed to launch tauri android build: ${buildResult.error.message}`);
+  }
+
+  if (buildResult.status !== 0) {
+    process.exit(buildResult.status ?? 1);
+  }
+
+  installAndLaunchAndroidDebugApk(resolveAdbPath(androidHome), selectedAndroidDevice);
 }
 
 const result = spawnSync("tauri", ["android", ...androidArgs], {

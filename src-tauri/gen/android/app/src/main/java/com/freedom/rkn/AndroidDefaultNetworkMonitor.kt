@@ -162,9 +162,6 @@ object AndroidDefaultNetworkMonitor {
                 notifyListener(context.applicationContext, recoveredNetwork)
                 return@Thread
             }
-            if (emptyInterfaceGeneration == generation) {
-                listener?.updateDefaultInterface("", -1, false, false)
-            }
         }, "rkn-default-network-empty-debounce").start()
     }
 

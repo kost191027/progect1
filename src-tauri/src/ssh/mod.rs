@@ -31,6 +31,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 pub(crate) const PRIMARY_EXTERNAL_PORT: u16 = 4433;
 pub(crate) const EXTERNAL_PORT_CANDIDATES: [u16; 5] = [4433, 443, 5443, 7443, 9443];
+pub(crate) const VLESS_EXTERNAL_PORT_CANDIDATES: [u16; 5] = [8443, 8444, 2087, 2096, 2053];
 pub(crate) const INTERNAL_SS_PORT_CANDIDATES: [u16; 5] = [14433, 15433, 16433, 17433, 18433];
 pub(crate) const PINNED_WARP_SING_BOX_IMAGE: &str = "ghcr.io/sagernet/sing-box:v1.10.7";
 pub(crate) const PINNED_DIRECT_SING_BOX_IMAGE: &str = "ghcr.io/sagernet/sing-box:v1.13.5";
@@ -65,6 +66,7 @@ pub(crate) fn pinned_sing_box_image_for_routing_mode(routing_mode: &str) -> &'st
 #[derive(Debug)]
 pub(crate) struct RemoteDeployTarget {
     pub(crate) external_port: u16,
+    pub(crate) vless_external_port: u16,
     pub(crate) internal_ss_port: u16,
     pub(crate) container_name: String,
     pub(crate) reusing_existing_instance: bool,
@@ -93,6 +95,8 @@ struct PersistedBackendAppRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RemoteTransportBootstrap {
     pub(crate) external_port: u16,
+    #[serde(default)]
+    pub(crate) vless_external_port: u16,
     #[serde(default = "default_internal_ss_port")]
     pub(crate) internal_ss_port: u16,
     #[serde(default = "default_remote_routing_mode")]
@@ -102,6 +106,8 @@ pub(crate) struct RemoteTransportBootstrap {
     pub(crate) fallback_cover_domains: Vec<String>,
     pub(crate) shadow_pass: String,
     pub(crate) ss_password: String,
+    #[serde(default)]
+    pub(crate) vless_uuid: String,
     #[serde(default)]
     pub(crate) ss_server_password: String,
     #[serde(default)]
@@ -113,6 +119,7 @@ pub(crate) struct LocalClientTransportState {
     pub(crate) cover_domain: String,
     pub(crate) shadow_pass: String,
     pub(crate) ss_password: String,
+    pub(crate) vless_uuid: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +150,8 @@ pub(crate) struct RemoteInviteRecord {
     pub(crate) id: String,
     pub(crate) shadow_pass: String,
     pub(crate) ss_user_password: String,
+    #[serde(default)]
+    pub(crate) vless_uuid: String,
     pub(crate) generated_at: u64,
 }
 
@@ -860,6 +869,16 @@ pub(crate) fn load_local_client_transport_state(
                 && outbound.get("tag").and_then(Value::as_str) == Some("proxy")
         })
         .ok_or_else(|| "Local client config is missing proxy shadowsocks outbound".to_string())?;
+    let vless_uuid = outbounds
+        .iter()
+        .find(|outbound| {
+            outbound.get("type").and_then(Value::as_str) == Some("vless")
+                && outbound.get("tag").and_then(Value::as_str) == Some("vless-proxy")
+        })
+        .and_then(|outbound| outbound.get("uuid"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
 
     let cover_domain = shadowtls_outbound
         .get("tls")
@@ -882,6 +901,7 @@ pub(crate) fn load_local_client_transport_state(
         cover_domain,
         shadow_pass,
         ss_password,
+        vless_uuid,
     }))
 }
 
@@ -955,6 +975,9 @@ fn parse_remote_bootstrap_from_server_config(
         .iter()
         .find(|inbound| inbound.get("type").and_then(Value::as_str) == Some("shadowsocks"))
         .ok_or_else(|| "Remote server config is missing shadowsocks inbound".to_string())?;
+    let vless_inbound = inbounds
+        .iter()
+        .find(|inbound| inbound.get("type").and_then(Value::as_str) == Some("vless"));
 
     let external_port = shadowtls_inbound
         .get("listen_port")
@@ -990,6 +1013,19 @@ fn parse_remote_bootstrap_from_server_config(
         .and_then(Value::as_u64)
         .map(|port| port as u16)
         .unwrap_or_else(default_internal_ss_port);
+    let vless_external_port = vless_inbound
+        .and_then(|inbound| inbound.get("listen_port"))
+        .and_then(Value::as_u64)
+        .map(|port| port as u16)
+        .unwrap_or(0);
+    let vless_uuid = vless_inbound
+        .and_then(|inbound| inbound.get("users"))
+        .and_then(Value::as_array)
+        .and_then(|users| users.first())
+        .and_then(|user| user.get("uuid"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let routing_mode = if remote_runtime_uses_warp_from_config(&parsed) {
         "warp"
     } else {
@@ -1004,6 +1040,8 @@ fn parse_remote_bootstrap_from_server_config(
         fallback_cover_domains,
         shadow_pass,
         ss_password,
+        vless_external_port,
+        vless_uuid,
         ss_server_password: String::new(),
         issued_invites: Vec::new(),
     })

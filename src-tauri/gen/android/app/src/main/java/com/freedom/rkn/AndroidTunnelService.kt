@@ -7,7 +7,6 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager.NameNotFoundException
-import android.net.IpPrefix
 import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
@@ -17,10 +16,8 @@ import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import io.nekohasekai.libbox.RoutePrefix
 import io.nekohasekai.libbox.RoutePrefixIterator
-import io.nekohasekai.libbox.StringIterator
 import io.nekohasekai.libbox.TunOptions
 import java.io.File
-import java.net.InetAddress
 
 class AndroidTunnelService : VpnService() {
     override fun onBind(intent: Intent?): IBinder? = null
@@ -435,14 +432,6 @@ class AndroidTunnelService : VpnService() {
         val mtu = options?.getMTU()?.takeIf { it > 0 } ?: TUN_MTU
         val inet4Address = options?.getInet4Address().toRoutePrefixList()
         val inet6Address = options?.getInet6Address().toRoutePrefixList()
-        val inet4RouteAddress = options?.getInet4RouteAddress().toRoutePrefixList()
-        val inet6RouteAddress = options?.getInet6RouteAddress().toRoutePrefixList()
-        val inet4RouteExcludeAddress = options?.getInet4RouteExcludeAddress().toRoutePrefixList()
-        val inet6RouteExcludeAddress = options?.getInet6RouteExcludeAddress().toRoutePrefixList()
-        val inet4RouteRange = options?.getInet4RouteRange().toRoutePrefixList()
-        val inet6RouteRange = options?.getInet6RouteRange().toRoutePrefixList()
-        val includePackages = options?.getIncludePackage().toStringList()
-        val excludePackages = options?.getExcludePackage().toStringList()
         val dnsServer = runCatching {
             options?.getDNSServerAddress()?.value
         }.getOrNull()?.takeIf { !it.isNullOrBlank() }
@@ -455,7 +444,6 @@ class AndroidTunnelService : VpnService() {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     setMetered(false)
                 }
-                allowBypass()
             }
 
         if (inet4Address.isEmpty() && inet6Address.isEmpty()) {
@@ -468,43 +456,17 @@ class AndroidTunnelService : VpnService() {
         if (autoRoute) {
             dnsServer?.let { builder.addDnsServer(it) }
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                if (inet4RouteAddress.isNotEmpty()) {
-                    inet4RouteAddress.forEach { builder.addRoute(it.toIpPrefix()) }
-                } else if (inet4Address.isNotEmpty()) {
-                    builder.addRoute("0.0.0.0", 0)
-                }
-
-                if (inet6RouteAddress.isNotEmpty()) {
-                    inet6RouteAddress.forEach { builder.addRoute(it.toIpPrefix()) }
-                } else if (inet6Address.isNotEmpty()) {
-                    builder.addRoute("::", 0)
-                }
-
-                inet4RouteExcludeAddress.forEach { builder.excludeRoute(it.toIpPrefix()) }
-                inet6RouteExcludeAddress.forEach { builder.excludeRoute(it.toIpPrefix()) }
-            } else {
-                if (inet4RouteRange.isNotEmpty()) {
-                    inet4RouteRange.forEach { builder.addRoute(it.address(), it.prefix()) }
-                } else if (inet4Address.isNotEmpty()) {
-                    builder.addRoute("0.0.0.0", 0)
-                }
-
-                if (inet6RouteRange.isNotEmpty()) {
-                    inet6RouteRange.forEach { builder.addRoute(it.address(), it.prefix()) }
-                } else if (inet6Address.isNotEmpty()) {
-                    builder.addRoute("::", 0)
-                }
+            // Product mode is a full-device VPN. Do not honor include-package,
+            // exclude-package, or route-exclude hints here: those can let games and native apps
+            // bypass the tunnel. sing-box still decides direct vs proxy after
+            // packets enter the VpnService-owned TUN, and outbound sockets are
+            // protected through PlatformInterface.protect().
+            builder.addRoute("0.0.0.0", 0)
+            if (inet6Address.isNotEmpty()) {
+                builder.addRoute("::", 0)
             }
 
-            includePackages.forEach { packageName ->
-                try {
-                    builder.addAllowedApplication(packageName)
-                } catch (_: NameNotFoundException) {
-                }
-            }
-
-            (excludePackages + packageName).distinct().forEach { blockedPackage ->
+            listOf(packageName).forEach { blockedPackage ->
                 try {
                     builder.addDisallowedApplication(blockedPackage)
                 } catch (_: NameNotFoundException) {
@@ -520,18 +482,11 @@ class AndroidTunnelService : VpnService() {
         val firstAddress = inet4Address.firstOrNull() ?: inet6Address.firstOrNull()
         currentTunAddress = firstAddress?.address() ?: TUN_ADDRESS
         currentTunPrefixLength = firstAddress?.prefix() ?: TUN_PREFIX_LENGTH
-        currentTunRouteSummary = inet4RouteAddress.firstOrNull()?.string()
-            ?: inet4RouteRange.firstOrNull()?.string()
-            ?: inet6RouteAddress.firstOrNull()?.string()
-            ?: inet6RouteRange.firstOrNull()?.string()
-            ?: "0.0.0.0/0"
+        currentTunRouteSummary = "0.0.0.0/0"
         currentTunMtu = mtu
 
         return descriptor
     }
-
-    private fun RoutePrefix.toIpPrefix(): IpPrefix =
-        IpPrefix(InetAddress.getByName(address()), prefix())
 
     private fun RoutePrefixIterator?.toRoutePrefixList(): List<RoutePrefix> {
         if (this == null) {
@@ -539,18 +494,6 @@ class AndroidTunnelService : VpnService() {
         }
 
         val values = mutableListOf<RoutePrefix>()
-        while (hasNext()) {
-            values += next()
-        }
-        return values
-    }
-
-    private fun StringIterator?.toStringList(): List<String> {
-        if (this == null) {
-            return emptyList()
-        }
-
-        val values = mutableListOf<String>()
         while (hasNext()) {
             values += next()
         }
