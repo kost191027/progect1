@@ -1466,7 +1466,26 @@ pub fn delete_imported_invite_profile(app: AppHandle, profile_id: String) -> Res
 pub fn list_saved_server_profiles(app: AppHandle) -> Result<Vec<SavedServerProfileEntry>, String> {
     let active = warp::load_saved_server_profile(app.clone())?;
     let active_id = active.as_ref().map(saved_server_profile_id);
-    let records = load_saved_server_profile_records(&app)?;
+    let mut records = load_saved_server_profile_records(&app)?;
+
+    if let (Some(active_profile), Some(active_id)) = (active.as_ref(), active_id.as_ref()) {
+        if !records.iter().any(|record| record.id == *active_id) {
+            records.insert(
+                0,
+                StoredServerProfile {
+                    id: active_id.clone(),
+                    host: active_profile.host.clone(),
+                    user: active_profile.user.clone(),
+                    password: active_profile.password.clone(),
+                    saved_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|e| e.to_string())?
+                        .as_secs(),
+                },
+            );
+            save_saved_server_profile_records(&app, &records)?;
+        }
+    }
 
     Ok(records
         .into_iter()
@@ -1498,7 +1517,7 @@ pub fn add_saved_server_profile(
         user: user.trim().to_string(),
         password,
     };
-    save_server_profile(&app, &profile)?;
+    upsert_saved_server_profile_record(&app, &profile)?;
     save_backend_app_role(&app, BackendAppRole::Master)?;
     Ok(profile)
 }

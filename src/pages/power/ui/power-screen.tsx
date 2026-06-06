@@ -63,11 +63,11 @@ export function PowerScreen({
     isAndroidRuntime && isBusy && !isRunning && statusSummary.state === "connecting";
   const [startingStep, setStartingStep] = useState(0);
   const buttonSizeClass = isAndroidRuntime
-    ? "h-40 w-40 sm:h-52 sm:w-52 lg:h-60 lg:w-60"
-    : "h-40 w-40 sm:h-48 sm:w-48 lg:h-56 lg:w-56";
+    ? "h-36 w-36 sm:h-44 sm:w-44 lg:h-52 lg:w-52"
+    : "h-36 w-36 sm:h-44 sm:w-44 lg:h-52 lg:w-52";
   const iconSizeClass = isAndroidRuntime
-    ? "h-14 w-14 sm:h-16 sm:w-16 lg:h-[4.4rem] lg:w-[4.4rem]"
-    : "h-11 w-11 sm:h-12 sm:w-12 lg:h-14 lg:w-14";
+    ? "h-12 w-12 sm:h-14 sm:w-14 lg:h-16 lg:w-16"
+    : "h-10 w-10 sm:h-12 sm:w-12 lg:h-14 lg:w-14";
   const startingStatusText = useMemo(
     () => STARTING_COPY_STEPS[Math.min(startingStep, STARTING_COPY_STEPS.length - 1)].label,
     [startingStep],
@@ -120,8 +120,8 @@ export function PowerScreen({
         compact
       />
 
-      <div className="flex min-h-0 flex-1 flex-col">
-        <div className="flex min-h-0 flex-[1.15] flex-col items-center justify-center gap-4">
+      <div className="flex min-h-0 flex-1 flex-col justify-between gap-3">
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3">
           <button
             type="button"
             aria-label={
@@ -176,7 +176,7 @@ export function PowerScreen({
             {visibleQuickStatus}
           </div>
 
-          <div className="flex items-center gap-1 rounded-full border border-zinc-800 bg-[#121313] p-1 text-[11px] font-bold uppercase tracking-[0.18em] text-zinc-500">
+          <div className="flex max-w-full flex-wrap items-center justify-center gap-1 rounded-2xl border border-zinc-800 bg-[#121313] p-1 text-[11px] font-bold uppercase tracking-[0.18em] text-zinc-500">
             {(["shadowtls", "vless"] as const).map((protocol) => {
               const isSelected = transportProtocol === protocol;
               const label = protocol === "shadowtls" ? "ShadowTLS" : "VLESS";
@@ -210,8 +210,8 @@ export function PowerScreen({
         </div>
 
         <div
-          className={`w-full max-w-[960px] self-center rounded-2xl border border-zinc-800 bg-[#121313] text-center ${
-            isAndroidRuntime ? "mb-3 mt-3 px-4 py-3" : "mb-3 mt-3 px-4 py-3"
+          className={`w-full max-w-[960px] shrink-0 self-center rounded-2xl border border-zinc-800 bg-[#121313] text-center ${
+            isAndroidRuntime ? "mb-2 px-4 py-3" : "mb-2 px-4 py-3"
           }`}
         >
           <div

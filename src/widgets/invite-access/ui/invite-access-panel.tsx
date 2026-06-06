@@ -73,6 +73,9 @@ export function InviteAccessPanel({
 }: InviteAccessPanelProps) {
   const isMaster = appRole === "master";
   const [isInviteListCollapsed, setIsInviteListCollapsed] = useState(false);
+  const [pendingImportedDeleteId, setPendingImportedDeleteId] = useState<string | null>(
+    null,
+  );
   const subtitle = isMaster
     ? isAndroidRuntime
       ? "Create a phone link without exposing SSH credentials."
@@ -217,9 +220,18 @@ export function InviteAccessPanel({
                   {issuedInviteLinks.map((invite) => (
                     <div
                       key={invite.id}
-                      className="rounded-2xl border border-zinc-800 bg-[#171818] px-3 py-3"
+                      className="relative rounded-2xl border border-zinc-800 bg-[#171818] px-3 py-3 pr-12"
                     >
-                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <button
+                        type="button"
+                        className="absolute right-3 top-3 flex h-7 w-7 cursor-pointer items-center justify-center rounded-full border border-[#6b4440] bg-[#341f1d] text-[11px] font-bold text-[#f1dedb] transition-colors hover:bg-[#412725] disabled:cursor-not-allowed disabled:border-zinc-800 disabled:bg-[#171717] disabled:text-zinc-600"
+                        title="Delete this invite link"
+                        disabled={deletingInviteId === invite.id}
+                        onClick={() => onDeleteInvite(invite.id)}
+                      >
+                        {deletingInviteId === invite.id ? "…" : "X"}
+                      </button>
+                      <div className="flex flex-col gap-2.5 sm:flex-row sm:items-start sm:justify-between">
                         <div className="min-w-0 flex-1">
                           <div className="text-sm font-semibold text-zinc-100">
                             {invite.cover_domain}
@@ -237,25 +249,25 @@ export function InviteAccessPanel({
                           >
                             {invite.shadowtls_link}
                           </button>
-                          <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] font-bold uppercase tracking-[0.12em]">
-                            <span className="rounded-full border border-zinc-800 px-2 py-1 text-zinc-500">
+                          <div className="mt-2 flex flex-nowrap items-center gap-1.5 overflow-x-auto text-[9px] font-bold uppercase tracking-[0.08em]">
+                            <span className="shrink-0 rounded-full border border-emerald-900/70 px-1.5 py-0.5 text-emerald-400">
                               ShadowTLS ready
                             </span>
                             <span
                               className={
                                 invite.vless_available
-                                  ? "rounded-full border border-emerald-900/70 px-2 py-1 text-emerald-400"
-                                  : "rounded-full border border-zinc-800 px-2 py-1 text-zinc-600"
+                                  ? "shrink-0 rounded-full border border-emerald-900/70 px-1.5 py-0.5 text-emerald-400"
+                                  : "shrink-0 rounded-full border border-zinc-800 px-1.5 py-0.5 text-zinc-600"
                               }
                             >
                               {invite.vless_available ? "VLESS ready" : "ShadowTLS-only"}
                             </span>
                           </div>
                         </div>
-                        <div className="flex flex-wrap gap-2 sm:max-w-[190px] sm:justify-end sm:pl-3">
+                        <div className="flex shrink-0 flex-nowrap gap-1.5 pr-0 sm:max-w-[170px] sm:justify-end sm:pl-2 sm:pr-5">
                           <Button
                             variant="secondary"
-                            className="px-2.5 py-1.5 text-[10px] tracking-[0.12em]"
+                            className="whitespace-nowrap px-2 py-1 text-[9px] tracking-[0.08em]"
                             onClick={() =>
                               onCopyExistingInvite(`${invite.id}:shadowtls`, invite.shadowtls_link)
                             }
@@ -266,7 +278,7 @@ export function InviteAccessPanel({
                           </Button>
                           <Button
                             variant="secondary"
-                            className="px-2.5 py-1.5 text-[10px] tracking-[0.12em]"
+                            className="whitespace-nowrap px-2 py-1 text-[9px] tracking-[0.08em]"
                             title={
                               invite.vless_available
                                 ? "Copy the VLESS invite link"
@@ -285,15 +297,6 @@ export function InviteAccessPanel({
                               : invite.vless_available
                                 ? "VLESS Link"
                                 : "Add VLESS Link"}
-                          </Button>
-                          <Button
-                            variant="danger"
-                            className="min-w-[36px] px-2 py-1.5 text-xs tracking-[0.08em]"
-                            title="Delete this invite link"
-                            disabled={deletingInviteId === invite.id}
-                            onClick={() => onDeleteInvite(invite.id)}
-                          >
-                            {deletingInviteId === invite.id ? "…" : "X"}
                           </Button>
                         </div>
                       </div>
@@ -397,12 +400,47 @@ export function InviteAccessPanel({
                               className="min-w-[36px] px-2 py-1.5 text-xs tracking-[0.08em]"
                               title="Delete this imported link"
                               disabled={deletingInviteId === profile.id}
-                              onClick={() => onDeleteImportedInviteProfile(profile.id)}
+                              onClick={() => setPendingImportedDeleteId(profile.id)}
                             >
                               {deletingInviteId === profile.id ? "…" : "X"}
                             </Button>
                           </div>
                         </div>
+                        {pendingImportedDeleteId === profile.id ? (
+                          <div className="mt-3 rounded-xl border border-red-900/50 bg-red-950/20 px-3 py-3">
+                            <div className="text-sm font-semibold text-red-100">
+                              Delete this imported link from this device?
+                            </div>
+                            <p className="mt-1 text-xs leading-5 text-red-200/80">
+                              This only removes the local saved link. It does not change the
+                              remote server.
+                              {profile.is_active
+                                ? " If this link is active, activate another saved link before starting again."
+                                : ""}
+                            </p>
+                            <div className="mt-3 flex gap-2">
+                              <Button
+                                variant="danger"
+                                className="px-3 py-2 text-[11px]"
+                                disabled={deletingInviteId === profile.id}
+                                onClick={() => {
+                                  onDeleteImportedInviteProfile(profile.id);
+                                  setPendingImportedDeleteId(null);
+                                }}
+                              >
+                                Yes
+                              </Button>
+                              <Button
+                                variant="secondary"
+                                className="px-3 py-2 text-[11px]"
+                                disabled={deletingInviteId === profile.id}
+                                onClick={() => setPendingImportedDeleteId(null)}
+                              >
+                                No
+                              </Button>
+                            </div>
+                          </div>
+                        ) : null}
                       </div>
                     );
                   })}

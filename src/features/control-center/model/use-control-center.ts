@@ -1125,7 +1125,7 @@ export function useControlCenter() {
       userMessage: string;
       skipReplacementConfirm?: boolean;
     },
-  ) {
+  ): Promise<boolean> {
     if (!options.skipReplacementConfirm && shouldConfirmProfileReplacement(savedProfile, profile)) {
       const confirmed = window.confirm(
         [
@@ -1141,7 +1141,7 @@ export function useControlCenter() {
         appendLog(
           `[SYSTEM] Deploy cancelled. The active local server profile remains ${savedProfile?.host ?? "unchanged"}.`,
         );
-        return;
+        return false;
       }
     }
 
@@ -1171,8 +1171,10 @@ export function useControlCenter() {
       setLastDeployedAt(deployedAt);
       window.localStorage.setItem(LAST_DEPLOYED_AT_KEY, deployedAt);
       await refreshSavedServerProfiles();
+      return true;
     } catch (error) {
       appendLog(`[MAIN ERROR] Deploy failed: ${error}`);
+      return false;
     } finally {
       setIsDeploying(false);
     }
@@ -1206,25 +1208,35 @@ export function useControlCenter() {
     setSavedServerProfiles(profiles);
   }
 
-  async function addCurrentServerProfile() {
-    if (!host || !user || !password) {
-      appendLog("[MAIN ERROR] Please fill in Server IP, Login, and Password before saving.");
+  async function addCurrentServerProfile(profileDraft?: SavedServerProfile) {
+    const sourceProfile = profileDraft ?? { host, user, password };
+    const nextProfile = {
+      host: sourceProfile.host.trim(),
+      user: sourceProfile.user.trim(),
+      password: sourceProfile.password,
+    };
+
+    if (!nextProfile.host || !nextProfile.user || !nextProfile.password) {
+      const message = "Please fill in Server IP, Login, and Password before saving.";
+      setLastUserMessage(message);
+      appendLog(`[MAIN ERROR] ${message}`);
       return;
     }
 
     try {
       const profile = await invoke<SavedServerProfile>("add_saved_server_profile", {
-        host,
-        user,
-        password,
+        host: nextProfile.host,
+        user: nextProfile.user,
+        password: nextProfile.password,
       });
-      setSavedProfile(profile);
       setAppRole("master");
       window.localStorage.setItem(APP_ROLE_KEY, "master");
       window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
       window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
       await refreshSavedServerProfiles();
-      setLastUserMessage(`Saved server ${profile.host} to the local server library.`);
+      setLastUserMessage(
+        `Saved server ${profile.host} to the local server library. Activate it when you want to switch.`,
+      );
       appendLog(`[SYSTEM] Saved server ${profile.host} to the local server library.`);
     } catch (error) {
       appendLog(`[MAIN ERROR] Failed to save server profile: ${error}`);
@@ -1232,10 +1244,23 @@ export function useControlCenter() {
   }
 
   async function activateSavedServerProfile(profileId: string) {
+    const wasRunning = isRunning;
+
     try {
       const profile = await invoke<SavedServerProfile>("activate_saved_server_profile", {
         profileId,
       });
+      if (wasRunning) {
+        setIsStopping(true);
+        setLastUserMessage("Stopping the active tunnel before switching saved server.");
+        appendLog("[SYSTEM] Stopping the active tunnel before saved server switch.");
+        await invoke("stop_tunnel");
+        setIsRunning(false);
+        setGuardState("inactive");
+        setIsStopping(false);
+        await refreshAndroidRuntimeContext();
+      }
+
       setHost(profile.host);
       setUser(profile.user);
       setPassword(profile.password);
@@ -1246,34 +1271,43 @@ export function useControlCenter() {
       window.localStorage.removeItem(SUBORDINATE_HOST_KEY);
       window.localStorage.removeItem(SUBORDINATE_COVER_DOMAIN_KEY);
       appendLog(`[SYSTEM] Saved server ${profile.host} selected.`);
-      await deployWithProfile(profile, {
+      const switched = await deployWithProfile(profile, {
         logHeader: "--- SWITCHING TO SAVED SERVER ---",
         userMessage:
           "Switching to the selected saved server and refreshing the local tunnel config.",
         skipReplacementConfirm: true,
       });
+
+      if (wasRunning && switched) {
+        setIsStarting(true);
+        setLastUserMessage("Restarting the tunnel on the selected saved server.");
+        await invoke("start_tunnel");
+        await refreshAndroidRuntimeContext();
+      }
     } catch (error) {
       appendLog(`[MAIN ERROR] Failed to activate saved server profile: ${error}`);
+    } finally {
+      setIsStarting(false);
+      setIsStopping(false);
     }
   }
 
   async function deleteSavedServerProfile(profileId: string) {
-    const confirmed = window.confirm(
-      [
-        "Delete this saved server from this device?",
-        "",
-        "This only removes local credentials. It does not delete the remote VPS.",
-      ].join("\n"),
-    );
-
-    if (!confirmed) {
-      return;
-    }
+    const deletedProfile = savedServerProfiles.find((profile) => profile.id === profileId);
 
     setDeletingServerProfileId(profileId);
 
     try {
-      const deletedProfile = savedServerProfiles.find((profile) => profile.id === profileId);
+      if (deletedProfile?.is_active && isRunning) {
+        setIsStopping(true);
+        setLastUserMessage("Stopping the active tunnel before deleting this server profile.");
+        await invoke("stop_tunnel");
+        setIsRunning(false);
+        setGuardState("inactive");
+        setIsStopping(false);
+        await refreshAndroidRuntimeContext();
+      }
+
       await invoke("delete_saved_server_profile", { profileId });
       const nextSavedProfile = await invoke<SavedServerProfile | null>(
         "load_saved_server_profile",
@@ -1724,7 +1758,20 @@ export function useControlCenter() {
         : "Importing the invite link and creating a subordinate client config on this device.",
     );
 
+    const wasRunning = isRunning;
+
     try {
+      if (wasRunning) {
+        setIsStopping(true);
+        setLastUserMessage("Stopping the active tunnel before importing the new link.");
+        appendLog("[SYSTEM] Stopping the active tunnel before invite import.");
+        await invoke("stop_tunnel");
+        setIsRunning(false);
+        setGuardState("inactive");
+        setIsStopping(false);
+        await refreshAndroidRuntimeContext();
+      }
+
       const result = await invoke<InviteImportResult>("import_invite_link", {
         inviteLink: normalizedInviteLink,
       });
@@ -1765,21 +1812,52 @@ export function useControlCenter() {
       setLastUserMessage(
         "Invite link imported successfully. This device is now in subordinate mode and ready to start the tunnel.",
       );
+
+      if (wasRunning) {
+        setIsStarting(true);
+        setLastUserMessage("Restarting the tunnel with the imported link.");
+        await invoke("start_tunnel");
+        await refreshAndroidRuntimeContext();
+      }
     } catch (error) {
       const message = String(error);
       setInviteLinkError(message);
       appendLog(`[MAIN ERROR] Invite link import failed: ${message}`);
+      if (wasRunning) {
+        try {
+          setIsStarting(true);
+          setLastUserMessage("Invite import failed. Restarting the previous tunnel config.");
+          await invoke("start_tunnel");
+          await refreshAndroidRuntimeContext();
+        } catch (restartError) {
+          appendLog(`[MAIN ERROR] Failed to restart previous tunnel config: ${restartError}`);
+        }
+      }
     } finally {
+      setIsStarting(false);
+      setIsStopping(false);
       setIsImportingInvite(false);
     }
   }
 
   async function activateImportedInviteProfile(profileId: string) {
+    const wasRunning = isRunning;
     setIsImportingInvite(true);
     setLastError(null);
     setLastUserMessage("Switching to the selected imported link and rebuilding the client config.");
 
     try {
+      if (wasRunning) {
+        setIsStopping(true);
+        setLastUserMessage("Stopping the active tunnel before switching imported link.");
+        appendLog("[SYSTEM] Stopping the active tunnel before imported link switch.");
+        await invoke("stop_tunnel");
+        setIsRunning(false);
+        setGuardState("inactive");
+        setIsStopping(false);
+        await refreshAndroidRuntimeContext();
+      }
+
       const result = await invoke<InviteImportResult>("activate_imported_invite_profile", {
         profileId,
       });
@@ -1792,24 +1870,52 @@ export function useControlCenter() {
       setRequiresInviteRefresh(false);
       setLastUserMessage(`Imported link activated for ${result.host}.`);
       appendLog("[SYSTEM] Imported invite profile activated.");
+
+      if (wasRunning) {
+        setIsStarting(true);
+        setLastUserMessage("Restarting the tunnel with the selected imported link.");
+        await invoke("start_tunnel");
+        await refreshAndroidRuntimeContext();
+      }
     } catch (error) {
       appendLog(`[MAIN ERROR] Failed to activate imported invite profile: ${error}`);
     } finally {
+      setIsStarting(false);
+      setIsStopping(false);
       setIsImportingInvite(false);
     }
   }
 
   async function deleteImportedInviteProfile(profileId: string) {
+    const deletedProfile = importedInviteProfiles.find((profile) => profile.id === profileId);
     setDeletingInviteId(profileId);
 
     try {
+      if (deletedProfile?.is_active && isRunning) {
+        setIsStopping(true);
+        setLastUserMessage("Stopping the active tunnel before deleting this imported link.");
+        await invoke("stop_tunnel");
+        setIsRunning(false);
+        setGuardState("inactive");
+        setIsStopping(false);
+        await refreshAndroidRuntimeContext();
+      }
+
       await invoke("delete_imported_invite_profile", { profileId });
       const profiles = await invoke<ImportedInviteProfile[]>("list_imported_invite_profiles");
       setImportedInviteProfiles(profiles);
-      setLastUserMessage("Imported link removed from this device.");
+      if (deletedProfile?.is_active) {
+        setRequiresInviteRefresh(true);
+        setLastUserMessage(
+          "Active imported link removed. Activate another saved link or paste a fresh one.",
+        );
+      } else {
+        setLastUserMessage("Imported link removed from this device.");
+      }
     } catch (error) {
       appendLog(`[MAIN ERROR] Failed to delete imported invite profile: ${error}`);
     } finally {
+      setIsStopping(false);
       setDeletingInviteId(null);
     }
   }

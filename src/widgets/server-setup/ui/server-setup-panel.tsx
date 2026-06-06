@@ -1,9 +1,11 @@
+import { useState } from "react";
 import { Button } from "../../../shared/ui/button";
 import { Input } from "../../../shared/ui/input";
 import { getLocalDeviceReference } from "../../../shared/lib/runtime-platform";
 import { SETTINGS_PANEL_ICONS } from "../../../shared/lib/settings-panel-icons";
 import { Panel } from "../../../shared/ui/panel";
 import type {
+  SavedServerProfile,
   SavedServerProfileEntry,
   WindowsRuntimeMode,
 } from "../../../features/control-center/model/use-control-center";
@@ -40,7 +42,7 @@ type ServerSetupPanelProps = {
   onWarpProfileInputChange: (value: string) => void;
   onWindowsRuntimeModeChange: (mode: WindowsRuntimeMode) => void;
   onDeploy: () => void;
-  onAddServerProfile: () => void;
+  onAddServerProfile: (profile: SavedServerProfile) => void;
   onActivateServerProfile: (profileId: string) => void;
   onDeleteServerProfile: (profileId: string) => void;
   onResetLocalData: () => void;
@@ -89,6 +91,13 @@ export function ServerSetupPanel({
   onImportWarpProfile,
   onClearWarpProfile,
 }: ServerSetupPanelProps) {
+  const [pendingDeleteServerId, setPendingDeleteServerId] = useState<string | null>(null);
+  const [isAddServerFormOpen, setIsAddServerFormOpen] = useState(false);
+  const [serverDraft, setServerDraft] = useState<SavedServerProfile>({
+    host: "",
+    user: user || "root",
+    password: "",
+  });
   const localDeviceReference = getLocalDeviceReference();
   const resetLabel = isAndroidRuntime ? "Reset This Phone" : "Reset Local Data";
   const resettingLabel = isAndroidRuntime ? "Resetting phone..." : "Resetting...";
@@ -200,51 +209,102 @@ export function ServerSetupPanel({
 
             <Button
               variant="secondary"
-              disabled={
-                isDeploying ||
-                isResettingLocalData ||
-                isCreatingWarpProfile ||
-                isImportingWarpProfile ||
-                isClearingWarpProfile ||
-                !host ||
-                !user ||
-                !password
-              }
-              onClick={onAddServerProfile}
+              onClick={() => {
+                setPendingDeleteServerId(null);
+                setServerDraft({
+                  host: "",
+                  user: user || "root",
+                  password: "",
+                });
+                setIsAddServerFormOpen((isOpen) => !isOpen);
+              }}
               className="min-w-14 px-4"
-              title="Save the current Server IP, Login, and Password"
+              title="Add another saved server"
             >
               +
             </Button>
           </div>
 
+          {isAddServerFormOpen ? (
+            <div className="mt-4 rounded-xl border border-zinc-800 bg-black/20 px-3 py-3">
+              <div className="text-sm font-semibold text-zinc-100">
+                Add saved server
+              </div>
+              <p className="mt-1 text-xs leading-5 text-zinc-500">
+                Save credentials locally, then activate this server when you want to switch.
+              </p>
+
+              <div className="mt-3 grid gap-3">
+                <Input
+                  type="text"
+                  placeholder="Server IP"
+                  value={serverDraft.host}
+                  onChange={(event) =>
+                    setServerDraft((draft) => ({
+                      ...draft,
+                      host: event.target.value,
+                    }))
+                  }
+                />
+                <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+                  <Input
+                    type="text"
+                    placeholder="Login"
+                    value={serverDraft.user}
+                    onChange={(event) =>
+                      setServerDraft((draft) => ({
+                        ...draft,
+                        user: event.target.value,
+                      }))
+                    }
+                  />
+                  <Input
+                    type="password"
+                    placeholder="Password"
+                    value={serverDraft.password}
+                    onChange={(event) =>
+                      setServerDraft((draft) => ({
+                        ...draft,
+                        password: event.target.value,
+                      }))
+                    }
+                  />
+                </div>
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button
+                  variant="success"
+                  className="px-3 py-2 text-[11px]"
+                  onClick={() => {
+                    onAddServerProfile(serverDraft);
+                    setIsAddServerFormOpen(false);
+                  }}
+                >
+                  Save Server
+                </Button>
+                <Button
+                  variant="secondary"
+                  className="px-3 py-2 text-[11px]"
+                  onClick={() => setIsAddServerFormOpen(false)}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          ) : null}
+
           {savedServerProfiles.length > 0 ? (
             <div className="mt-4 grid gap-2">
               {savedServerProfiles.map((profile) => (
-                <div
-                  key={profile.id}
-                  role="button"
-                  tabIndex={0}
-                  className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-zinc-800/80 bg-black/20 px-3 py-3 transition-colors hover:border-zinc-700 hover:bg-black/30"
-                  onClick={() => {
-                    if (
-                      profile.is_active ||
-                      isRunning ||
-                      isDeploying ||
-                      isResettingLocalData ||
-                      deletingServerProfileId === profile.id
-                    ) {
-                      return;
-                    }
-
-                    onActivateServerProfile(profile.id);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
+                <div key={profile.id} className="grid gap-2">
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-zinc-800/80 bg-black/20 px-3 py-3 transition-colors hover:border-zinc-700 hover:bg-black/30"
+                    onClick={() => {
                       if (
                         profile.is_active ||
-                        isRunning ||
                         isDeploying ||
                         isResettingLocalData ||
                         deletingServerProfileId === profile.id
@@ -253,9 +313,23 @@ export function ServerSetupPanel({
                       }
 
                       onActivateServerProfile(profile.id);
-                    }
-                  }}
-                >
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        if (
+                          profile.is_active ||
+                          isDeploying ||
+                          isResettingLocalData ||
+                          deletingServerProfileId === profile.id
+                        ) {
+                          return;
+                        }
+
+                        onActivateServerProfile(profile.id);
+                      }
+                    }}
+                  >
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="truncate text-sm font-semibold text-zinc-100">
@@ -277,7 +351,6 @@ export function ServerSetupPanel({
                       variant={profile.is_active ? "success" : "secondary"}
                       disabled={
                         profile.is_active ||
-                        isRunning ||
                         isDeploying ||
                         isResettingLocalData ||
                         deletingServerProfileId === profile.id
@@ -294,20 +367,54 @@ export function ServerSetupPanel({
                     <Button
                       variant="danger"
                       disabled={
-                        isRunning ||
                         isDeploying ||
                         isResettingLocalData ||
                         deletingServerProfileId === profile.id
                       }
                       onClick={(event) => {
                         event.stopPropagation();
-                        onDeleteServerProfile(profile.id);
+                        setPendingDeleteServerId(profile.id);
                       }}
                       className="px-3 py-2 text-[11px]"
                     >
                       {deletingServerProfileId === profile.id ? "..." : "X"}
                     </Button>
                   </div>
+                  </div>
+                  {pendingDeleteServerId === profile.id ? (
+                    <div className="rounded-xl border border-red-900/50 bg-red-950/20 px-3 py-3">
+                    <div className="text-sm font-semibold text-red-100">
+                      Delete this saved server from this device?
+                    </div>
+                    <p className="mt-1 text-xs leading-5 text-red-200/80">
+                      This only removes local credentials. It does not delete the remote VPS.
+                      {profile.is_active && isRunning
+                        ? " The active tunnel will be stopped first."
+                        : ""}
+                    </p>
+                    <div className="mt-3 flex gap-2">
+                      <Button
+                        variant="danger"
+                        className="px-3 py-2 text-[11px]"
+                        disabled={deletingServerProfileId === profile.id}
+                        onClick={() => {
+                          onDeleteServerProfile(profile.id);
+                          setPendingDeleteServerId(null);
+                        }}
+                      >
+                        Yes
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        className="px-3 py-2 text-[11px]"
+                        disabled={deletingServerProfileId === profile.id}
+                        onClick={() => setPendingDeleteServerId(null)}
+                      >
+                        No
+                      </Button>
+                    </div>
+                    </div>
+                  ) : null}
                 </div>
               ))}
             </div>
