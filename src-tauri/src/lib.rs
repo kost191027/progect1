@@ -518,6 +518,43 @@ fn apply_selected_transport_protocol_to_runtime_config(
     replace_runtime_proxy_tag(cfg, "vless-proxy");
 }
 
+#[cfg(any(target_os = "android", test))]
+fn runtime_config_has_outbound_tag(cfg: &serde_json::Value, tag: &str) -> bool {
+    cfg.get("outbounds")
+        .and_then(|value| value.as_array())
+        .is_some_and(|outbounds| {
+            outbounds
+                .iter()
+                .any(|outbound| outbound.get("tag").and_then(|value| value.as_str()) == Some(tag))
+        })
+}
+
+#[cfg(any(target_os = "android", test))]
+fn optimize_android_vless_gameplay_outbound(cfg: &mut serde_json::Value) {
+    if let Some(outbounds) = cfg
+        .get_mut("outbounds")
+        .and_then(|value| value.as_array_mut())
+    {
+        for outbound in outbounds {
+            let is_vless_proxy = outbound
+                .get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "vless")
+                && outbound
+                    .get("tag")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == "vless-proxy");
+
+            if is_vless_proxy {
+                if let Some(object) = outbound.as_object_mut() {
+                    object.remove("multiplex");
+                    object.insert("packet_encoding".to_string(), serde_json::json!("xudp"));
+                }
+            }
+        }
+    }
+}
+
 fn replace_runtime_proxy_tag(value: &mut serde_json::Value, replacement: &str) {
     match value {
         serde_json::Value::Object(object) => {
@@ -1521,6 +1558,7 @@ fn build_android_runtime_client_config(
     let server_ip = extract_server_ip_from_config(&cfg).ok_or_else(|| {
         "Android runtime config could not determine the upstream server IP from the generated client config.".to_string()
     })?;
+    let vless_outbound_available = runtime_config_has_outbound_tag(&cfg, "vless-proxy");
 
     cfg["log"]["output"] = serde_json::json!(log_path);
     cfg["log"]["level"] = serde_json::json!("warn");
@@ -1589,6 +1627,8 @@ fn build_android_runtime_client_config(
             }
         }
     }
+
+    optimize_android_vless_gameplay_outbound(&mut cfg);
 
     if let Some(route) = cfg.get_mut("route").and_then(|value| value.as_object_mut()) {
         route.insert(
@@ -1697,6 +1737,14 @@ fn build_android_runtime_client_config(
                 "rule_set": direct_rule_set_tags,
                 "action": "route",
                 "outbound": "direct"
+            }));
+        }
+
+        if protocol == TransportProtocol::Shadowtls && vless_outbound_available {
+            route_rules.push(serde_json::json!({
+                "network": "udp",
+                "action": "route",
+                "outbound": "vless-proxy"
             }));
         }
 
@@ -6782,6 +6830,7 @@ mod tests {
         find_android_local_proxy_inbound_violation, inject_android_local_rule_sets,
         shell_single_quote, validate_android_runtime_route_policy, TransportProtocol,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn escape_applescript_preserves_shell_special_chars_inside_string_literal() {
@@ -6892,8 +6941,14 @@ mod tests {
     }
 
     fn write_test_srs(tag: &str) -> String {
-        let dir =
-            std::env::temp_dir().join(format!("rkn-android-route-policy-{}", std::process::id()));
+        static TEST_SRS_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let counter = TEST_SRS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rkn-android-route-policy-{}-{}",
+            std::process::id(),
+            counter
+        ));
         std::fs::create_dir_all(&dir).expect("test rule-set dir must be created");
         let path = dir.join(format!("{tag}.srs"));
         std::fs::write(&path, b"SRS\x00test").expect("test SRS file must be written");
@@ -7065,7 +7120,10 @@ mod tests {
                     "tag": "vless-proxy",
                     "server": "203.0.113.10",
                     "server_port": 8443,
-                    "uuid": "11111111-1111-4111-8111-111111111111"
+                    "uuid": "11111111-1111-4111-8111-111111111111",
+                    "multiplex": {
+                        "enabled": true
+                    }
                 }),
             );
 
@@ -7092,8 +7150,79 @@ mod tests {
             .expect("dns servers should be an array")
             .iter()
             .any(|server| server["tag"] == "remote-dns" && server["detour"] == "vless-proxy"));
+        let vless_outbound = runtime_config["outbounds"]
+            .as_array()
+            .expect("outbounds should be an array")
+            .iter()
+            .find(|outbound| outbound["tag"] == "vless-proxy")
+            .expect("VLESS outbound should be present");
+        assert_eq!(vless_outbound["packet_encoding"], "xudp");
+        assert!(
+            vless_outbound.get("multiplex").is_none(),
+            "Android VLESS runtime should avoid multiplex for gameplay UDP stability"
+        );
         validate_android_runtime_route_policy(&runtime_config)
             .expect("VLESS protected route policy should pass audit");
+    }
+
+    #[test]
+    fn android_shadowtls_runtime_routes_gameplay_udp_through_vless_when_available() {
+        let mut config = serde_json::from_str::<serde_json::Value>(&android_policy_base_config())
+            .expect("base config must parse");
+        config["outbounds"]
+            .as_array_mut()
+            .expect("outbounds should be an array")
+            .push(serde_json::json!({
+                "type": "vless",
+                "tag": "vless-proxy",
+                "server": "203.0.113.10",
+                "server_port": 8443,
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "multiplex": {
+                    "enabled": true
+                }
+            }));
+
+        let rendered = build_android_runtime_client_config(
+            &config.to_string(),
+            "/data/user/0/com.freedom.rkn/files/rkn-tun.log",
+            TransportProtocol::Shadowtls,
+        )
+        .expect("Android ShadowTLS runtime config should be generated");
+        let runtime_config = serde_json::from_str::<serde_json::Value>(&rendered)
+            .expect("runtime config should parse");
+        let route_rules = runtime_config["route"]["rules"]
+            .as_array()
+            .expect("route rules should be an array");
+        assert!(route_rules.iter().any(|rule| {
+            rule["network"] == "udp"
+                && rule["action"] == "route"
+                && rule["outbound"] == "vless-proxy"
+        }));
+
+        let udp_vless_index = route_rules
+            .iter()
+            .position(|rule| {
+                rule["network"] == "udp"
+                    && rule["action"] == "route"
+                    && rule["outbound"] == "vless-proxy"
+            })
+            .expect("generic UDP should route to VLESS");
+        let ru_direct_index = route_rules
+            .iter()
+            .position(|rule| {
+                rule["rule_set"].as_array().is_some_and(|rule_sets| {
+                    rule_sets.iter().any(|value| value == "geosite-category-ru")
+                }) && rule["outbound"] == "direct"
+            })
+            .expect("RU rule-set should still route direct");
+        assert!(
+            ru_direct_index < udp_vless_index,
+            "RU direct policy must stay ahead of the generic Android gameplay UDP VLESS rule"
+        );
+        assert_eq!(runtime_config["route"]["final"], "proxy");
+        validate_android_runtime_route_policy(&runtime_config)
+            .expect("hybrid ShadowTLS/VLESS gameplay route policy should pass audit");
     }
 
     #[test]
@@ -7109,7 +7238,10 @@ mod tests {
         )
         .expect_err("Android runtime must reject remote rule-set entries");
 
-        assert!(error.contains("requires local rule-set entries"));
+        assert!(
+            error.contains("requires local rule-set entries"),
+            "unexpected Android rule-set rejection: {error}"
+        );
     }
 
     #[test]

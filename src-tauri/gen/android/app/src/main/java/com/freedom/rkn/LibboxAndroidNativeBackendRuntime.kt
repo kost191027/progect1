@@ -242,7 +242,7 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
             runtimeStates[handle.sessionId]
         } ?: return "idle(runtime=${handle.runtimeId}, session=${handle.sessionId})"
 
-        return state.close("service-stop", 10_000).also {
+        return state.close("service-stop", 15_000).also {
             synchronized(runtimeStates) {
                 if (state.closed) {
                     runtimeStates.remove(handle.sessionId)
@@ -500,19 +500,19 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
                 Thread({
                     try {
                         runCatching {
-                            commandServer.closeService()
-                            appendCloseDetail("closeService=ok")
-                        }.onFailure { error ->
-                            appendCloseDetail(
-                                "closeService=${error.message ?: error::class.java.simpleName}"
-                            )
-                        }
-                        runCatching {
                             commandServer.close()
                             appendCloseDetail("close=ok")
                         }.onFailure { error ->
                             appendCloseDetail(
                                 "close=${error.message ?: error::class.java.simpleName}"
+                            )
+                        }
+                        runCatching {
+                            commandServer.closeService()
+                            appendCloseDetail("closeService=ok")
+                        }.onFailure { error ->
+                            appendCloseDetail(
+                                "closeService=${error.message ?: error::class.java.simpleName}"
                             )
                         }
                     } finally {

@@ -1,5 +1,5 @@
-import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import { join, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const args = process.argv.slice(2);
@@ -228,8 +228,25 @@ function detectAndroidDeviceForRun(adbPath) {
   );
 }
 
+function collectDebugApks(dir) {
+  if (!existsSync(dir)) {
+    return [];
+  }
+
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const entryPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      return collectDebugApks(entryPath);
+    }
+    if (entry.isFile() && entry.name.endsWith(".apk") && entryPath.includes(`${sep}debug${sep}`)) {
+      return [entryPath];
+    }
+    return [];
+  });
+}
+
 function androidDebugApkPath() {
-  return join(
+  const apkRoot = join(
     cwd,
     "src-tauri",
     "gen",
@@ -238,10 +255,43 @@ function androidDebugApkPath() {
     "build",
     "outputs",
     "apk",
-    "arm64",
-    "debug",
-    "app-arm64-debug.apk",
   );
+  const debugApks = collectDebugApks(apkRoot)
+    .map((apkPath) => ({ apkPath, mtimeMs: statSync(apkPath).mtimeMs }))
+    .sort((left, right) => right.mtimeMs - left.mtimeMs);
+
+  if (debugApks.length > 0) {
+    return debugApks[0].apkPath;
+  }
+
+  return join(apkRoot, "arm64", "debug", "app-arm64-debug.apk");
+}
+
+function printInstalledAndroidPackageInfo(adbPath, deviceSerial) {
+  const packageResult = spawnSync(
+    adbPath,
+    ["-s", deviceSerial, "shell", "dumpsys", "package", "com.freedom.rkn"],
+    {
+      encoding: "utf8",
+    },
+  );
+
+  if (packageResult.status !== 0) {
+    return;
+  }
+
+  const packageInfo = packageResult.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) =>
+      ["versionCode=", "versionName=", "firstInstallTime=", "lastUpdateTime="].some((prefix) =>
+        line.startsWith(prefix),
+      ),
+    );
+
+  if (packageInfo.length > 0) {
+    console.log(["Installed Android package:", ...packageInfo.map((line) => `  ${line}`)].join("\n"));
+  }
 }
 
 function installAndLaunchAndroidDebugApk(adbPath, deviceSerial) {
@@ -250,12 +300,24 @@ function installAndLaunchAndroidDebugApk(adbPath, deviceSerial) {
     fail(`Android debug APK was not produced at ${apkPath}.`);
   }
 
+  console.log(`Installing Android debug APK: ${apkPath}`);
+
+  spawnSync(adbPath, ["-s", deviceSerial, "shell", "am", "force-stop", "com.freedom.rkn"], {
+    stdio: "inherit",
+  });
+
   const installResult = spawnSync(adbPath, ["-s", deviceSerial, "install", "-r", apkPath], {
     stdio: "inherit",
   });
   if (installResult.status !== 0) {
     process.exit(installResult.status ?? 1);
   }
+
+  printInstalledAndroidPackageInfo(adbPath, deviceSerial);
+
+  spawnSync(adbPath, ["-s", deviceSerial, "shell", "am", "force-stop", "com.freedom.rkn"], {
+    stdio: "inherit",
+  });
 
   const launchResult = spawnSync(
     adbPath,
