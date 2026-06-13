@@ -352,6 +352,12 @@ class AndroidTunnelService : VpnService() {
         }
 
         fun abortBackendLaunch(sessionId: String, reason: String): String {
+            synchronized(STATE_LOCK) {
+                if (backendHandoffSessionId.isNotEmpty() && backendHandoffSessionId != sessionId) {
+                    return "session-mismatch(current=$backendHandoffSessionId, requested=$sessionId)"
+                }
+            }
+
             val stopState = stopRunningBackend()
             synchronized(STATE_LOCK) {
                 if (backendHandoffSessionId.isNotEmpty() && backendHandoffSessionId != sessionId) {

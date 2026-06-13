@@ -7562,6 +7562,8 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             if !is_android_native_backend_pid(pid) {
                 stop_android_backend_runtime_and_wait(&app, "process-stop").await;
             }
+            #[cfg(target_os = "android")]
+            sleep(Duration::from_millis(700)).await;
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");
             refresh_tray_toggle_item(&app);
@@ -7595,6 +7597,7 @@ async fn stop_tunnel_inner(app: AppHandle) -> Result<(), String> {
             #[cfg(target_os = "android")]
             {
                 stop_android_backend_runtime_and_wait(&app, "no-active-tunnel-stop").await;
+                sleep(Duration::from_millis(700)).await;
             }
             emit_tunnel_state(&app, false);
             emit_guard_state(&app, "inactive");

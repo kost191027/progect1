@@ -500,19 +500,19 @@ object LibboxAndroidNativeBackendRuntime : AndroidNativeBackendRuntime {
                 Thread({
                     try {
                         runCatching {
-                            commandServer.close()
-                            appendCloseDetail("close=ok")
-                        }.onFailure { error ->
-                            appendCloseDetail(
-                                "close=${error.message ?: error::class.java.simpleName}"
-                            )
-                        }
-                        runCatching {
                             commandServer.closeService()
                             appendCloseDetail("closeService=ok")
                         }.onFailure { error ->
                             appendCloseDetail(
                                 "closeService=${error.message ?: error::class.java.simpleName}"
+                            )
+                        }
+                        runCatching {
+                            commandServer.close()
+                            appendCloseDetail("close=ok")
+                        }.onFailure { error ->
+                            appendCloseDetail(
+                                "close=${error.message ?: error::class.java.simpleName}"
                             )
                         }
                     } finally {

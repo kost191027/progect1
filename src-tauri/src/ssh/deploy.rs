@@ -9,8 +9,8 @@ use super::warp::{
 };
 use super::{
     acquire_remote_mutation_lock, build_container_name, connect_ssh_session, emit_ssh_stage,
-    ensure_local_client_rule_sets_sync, ensure_master_role, load_remote_container_image,
-    load_remote_container_name, load_remote_transport_bootstrap,
+    ensure_local_client_rule_sets_sync, ensure_master_role, load_cached_transport_bootstrap,
+    load_remote_container_image, load_remote_container_name, load_remote_transport_bootstrap,
     pinned_sing_box_image_for_routing_mode, remote_runtime_uses_warp, run_remote_command,
     save_backend_app_role, save_cached_transport_bootstrap, save_server_profile,
     snapshot_for_cover_domain, stream_remote_deploy_output, BackendAppRole, RemoteDeployTarget,
@@ -18,6 +18,7 @@ use super::{
     INTERNAL_SS_PORT_CANDIDATES, LEGACY_CONTAINER_NAME, PRIMARY_EXTERNAL_PORT,
     VLESS_EXTERNAL_PORT_CANDIDATES,
 };
+use std::path::Path;
 
 const TRANSPORT_SMOKE_TARGETS: &[&str] = &[
     "https://www.gstatic.com/generate_204",
@@ -53,6 +54,76 @@ fn backup_local_file_if_exists(path: &std::path::Path) -> Result<(), String> {
     })?;
 
     Ok(())
+}
+
+fn transport_bootstrap_runtime_fingerprint(bootstrap: &RemoteTransportBootstrap) -> String {
+    [
+        bootstrap.external_port.to_string(),
+        bootstrap.vless_external_port.to_string(),
+        bootstrap.internal_ss_port.to_string(),
+        bootstrap.routing_mode.clone(),
+        bootstrap.cover_domain.clone(),
+        bootstrap.shadow_pass.clone(),
+        bootstrap.ss_password.clone(),
+        bootstrap.vless_uuid.clone(),
+        bootstrap.ss_server_password.clone(),
+    ]
+    .join("|")
+}
+
+fn transport_bootstrap_runtime_changed(
+    previous: Option<&RemoteTransportBootstrap>,
+    current: &RemoteTransportBootstrap,
+) -> bool {
+    previous.is_none_or(|previous| {
+        transport_bootstrap_runtime_fingerprint(previous)
+            != transport_bootstrap_runtime_fingerprint(current)
+    })
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<bool, String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to remove stale runtime file {}: {}",
+            path.display(),
+            error
+        )),
+    }
+}
+
+fn remove_dir_if_exists(path: &Path) -> Result<bool, String> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to remove stale runtime directory {}: {}",
+            path.display(),
+            error
+        )),
+    }
+}
+
+fn invalidate_android_runtime_cache(local_data: &Path) -> Result<usize, String> {
+    let mut removed = 0;
+    for file_name in [
+        "client_config_android.json",
+        "client_config_android_backend.json",
+        "android_runtime_context.json",
+        "android_backend_consumer_claim.json",
+        "android_native_backend_launch.json",
+    ] {
+        if remove_file_if_exists(&local_data.join(file_name))? {
+            removed += 1;
+        }
+    }
+
+    if remove_dir_if_exists(&local_data.join("android_native_backend"))? {
+        removed += 1;
+    }
+
+    Ok(removed)
 }
 
 pub(crate) struct RemoteDeployExecution<'a> {
@@ -556,6 +627,18 @@ fn build_client_transport_smoke_config(client_cfg: &str) -> Result<String, Strin
 }
 
 #[cfg(not(target_os = "android"))]
+fn required_transport_smoke_outbounds(
+    client_cfg: &str,
+) -> Result<Vec<(&'static str, &'static str)>, String> {
+    let mut required_outbounds = vec![("ShadowTLS/Shadowsocks", "proxy")];
+    if client_config_has_outbound_tag(client_cfg, "vless-proxy")? {
+        required_outbounds.push(("VLESS", "vless-proxy"));
+    }
+
+    Ok(required_outbounds)
+}
+
+#[cfg(not(target_os = "android"))]
 fn validate_local_client_config(
     app: &AppHandle,
     local_data: &std::path::Path,
@@ -630,10 +713,7 @@ fn run_client_transport_smoke_check(
     })?;
 
     let singbox_path = crate::resolve_singbox_path(app)?;
-    let mut required_outbounds = vec![("ShadowTLS/Shadowsocks", "proxy")];
-    if client_config_has_outbound_tag(client_cfg, "vless-proxy")? {
-        required_outbounds.push(("VLESS", "vless-proxy"));
-    }
+    let required_outbounds = required_transport_smoke_outbounds(client_cfg)?;
 
     let mut errors = Vec::new();
     for (label, outbound_tag) in required_outbounds {
@@ -643,8 +723,19 @@ fn run_client_transport_smoke_check(
             label,
             outbound_tag,
         ) {
-            Ok(()) => {}
-            Err(error) => errors.push(error),
+            Ok(()) => {
+                emit_ssh_stage(app, "VALIDATE", format!("{} smoke-check passed.", label));
+            }
+            Err(error) => {
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SSH WARN] {} smoke-check failed. Details: {}",
+                        label, error
+                    ),
+                );
+                errors.push(error);
+            }
         }
     }
 
@@ -761,6 +852,160 @@ fn run_client_transport_smoke_check(
     _client_cfg: &str,
 ) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod tests {
+    use super::{
+        build_client_transport_smoke_config, required_transport_smoke_outbounds,
+        transport_bootstrap_runtime_changed, RemoteTransportBootstrap,
+    };
+
+    fn sample_bootstrap() -> RemoteTransportBootstrap {
+        RemoteTransportBootstrap {
+            external_port: 4433,
+            vless_external_port: 8443,
+            internal_ss_port: 14433,
+            routing_mode: "warp".to_string(),
+            cover_domain: "www.microsoft.com".to_string(),
+            fallback_cover_domains: Vec::new(),
+            shadow_pass: "shadow-secret".to_string(),
+            ss_password: "server-pass:user-pass".to_string(),
+            vless_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            ss_server_password: "server-pass".to_string(),
+            issued_invites: Vec::new(),
+        }
+    }
+
+    fn smoke_client_config(include_vless: bool) -> String {
+        let mut outbounds = vec![
+            serde_json::json!({
+                "type": "shadowtls",
+                "tag": "shadowtls-out",
+                "detour": "proxy"
+            }),
+            serde_json::json!({
+                "type": "shadowsocks",
+                "tag": "proxy",
+                "server": "203.0.113.10",
+                "server_port": 4433
+            }),
+            serde_json::json!({
+                "type": "direct",
+                "tag": "direct"
+            }),
+        ];
+
+        if include_vless {
+            outbounds.push(serde_json::json!({
+                "type": "vless",
+                "tag": "vless-proxy",
+                "server": "203.0.113.10",
+                "server_port": 8443,
+                "uuid": "11111111-1111-4111-8111-111111111111"
+            }));
+        }
+
+        serde_json::json!({
+            "log": {
+                "level": "debug"
+            },
+            "dns": {
+                "servers": []
+            },
+            "inbounds": [
+                {
+                    "type": "tun",
+                    "tag": "tun-in"
+                }
+            ],
+            "outbounds": outbounds,
+            "route": {
+                "final": "proxy"
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn smoke_outbound_list_includes_vless_only_when_profile_has_vless() {
+        assert_eq!(
+            required_transport_smoke_outbounds(&smoke_client_config(false))
+                .expect("ShadowTLS-only config should parse"),
+            vec![("ShadowTLS/Shadowsocks", "proxy")]
+        );
+        assert_eq!(
+            required_transport_smoke_outbounds(&smoke_client_config(true))
+                .expect("dual-transport config should parse"),
+            vec![("ShadowTLS/Shadowsocks", "proxy"), ("VLESS", "vless-proxy")]
+        );
+    }
+
+    #[test]
+    fn smoke_config_keeps_outbounds_but_drops_runtime_inbounds_and_routes() {
+        let smoke_config = build_client_transport_smoke_config(&smoke_client_config(true))
+            .expect("smoke config should be generated");
+        let parsed = serde_json::from_str::<serde_json::Value>(&smoke_config)
+            .expect("smoke config should stay valid JSON");
+
+        assert!(parsed.get("inbounds").is_none());
+        assert!(parsed.get("route").is_none());
+        assert!(parsed.get("dns").is_none());
+        assert!(parsed["outbounds"]
+            .as_array()
+            .expect("outbounds should be present")
+            .iter()
+            .any(|outbound| outbound["tag"] == "proxy"));
+        assert!(parsed["outbounds"]
+            .as_array()
+            .expect("outbounds should be present")
+            .iter()
+            .any(|outbound| outbound["tag"] == "vless-proxy"));
+    }
+
+    #[test]
+    fn transport_bootstrap_runtime_change_detects_endpoint_and_secret_changes() {
+        let previous = sample_bootstrap();
+        assert!(transport_bootstrap_runtime_changed(None, &previous));
+        assert!(!transport_bootstrap_runtime_changed(
+            Some(&previous),
+            &previous
+        ));
+
+        let mut changed_port = previous.clone();
+        changed_port.vless_external_port = 2096;
+        assert!(transport_bootstrap_runtime_changed(
+            Some(&previous),
+            &changed_port
+        ));
+
+        let mut changed_secret = previous.clone();
+        changed_secret.vless_uuid = "22222222-2222-4222-8222-222222222222".to_string();
+        assert!(transport_bootstrap_runtime_changed(
+            Some(&previous),
+            &changed_secret
+        ));
+    }
+
+    #[test]
+    fn transport_bootstrap_runtime_change_ignores_invite_only_changes() {
+        let previous = sample_bootstrap();
+        let mut invite_only = previous.clone();
+        invite_only
+            .issued_invites
+            .push(super::super::RemoteInviteRecord {
+                id: "phone-1".to_string(),
+                shadow_pass: "invite-shadow".to_string(),
+                ss_user_password: "invite-ss".to_string(),
+                vless_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
+                generated_at: 42,
+            });
+
+        assert!(!transport_bootstrap_runtime_changed(
+            Some(&previous),
+            &invite_only
+        ));
+    }
 }
 
 pub(crate) fn execute_remote_deploy(
@@ -1053,6 +1298,24 @@ pub async fn deploy_server(
                 routing_mode: effective_routing_mode.to_string(),
                 ..remote_bootstrap.clone()
             };
+            let previous_bootstrap = match load_cached_transport_bootstrap(&app) {
+                Ok(bootstrap) => bootstrap,
+                Err(error) => {
+                    let _ = app.emit(
+                        "tunnel-log",
+                        format!(
+                            "[SSH WARN] Cached transport metadata could not be read. Android runtime cache will be refreshed after saving the new config. Details: {}",
+                            error
+                        ),
+                    );
+                    None
+                }
+            };
+            let remote_runtime_changed = local_client_config_present
+                && transport_bootstrap_runtime_changed(
+                    previous_bootstrap.as_ref(),
+                    &effective_bootstrap,
+                );
             let local_rule_sets = ensure_local_client_rule_sets_sync(&app)?;
             let client_cfg =
                 crate::generator::build_client_config(crate::generator::ClientConfigParams {
@@ -1096,6 +1359,16 @@ pub async fn deploy_server(
             save_server_profile(&app, &attach_saved_profile)?;
             save_backend_app_role(&app, BackendAppRole::Master)?;
             let _ = save_cached_transport_bootstrap(&app, &effective_bootstrap);
+            if remote_runtime_changed {
+                let removed = invalidate_android_runtime_cache(&local_data)?;
+                let _ = app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SYSTEM] Remote transport changed on this server. Refreshed the local client config and invalidated {} stale Android runtime cache item(s) before the next start/restart.",
+                        removed
+                    ),
+                );
+            }
             crate::refresh_tray_toggle_item(&app);
 
             let _ = app.emit(
@@ -1362,6 +1635,34 @@ pub async fn deploy_server(
             "issued_invites": issued_invites
         })
         .to_string();
+        let fresh_bootstrap = RemoteTransportBootstrap {
+            external_port,
+            vless_external_port,
+            internal_ss_port,
+            routing_mode: routing_mode.clone(),
+            cover_domain: cover_domain.to_string(),
+            fallback_cover_domains: fallback_cover_domains.clone(),
+            shadow_pass: shadow_pass.clone(),
+            ss_password: ss_password.clone(),
+            vless_uuid: vless_uuid.clone(),
+            ss_server_password: ss_server_password.clone(),
+            issued_invites: issued_invites.clone(),
+        };
+        let previous_bootstrap = match load_cached_transport_bootstrap(&deploy_app) {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                let _ = deploy_app.emit(
+                    "tunnel-log",
+                    format!(
+                        "[SSH WARN] Cached transport metadata could not be read. Android runtime cache will be refreshed after saving the new config. Details: {}",
+                        error
+                    ),
+                );
+                None
+            }
+        };
+        let remote_runtime_changed =
+            transport_bootstrap_runtime_changed(previous_bootstrap.as_ref(), &fresh_bootstrap);
 
         emit_ssh_stage(
             &deploy_app,
@@ -1431,20 +1732,17 @@ pub async fn deploy_server(
         std::fs::write(&client_cfg_path, &client_cfg).map_err(|e| e.to_string())?;
         save_server_profile(&deploy_app, &saved_profile)?;
         save_backend_app_role(&deploy_app, BackendAppRole::Master)?;
-        let fresh_bootstrap = RemoteTransportBootstrap {
-            external_port,
-            vless_external_port,
-            internal_ss_port,
-            routing_mode,
-            cover_domain: cover_domain.to_string(),
-            fallback_cover_domains,
-            shadow_pass: shadow_pass.clone(),
-            ss_password: ss_password.clone(),
-            vless_uuid: vless_uuid.clone(),
-            ss_server_password: ss_server_password.clone(),
-            issued_invites,
-        };
         let _ = save_cached_transport_bootstrap(&deploy_app, &fresh_bootstrap);
+        if remote_runtime_changed {
+            let removed = invalidate_android_runtime_cache(&local_data)?;
+            let _ = deploy_app.emit(
+                "tunnel-log",
+                format!(
+                    "[SYSTEM] Remote transport was rebuilt or changed. Refreshed the local client config and invalidated {} stale Android runtime cache item(s) before the next start/restart.",
+                    removed
+                ),
+            );
+        }
         crate::refresh_tray_toggle_item(&deploy_app);
 
         let _ = deploy_app.emit(

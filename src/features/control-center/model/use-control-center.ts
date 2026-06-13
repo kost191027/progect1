@@ -1554,6 +1554,7 @@ export function useControlCenter() {
       return;
     }
 
+    const wasRunning = isRunning;
     setIsSavingTransportProtocol(true);
     setLastError(null);
     setLastUserMessage(
@@ -1563,7 +1564,7 @@ export function useControlCenter() {
     );
 
     try {
-      if (isRunning) {
+      if (wasRunning) {
         setIsStopping(true);
         setLastUserMessage("Stopping the active tunnel before switching transport protocol.");
         appendLog("[SYSTEM] Stopping the active tunnel before transport switch.");
@@ -1594,7 +1595,7 @@ export function useControlCenter() {
           : "VLESS is selected for the next tunnel start.",
       );
 
-      if (isRunning) {
+      if (wasRunning) {
         setIsStarting(true);
         setLastUserMessage(
           status.protocol === "shadowtls"
