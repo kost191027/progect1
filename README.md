@@ -55,19 +55,19 @@ It combines a lightweight desktop shell, a high-performance native backend, and 
 `enter server -> deploy node -> start tunnel -> stay protected`
 
 <p>
-  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.8/RKN-0.1.8-x64.dmg">
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.9/RKN-0.1.9-x64.dmg">
     <img alt="Download for Intel Mac" src="https://img.shields.io/badge/Download%20for-Intel%20Mac-1F2937?style=for-the-badge&logo=apple&logoColor=white">
   </a>
-  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.8/RKN-0.1.8-arm64.dmg">
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.9/RKN-0.1.9-arm64.dmg">
     <img alt="Download for Apple Silicon" src="https://img.shields.io/badge/Download%20for-Apple%20Silicon-111827?style=for-the-badge&logo=apple&logoColor=white">
   </a>
-  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.8/RKN-0.1.8-x64-setup.exe">
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.9/RKN-0.1.9-x64-setup.exe">
     <img alt="Download for Windows" src="https://img.shields.io/badge/Download%20for-Windows-0F172A?style=for-the-badge&logo=windows11&logoColor=white">
   </a>
-  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.8/RKN-0.1.8-android-arm64.apk">
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.9/RKN-0.1.9-android-arm64.apk">
     <img alt="Download Android APK" src="https://img.shields.io/badge/Download%20Android-APK-14532D?style=for-the-badge&logo=android&logoColor=white">
   </a>
-  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.8/RKN-0.1.8-android-arm64.aab">
+  <a href="https://github.com/kost191027/progect1/releases/download/v0.1.9/RKN-0.1.9-android-arm64.aab">
     <img alt="Download Android AAB" src="https://img.shields.io/badge/Download%20Android-AAB-1B5E20?style=for-the-badge&logo=android&logoColor=white">
   </a>
 </p>
@@ -222,7 +222,7 @@ RKN now ships release artifacts for three product tracks:
 
 ## Android
 
-Android is no longer just a future track. Version `0.1.8` continues the stable Android release path.
+Android is no longer just a future track. Version `0.1.9` continues the stable Android release path.
 
 The Android build uses:
 
